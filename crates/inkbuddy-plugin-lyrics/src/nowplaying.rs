@@ -21,10 +21,14 @@ pub struct Playback {
     pub artist: String,
     pub album: String,
     pub duration: f64,
-    /// Progress reported by the player at this instant (may be a frozen
-    /// snapshot; the clock in `state.rs` advances it locally).
+    /// Progress reported by the player at this instant. QQ Music freezes this
+    /// at 0 for the whole track; the clock in `state.rs` advances it locally.
     pub elapsed: f64,
     pub playing: bool,
+    /// Unix time when the player published this Now Playing snapshot (the
+    /// helper's `timestamp`). Used once, when a track first appears, to align
+    /// the local clock when ElapsedTime is frozen.
+    pub reported_at: Option<f64>,
 }
 
 impl Playback {
@@ -82,6 +86,7 @@ struct HelperEnv {
     elapsed: f64,
     playing: bool,
     playback_rate: f64,
+    reported_at: Option<f64>,
 }
 
 /// Parse the helper's JSON. Returns `None` when the payload is not JSON or the
@@ -100,6 +105,10 @@ fn parse_helper_env(text: &str) -> Option<HelperEnv> {
         elapsed: f("elapsedTime"),
         playing,
         playback_rate: f("playbackRate"),
+        reported_at: v
+            .get("timestamp")
+            .and_then(|x| x.as_str())
+            .and_then(parse_iso8601_utc),
     })
 }
 
@@ -115,6 +124,38 @@ fn parse_playing(v: &serde_json::Value) -> Option<bool> {
         },
         _ => None,
     }
+}
+
+/// Parse a UTC timestamp like "2026-11-23T16:16:24Z" (optional fractional
+/// seconds) into Unix seconds. Hand-rolled so the lyrics plugin does not need
+/// a date library for one field.
+fn parse_iso8601_utc(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let s = s
+        .strip_suffix('Z')
+        .or_else(|| s.strip_suffix('z'))
+        .or_else(|| s.strip_suffix("+00:00"))?;
+    let (date, clock) = s.split_once('T').or_else(|| s.split_once(' '))?;
+    let mut d = date.split('-');
+    let year: i64 = d.next()?.parse().ok()?;
+    let month: i64 = d.next()?.parse().ok()?;
+    let day: i64 = d.next()?.parse().ok()?;
+    let mut c = clock.split(':');
+    let hour: i64 = c.next()?.parse().ok()?;
+    let minute: i64 = c.next()?.parse().ok()?;
+    let second: f64 = c.next()?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
+        return None;
+    }
+    // Days since 1970-01-01 (civil date -> epoch day).
+    let y = year - i64::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some((days * 86400) as f64 + (hour * 3600 + minute * 60) as f64 + second)
 }
 
 pub struct CliBackend {
@@ -192,6 +233,7 @@ impl NowPlayingBackend for CliBackend {
                 duration: env.duration,
                 elapsed: env.elapsed,
                 playing,
+                reported_at: env.reported_at,
             });
         }
 
@@ -222,6 +264,7 @@ impl NowPlayingBackend for CliBackend {
             duration: raw.duration.unwrap_or(0.0),
             elapsed: raw.elapsed.unwrap_or(0.0),
             playing,
+            reported_at: None,
         })
     }
 }
@@ -393,6 +436,7 @@ mod tests {
             duration: 326.0,
             elapsed: 0.0,
             playing: true,
+            reported_at: None,
         }
     }
 
@@ -464,5 +508,35 @@ mod tests {
         // next miss must stay paused, not flip back to playing.
         assert!(!backend.resolve_playing(None));
         assert!(!backend.last_playing.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn helper_env_exposes_snapshot_timestamp() {
+        let json = r#"{
+            "title":"海阔天空","playing":true,"elapsedTime":0,
+            "timestamp":"2026-11-23T16:16:24Z"
+        }"#;
+        let env = parse_helper_env(json).expect("valid helper env");
+        assert_eq!(env.reported_at, Some(1_795_450_584.0));
+        assert!((env.elapsed - 0.0).abs() < 1e-6, "ElapsedTime stays frozen");
+    }
+
+    #[test]
+    fn iso8601_utc_parsing() {
+        assert_eq!(parse_iso8601_utc("1970-01-01T00:00:00Z"), Some(0.0));
+        assert_eq!(
+            parse_iso8601_utc("2026-11-23T16:16:24Z"),
+            Some(1_795_450_584.0)
+        );
+        assert_eq!(
+            parse_iso8601_utc("2026-11-23T16:16:24.500Z"),
+            Some(1_795_450_584.5)
+        );
+        assert_eq!(
+            parse_iso8601_utc("2026-11-23T16:16:24+00:00"),
+            Some(1_795_450_584.0)
+        );
+        assert_eq!(parse_iso8601_utc("not a date"), None);
+        assert_eq!(parse_iso8601_utc("2026-13-01T00:00:00Z"), None);
     }
 }

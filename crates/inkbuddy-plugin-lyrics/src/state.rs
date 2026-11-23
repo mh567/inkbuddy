@@ -1,20 +1,22 @@
 //! Playback clock and lyric-window state.
 //!
-//! macOS players (notably QQ Music) report elapsed time as an occasional
-//! snapshot that freezes between events. We anchor on each changed report and
-//! advance locally in between. Seeking to 0 is a legitimate change and must
-//! re-anchor too — filtering it out used to leave lyrics stuck mid-song.
+//! QQ Music on current macOS builds freezes `ElapsedTime` at 0 for the whole
+//! track, both in the helper env and in `nowplaying-cli get-raw`. We anchor on
+//! each CHANGE of the reported value and advance locally in between; a frozen
+//! report is not a seek. Seeking to 0 is a legitimate change and must re-anchor.
 
 use crate::nowplaying::{NowPlayingBackend, Playback};
 use crate::source::{line_index_at, CachedSong, LyricsSource};
 use inkbuddy_protocol::{Block, Emphasis, Line, RenderResult, Ruby};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
 
-/// A seek is only recognised when the player's report diverges from our
-/// locally extrapolated clock by more than this many seconds. Normal playback
-/// keeps the two in lock-step, so the local clock stays authoritative.
+/// A changed player report is treated as a seek only when it moves by more
+/// than this many seconds. Small step changes from integer-second reports do
+/// not disturb the local clock.
 const SEEK_EPS: f64 = 1.5;
+/// Refuse a snapshot timestamp older than a day when aligning the clock.
+const MAX_ANCHOR_AGE: f64 = 86_400.0;
 /// After the last lyric line plus this grace period, show an idle note (♪)
 /// instead of freezing on the final line forever.
 const TAIL_GRACE: f64 = 9.0;
@@ -24,6 +26,10 @@ pub struct PluginState {
     source: LyricsSource,
 
     last_track_id: Option<String>,
+    /// Last ElapsedTime the player reported. A frozen value is normal and must
+    /// NOT be compared against the local clock: that rewinds the clock to 0
+    /// every 1.5s and makes the lyric window jump between the first lines.
+    last_reported: f64,
     position_base: f64,
     position_base_at: Instant,
     last_playing: bool,
@@ -52,6 +58,7 @@ impl PluginState {
             backend,
             source,
             last_track_id: None,
+            last_reported: 0.0,
             position_base: 0.0,
             position_base_at: Instant::now(),
             last_playing: false,
@@ -84,32 +91,75 @@ impl PluginState {
         }
     }
 
+    /// Position at this instant, derived from the player's snapshot.
+    ///
+    /// MediaRemote publishes ElapsedTime together with the moment the snapshot
+    /// was taken (`timestamp`), and often leaves both frozen for the whole
+    /// track. The real position is `elapsed + (now - timestamp)`; wrapping at
+    /// the duration also covers single-track repeat. Paused playback and
+    /// INKBUDDY_TIMESTAMP_ANCHOR=0 fall back to the raw reported value.
+    fn aligned_position(pb: &Playback) -> f64 {
+        if !pb.playing {
+            return pb.elapsed;
+        }
+        if std::env::var("INKBUDDY_TIMESTAMP_ANCHOR")
+            .map(|v| v == "0")
+            .unwrap_or(false)
+        {
+            return pb.elapsed;
+        }
+        let Some(ts) = pb.reported_at else {
+            return pb.elapsed;
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let age = now - ts;
+        if age <= 0.0 || age > MAX_ANCHOR_AGE {
+            return pb.elapsed;
+        }
+        let pos = pb.elapsed + age;
+        let aligned = if pb.duration > 0.0 {
+            pos % pb.duration
+        } else {
+            pos
+        };
+        info!(
+            reported = pb.elapsed,
+            snapshot_age = age,
+            aligned = aligned,
+            "aligned playback position from snapshot timestamp"
+        );
+        aligned
+    }
+
     fn update_clock(&mut self, pb: &Playback) {
         let track_id = pb.track_id();
         let now = Instant::now();
 
         if self.last_track_id.as_deref() != Some(track_id.as_str()) {
             self.last_track_id = Some(track_id);
-            self.position_base = pb.elapsed;
+            self.position_base = Self::aligned_position(pb);
             self.position_base_at = now;
+            self.last_reported = pb.elapsed;
             self.last_playing = pb.playing;
             return;
         }
 
-        // Compare the player's report against what our local clock predicts.
-        // While playing both advance together, so a normal frame is a no-op;
-        // only a real seek (forward or back to 0, in ANY play state) exceeds
-        // SEEK_EPS and re-anchors. Re-anchoring is NOT gated on `playing`.
-        let local = self.position_base + self.position_base_at.elapsed().as_secs_f64();
-        if (pb.elapsed - local).abs() > SEEK_EPS {
+        // Only a CHANGE in the reported value means a seek. Comparing a frozen
+        // report to the local clock re-anchors to 0 over and over and makes
+        // the lyrics jump backwards through the first lines.
+        if (pb.elapsed - self.last_reported).abs() > SEEK_EPS {
             debug!(
                 reported = pb.elapsed,
-                local = local,
+                previous = self.last_reported,
                 "clock re-anchored after seek"
             );
-            self.position_base = pb.elapsed;
+            self.position_base = Self::aligned_position(pb);
             self.position_base_at = now;
         }
+        self.last_reported = pb.elapsed;
 
         // pause/resume only toggles the local clock; it never corrects position.
         if pb.playing && !self.last_playing {
@@ -258,6 +308,7 @@ mod tests {
             duration: 300.0,
             elapsed,
             playing,
+            reported_at: None,
         }
     }
 
@@ -268,20 +319,29 @@ mod tests {
         PluginState::new(Box::new(FakeBackend(pb)), source)
     }
 
-    /// A state already anchored on `pb`'s track, with a known clock base.
-    fn primed(pb: &Playback, base: f64, playing: bool) -> PluginState {
+    /// A state already anchored on `pb`'s track, with a known clock base and
+    /// the last value the player reported.
+    fn primed(pb: &Playback, base: f64, reported: f64, playing: bool) -> PluginState {
         let mut s = state_with(None);
         s.last_track_id = Some(pb.track_id());
+        s.last_reported = reported;
         s.position_base = base;
         s.position_base_at = Instant::now();
         s.last_playing = playing;
         s
     }
 
+    fn now_epoch() -> f64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs_f64()
+    }
+
     #[tokio::test]
     async fn seek_to_zero_reanchors() {
         let pb = make_pb(0.0, true);
-        let mut s = primed(&pb, 100.0, true);
+        let mut s = primed(&pb, 100.0, 100.0, true);
         s.update_clock(&pb);
         assert!(s.position_base.abs() < 1e-6, "seek to 0 must re-anchor");
     }
@@ -291,7 +351,7 @@ mod tests {
         // Re-anchoring must NOT be gated on `pb.playing`: a paused seek to 0
         // used to be swallowed, leaving the wrong position after resume.
         let pb = make_pb(0.0, false);
-        let mut s = primed(&pb, 100.0, false);
+        let mut s = primed(&pb, 100.0, 100.0, false);
         s.update_clock(&pb);
         assert!(
             s.position_base.abs() < 1e-6,
@@ -300,33 +360,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_extrapolation_reanchor_threshold() {
-        let mut s = state_with(None);
-        let pb = make_pb(12.0, true);
-        s.last_track_id = Some(pb.track_id());
-        s.position_base = 10.0;
-        // Local clock has advanced ~2s, so local ~= 12 == reported 12.
-        s.position_base_at = Instant::now() - Duration::from_secs(2);
-        s.last_playing = true;
-
+    async fn frozen_report_never_rewinds_the_clock() {
+        // QQ Music keeps ElapsedTime at 0 for the entire track. The local
+        // clock must keep advancing instead of being re-anchored to 0 every
+        // 1.5s (that made the lyric window jump between the first lines).
+        let pb = make_pb(0.0, true);
+        let mut s = primed(&pb, 0.0, 0.0, true);
+        s.position_base_at = Instant::now() - Duration::from_secs(10);
         s.update_clock(&pb);
         assert!(
-            (s.position_base - 10.0).abs() < 1e-6,
-            "small drift must NOT re-anchor (local clock stays authoritative)"
+            s.position_base.abs() < 1e-6,
+            "a frozen report is not a seek"
         );
+        let pos = s.position(&pb);
+        assert!(pos >= 9.9, "local clock must keep advancing: {pos}");
 
+        s.position_base_at = Instant::now() - Duration::from_secs(20);
+        s.update_clock(&pb);
+        assert!(
+            s.position_base.abs() < 1e-6,
+            "still frozen after 20 seconds"
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_integer_reports_do_not_reanchor() {
+        let pb = make_pb(13.0, true);
+        let mut s = primed(&pb, 12.0, 12.0, true);
+        s.position_base_at = Instant::now() - Duration::from_secs(2);
+        s.update_clock(&pb);
+        assert!((s.position_base - 12.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn large_report_change_reanchors() {
+        let pb = make_pb(12.0, true);
+        let mut s = primed(&pb, 12.0, 12.0, true);
+        s.position_base_at = Instant::now() - Duration::from_secs(2);
         let seek = make_pb(20.0, true);
         s.update_clock(&seek);
         assert!(
             (s.position_base - 20.0).abs() < 1e-6,
-            "divergence > SEEK_EPS must re-anchor"
+            "a real seek must re-anchor"
         );
     }
 
     #[tokio::test]
     async fn position_clamped_to_duration() {
         let pb = make_pb(0.0, true);
-        let mut s = primed(&pb, 1000.0, true);
+        let mut s = primed(&pb, 1000.0, 0.0, true);
         s.set_latency_ms(0.0);
         assert!(
             (s.position(&pb) - 300.0).abs() < 1e-6,
@@ -337,7 +419,7 @@ mod tests {
     #[tokio::test]
     async fn latency_configuration_takes_effect() {
         let pb_play = make_pb(0.0, true);
-        let mut s = primed(&pb_play, 10.0, true);
+        let mut s = primed(&pb_play, 10.0, 0.0, true);
         s.set_latency_ms(1500.0);
         assert!(
             (s.position(&pb_play) - 11.5).abs() < 0.05,
@@ -356,6 +438,7 @@ mod tests {
         let pb = make_pb(100.0, true);
         let mut s = state_with(Some(pb.clone()));
         s.last_track_id = Some(pb.track_id());
+        s.last_reported = 100.0;
         // Inject a loaded song so render() skips the network entirely.
         s.cached_track = Some(pb.track_id());
         s.cached_song = Some(CachedSong {
@@ -373,5 +456,46 @@ mod tests {
             json.contains("♪"),
             "past last line + grace should show the idle note: {json}"
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_timestamp_aligns_when_elapsed_is_frozen() {
+        let mut pb = make_pb(0.0, true);
+        pb.reported_at = Some(now_epoch() - 42.0);
+        let start = PluginState::aligned_position(&pb);
+        assert!(
+            (start - 42.0).abs() < 0.2,
+            "snapshot 42s old should start at 42s: {start}"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_timestamp_wraps_at_duration_for_repeat() {
+        let mut pb = make_pb(0.0, true);
+        pb.duration = 190.0;
+        pb.reported_at = Some(now_epoch() - 220.0);
+        let start = PluginState::aligned_position(&pb);
+        assert!(
+            (start - 30.0).abs() < 0.2,
+            "single-track repeat wraps at duration: {start}"
+        );
+    }
+
+    #[tokio::test]
+    async fn real_elapsed_is_combined_with_snapshot_age() {
+        let mut pb = make_pb(75.0, true);
+        pb.reported_at = Some(now_epoch() - 200.0);
+        let pos = PluginState::aligned_position(&pb);
+        assert!(
+            (pos - 275.0).abs() < 0.2,
+            "elapsed 75 plus 200s snapshot age = 275s: {pos}"
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_track_does_not_use_snapshot_timestamp() {
+        let mut pb = make_pb(0.0, false);
+        pb.reported_at = Some(now_epoch() - 42.0);
+        assert!(PluginState::aligned_position(&pb).abs() < 1e-6);
     }
 }
