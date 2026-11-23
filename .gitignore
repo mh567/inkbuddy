@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+.DS_Store
+*.log
+# Local runtime state (config, caches, installed plugins)
+.inkbuddy/
+# macOS app bundle build output
+/dist/
+*.app/

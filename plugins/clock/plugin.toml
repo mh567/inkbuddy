@@ -1,0 +1,12 @@
+[plugin]
+id = "clock"
+name = "时钟"
+version = "0.1.0"
+description = "当前日期与时间"
+command = "../../target/release/inkbuddy-plugin-clock"
+
+[runtime]
+enabled = true
+default_on = false
+timeout_ms = 2000
+args = []

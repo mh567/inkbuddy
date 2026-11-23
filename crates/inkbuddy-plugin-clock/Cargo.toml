@@ -1,0 +1,18 @@
+[package]
+name = "inkbuddy-plugin-clock"
+description = "Second example inkbuddy plugin: date and time"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "inkbuddy-plugin-clock"
+path = "src/main.rs"
+
+[dependencies]
+inkbuddy-protocol = { path = "../inkbuddy-protocol" }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
