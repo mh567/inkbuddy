@@ -100,31 +100,28 @@ args = []
 {
   "type": "lines",
   "lines": [
-    {"text": "上一句", "emphasis": "muted", "ruby": []},
-    {"text": "当前句", "emphasis": "primary", "ruby": []},
-    {"text": "下一句", "emphasis": "muted", "ruby": []}
+    {"text": "上一句", "emphasis": "muted"},
+    {"text": "当前句", "emphasis": "primary"},
+    {"text": "下一句", "emphasis": "muted"}
   ]
 }
 ```
 
-`emphasis` 取值：`primary`（最大、加粗）、`normal`、`muted`（较小、灰色）。
+`emphasis` 取值：`primary`（最大、加粗）、`normal`、`muted`（较小、灰色）、`reading`（较小、灰色，单独一行的读音）。
 
-`ruby` 非空时，主程序会把这一行渲染成两行 grid：第一行是逐字读音，第二行是对应汉字，两套排版各自独立但共享列宽，所以能逐字对齐。粤语歌的粤拼就是这么显示的：
+读音单独占一行，和汉字行一样居中排版，不做逐字对齐。粤语歌的粤拼就是这么显示的：
 
 ```json
 {
-  "text": "我会与你变爱侣",
-  "emphasis": "primary",
-  "ruby": [
-    {"word": "我", "reading": "o"},
-    {"word": "会", "reading": "wui"},
-    {"word": "与", "reading": "yu"},
-    {"word": "你", "reading": "nei"}
+  "type": "lines",
+  "lines": [
+    {"text": "上一句", "emphasis": "muted"},
+    {"text": "我会与你", "emphasis": "primary"},
+    {"text": "o wui jyu nei", "emphasis": "reading"},
+    {"text": "下一句", "emphasis": "muted"}
   ]
 }
 ```
-
-`word` 和 `reading` 分开存，读音可以是多字母罗马字，汉字仍是一个字。
 
 ### 键值对
 
@@ -189,7 +186,7 @@ for line in sys.stdin:
 
 ## Rust 插件
 
-可以直接依赖 `inkbuddy-protocol` crate，里面有 `Request`、`Response`、`Block`、`Line`、`Ruby` 等类型和 serde 定义，省去手写 JSON 结构：
+可以直接依赖 `inkbuddy-protocol` crate，里面有 `Request`、`Response`、`Block`、`Line`、`Emphasis` 等类型和 serde 定义，省去手写 JSON 结构：
 
 ```toml
 [dependencies]

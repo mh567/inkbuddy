@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{debug, warn};
 
+use crate::player::LyricStrategy;
 use crate::qrc::{self, RomaLine};
 
 const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)";
@@ -19,6 +20,13 @@ const ROMA_TEXT_THRESHOLD: f64 = 0.6;
 /// Cap on each field folded into the cache key, guarding against pathological
 /// metadata. The hashed file name itself is always fixed-length.
 const CACHE_KEY_FIELD_LIMIT: usize = 256;
+
+fn strategy_name(strategy: LyricStrategy) -> &'static str {
+    match strategy {
+        LyricStrategy::QqFirst => "qq",
+        LyricStrategy::Race => "race",
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CachedSong {
@@ -257,8 +265,10 @@ impl LyricsSource {
     }
 
     /// Hash-based file name so different songs never overwrite each other and
-    /// long metadata cannot exceed the file-system name limit.
-    fn cache_path(&self, artist: &str, title: &str) -> PathBuf {
+    /// long metadata cannot exceed the file-system name limit. The strategy is
+    /// part of the key: QQ's simplified+Jyutping result and the race winner's
+    /// result for the same song stay in separate files.
+    fn cache_path(&self, strategy: LyricStrategy, artist: &str, title: &str) -> PathBuf {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let trunc = |s: &str| -> String {
@@ -268,7 +278,13 @@ impl LyricsSource {
                 .collect()
         };
         // "\0" prevents ("a","bc") and ("ab","c") from hashing identically.
-        let key = format!("{}\0{}", trunc(artist), trunc(title));
+        // Strategy prefix keeps QQ and race caches apart for the same song.
+        let key = format!(
+            "{}\0{}\0{}",
+            strategy_name(strategy),
+            trunc(artist),
+            trunc(title)
+        );
         let mut h = DefaultHasher::new();
         key.hash(&mut h);
         self.cache_dir.join(format!("{:016x}.json", h.finish()))
@@ -300,22 +316,23 @@ impl LyricsSource {
     /// the stored lines and Jyutping directly, without a network request.
     pub async fn get(
         &self,
+        strategy: LyricStrategy,
         artist: &str,
         title: &str,
         album: &str,
         duration: f64,
     ) -> Option<CachedSong> {
-        let path = self.cache_path(artist, title);
+        let path = self.cache_path(strategy, artist, title);
         if let Some(cached) = self.read_cache(&path) {
-            debug!(artist = %artist, title = %title, "lyrics cache hit");
+            debug!(artist = %artist, title = %title, strategy = strategy_name(strategy), "lyrics cache hit");
             return Some(cached);
         }
 
-        // Whole online fetch is capped so 4x8s serial requests cannot collide
-        // with the host's 3s render timeout.
+        // Whole online fetch is capped so several serial requests cannot
+        // collide with the host's 3s render timeout.
         let song = match tokio::time::timeout(
             Duration::from_millis(2500),
-            self.fetch_online(artist, title, album, duration),
+            self.fetch_online(strategy, artist, title, album, duration),
         )
         .await
         {
@@ -335,27 +352,66 @@ impl LyricsSource {
 
     async fn fetch_online(
         &self,
+        strategy: LyricStrategy,
         artist: &str,
         title: &str,
         album: &str,
         duration: f64,
     ) -> Option<CachedSong> {
-        // QQ first: its Mandarin songs are simplified and its Cantonese
-        // versions match the desktop player. LRCLIB often returns traditional
-        // Chinese uploads, so it is only a fallback.
-        if let Some(s) = self.fetch_qq(artist, title, album, duration).await {
-            if !s.lines.is_empty() {
-                debug!(artist = %artist, title = %title, "using QQ lyrics");
-                return Some(s);
+        match strategy {
+            // QQ 优先：国语为简体、粤语版本与桌面客户端一致，LRCLIB 兜底。
+            LyricStrategy::QqFirst => {
+                if let Some(s) = self.fetch_qq(artist, title, album, duration, true).await {
+                    if !s.lines.is_empty() {
+                        debug!(artist = %artist, title = %title, "using QQ lyrics");
+                        return Some(s);
+                    }
+                }
+                self.fetch_lrclib(artist, title)
+                    .await
+                    .filter(|s| !s.lines.is_empty())
+            }
+            // 两个来源同时发请求，先用先返回的有效歌词。
+            LyricStrategy::Race => {
+                self.fetch_race(artist, title, album, duration).await
             }
         }
-        if let Some(s) = self.fetch_lrclib(artist, title).await {
-            if !s.lines.is_empty() {
-                debug!(artist = %artist, title = %title, "using LRCLIB lyrics");
-                return Some(s);
+    }
+
+    /// 并发请求 QQ 与 LRCLIB，先用先返回的有效结果。两边都失败才返回 None。
+    /// `tokio::select!` 在某个分支返回时取消另一个 future，正在进行的 HTTP
+    /// 请求随之取消，不会白等慢的那个来源。
+    async fn fetch_race(
+        &self,
+        artist: &str,
+        title: &str,
+        album: &str,
+        duration: f64,
+    ) -> Option<CachedSong> {
+        let qq = self.fetch_qq(artist, title, album, duration, false);
+        let lrclib = self.fetch_lrclib(artist, title);
+        tokio::pin!(qq, lrclib);
+        let mut qq_done = false;
+        let mut lrclib_done = false;
+        loop {
+            tokio::select! {
+                r = &mut qq, if !qq_done => {
+                    qq_done = true;
+                    if let Some(s) = r.filter(|s| !s.lines.is_empty()) {
+                        debug!(artist = %artist, title = %title, source = %s.source, "race winner");
+                        return Some(s);
+                    }
+                }
+                r = &mut lrclib, if !lrclib_done => {
+                    lrclib_done = true;
+                    if let Some(s) = r.filter(|s| !s.lines.is_empty()) {
+                        debug!(artist = %artist, title = %title, source = %s.source, "race winner");
+                        return Some(s);
+                    }
+                }
+                else => return None,
             }
         }
-        None
     }
 
     /// 发请求并解析 JSON，每处失败都记录来源和原因。
@@ -442,12 +498,15 @@ impl LyricsSource {
         Some((id, mid))
     }
 
+    /// `with_roma` 控制是否额外请求 QRC 粤拼。Race 策略下关掉，让 QQ 与
+    /// LRCLIB 的耗时只取决于歌词本身，不会因为粤拼解密拖慢而必定落败。
     async fn fetch_qq(
         &self,
         artist: &str,
         title: &str,
         album: &str,
         duration: f64,
+        with_roma: bool,
     ) -> Option<CachedSong> {
         let (id, mid) = self.qq_search(artist, title, album, duration).await?;
 
@@ -497,7 +556,11 @@ impl LyricsSource {
 
         // Reuse the very same selected song id/mid for the QRC roma fetch:
         // a second search could pick a different (wrong) track.
-        let roma = self.fetch_roma_by_id(id, &mid).await.unwrap_or_default();
+        let roma = if with_roma {
+            self.fetch_roma_by_id(id, &mid).await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let roma_lines = bind_roma_to_lines(&lines, &roma);
 
         Some(CachedSong {
@@ -723,8 +786,8 @@ pub fn parse_lrc(text: &str) -> Vec<(f64, String)> {
 
 /// Find the line index for a playback position using the same boundary rule
 /// as the display: the current line is the last one whose start <= t. Using
-/// `end` here would leave gaps during instrumental breaks and make the ruby
-/// annotation disappear while the line is still on screen. Before the first
+/// `end` here would leave gaps during instrumental breaks and make the reading
+/// line disappear while the lyric is still on screen. Before the first
 /// line starts (intro) there is no current line, so `None` lets the caller
 /// show the idle note.
 pub fn line_index_at(lines: &[(f64, String)], t: f64) -> Option<usize> {
@@ -849,16 +912,18 @@ mod tests {
     }
 
     #[test]
-    fn cache_path_is_stable_and_case_insensitive() {
+    fn cache_path_is_stable_case_insensitive_and_strategy_scoped() {
         let dir =
             std::env::temp_dir().join(format!("inkbuddy-lyrics-cache-key-{}", std::process::id()));
         let source = LyricsSource::new(dir.clone()).expect("test LyricsSource");
-        let p1 = source.cache_path("Artist", "Song");
-        let p2 = source.cache_path("artist", "song");
-        let p3 = source.cache_path("Artist", "Other Song");
+        let p1 = source.cache_path(LyricStrategy::QqFirst, "Artist", "Song");
+        let p2 = source.cache_path(LyricStrategy::QqFirst, "artist", "song");
+        let p3 = source.cache_path(LyricStrategy::QqFirst, "Artist", "Other Song");
         assert_eq!(p1, p2, "case-insensitive: same song, same path");
         assert_ne!(p1, p3, "different songs must not overwrite each other");
-        assert_eq!(p1, source.cache_path("Artist", "Song"), "hash is stable");
+        assert_eq!(p1, source.cache_path(LyricStrategy::QqFirst, "Artist", "Song"));
+        let race = source.cache_path(LyricStrategy::Race, "Artist", "Song");
+        assert_ne!(p1, race, "strategies must not share a cache entry");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -876,7 +941,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let source = LyricsSource::new(dir.clone()).expect("test LyricsSource");
         let (artist, title) = ("Artist", "Song");
-        let path = source.cache_path(artist, title);
+        let path = source.cache_path(LyricStrategy::QqFirst, artist, title);
         let cached = CachedSong {
             lines: vec![(1.0, "歌词".to_string())],
             roma_lines: vec![Some(RomaLineCache {
@@ -890,7 +955,7 @@ mod tests {
         source.write_cache(&path, &cached);
 
         let got = source
-            .get(artist, title, "Album", 200.0)
+            .get(LyricStrategy::QqFirst, artist, title, "Album", 200.0)
             .await
             .expect("cache hit");
         assert_eq!(got.lines, cached.lines);

@@ -537,7 +537,7 @@ mod tests {
                 {"type": "text", "text": "hello"},
                 {"type": "future_widget", "x": 1},
                 {"type": "lines", "lines": [
-                    {"text": "hi", "emphasis": "bogus", "ruby": []}
+                    {"text": "hi", "emphasis": "bogus"}
                 ]},
                 {"type": "lines", "lines": "not-an-array"}
             ],

@@ -31,28 +31,15 @@ fn emphasis_class(e: Emphasis) -> &'static str {
         Emphasis::Primary => "line-primary",
         Emphasis::Normal => "line-normal",
         Emphasis::Muted => "line-muted",
+        Emphasis::Reading => "line-reading",
     }
 }
 
-/// Render a single line. When `ruby` is present, use a shared-column grid:
-/// the first row holds the readings, the second row the glyphs. Both rows
-/// have their own CSS, so romanisation layout is independent of glyph layout.
+/// Render one line of text. Reading lines use the same layout with a smaller
+/// CSS class, so no line type needs per-character cells.
 fn render_line(line: &Line) -> String {
     let cls = emphasis_class(line.emphasis);
-    if line.ruby.is_empty() {
-        return format!("<div class=\"line {cls}\">{}</div>", esc(&line.text));
-    }
-
-    let n = line.ruby.len();
-    let mut readings = String::new();
-    let mut glyphs = String::new();
-    for r in &line.ruby {
-        readings.push_str(&format!("<span class=\"roma\">{}</span>", esc(&r.reading)));
-        glyphs.push_str(&format!("<span class=\"han\">{}</span>", esc(&r.word)));
-    }
-    format!(
-        "<div class=\"line {cls} ruby-grid\" style=\"grid-template-columns:repeat({n},auto)\">{readings}{glyphs}</div>"
-    )
+    format!("<div class=\"line {cls}\">{}</div>", esc(&line.text))
 }
 
 fn render_block(block: &Block) -> String {
@@ -230,7 +217,6 @@ pub fn render_frame(parts: &[(String, RenderResult)], fallback_ms: u64) -> Frame
 #[cfg(test)]
 mod tests {
     use super::*;
-    use inkbuddy_protocol::Ruby;
 
     fn text_block(text: &str) -> RenderResult {
         RenderResult {
@@ -300,34 +286,25 @@ mod tests {
     }
 
     #[test]
-    fn ruby_grid_keeps_reading_and_glyph_columns() {
+    fn reading_line_renders_as_plain_text() {
         let frame = render_frame(
             &[(
                 "lyrics".into(),
                 RenderResult {
                     blocks: vec![Block::Lines {
-                        lines: vec![Line {
-                            text: "我会".to_string(),
-                            emphasis: Emphasis::Primary,
-                            ruby: vec![
-                                Ruby {
-                                    word: "我".to_string(),
-                                    reading: "o".to_string(),
-                                },
-                                Ruby {
-                                    word: "会".to_string(),
-                                    reading: "wui".to_string(),
-                                },
-                            ],
-                        }],
+                        lines: vec![
+                            Line::new("我会与你", Emphasis::Primary),
+                            Line::new("o wui jyu nei", Emphasis::Reading),
+                        ],
                     }],
                     refresh_ms: Some(500),
                 },
             )],
             500,
         );
-        assert!(frame.html.contains("grid-template-columns:repeat(2,auto)"));
-        assert!(frame.html.contains(">o</span>"));
-        assert!(frame.html.contains(">我</span>"));
+        assert!(frame.html.contains("line-primary\">我会与你</div>"));
+        assert!(frame.html.contains("line-reading\">o wui jyu nei</div>"));
+        assert!(!frame.html.contains("ruby-grid"));
+        assert!(!frame.html.contains("grid-template-columns"));
     }
 }

@@ -35,6 +35,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <dict>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>INKBUDDY_LATENCY_MS</key>
+    <string>300</string>
+    <key>INKBUDDY_LATENCY_OTHER_MS</key>
+    <string>0</string>
   </dict>
 </dict>
 </plist>

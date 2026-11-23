@@ -16,6 +16,8 @@ pub struct Playback {
     pub title: String,
     pub artist: String,
     pub album: String,
+    /// MediaRemote 上报的播放器 bundle id，用于按播放器选择策略。
+    pub bundle_id: Option<String>,
     pub duration: f64,
     /// Progress reported by the player at this instant. QQ Music freezes this
     /// at 0 for the whole track; the clock in `state.rs` advances it locally.
@@ -67,6 +69,8 @@ struct RawNowPlaying {
     duration: Option<f64>,
     #[serde(rename = "kMRMediaRemoteNowPlayingInfoElapsedTime")]
     elapsed: Option<f64>,
+    #[serde(rename = "kMRMediaRemoteNowPlayingInfoClientBundleIdentifier")]
+    bundle_id: Option<String>,
 }
 
 /// Full field set returned by `mediaremote-mini.pl adapter_get_env` in a
@@ -82,6 +86,7 @@ struct HelperEnv {
     playing: bool,
     playback_rate: f64,
     reported_at: Option<f64>,
+    bundle_id: Option<String>,
 }
 
 /// 解析 helper 的 JSON。载荷格式错误或 `playing` 字段缺失、无法识别时返回
@@ -103,6 +108,10 @@ fn parse_helper_env(text: &str) -> Option<HelperEnv> {
             .get("timestamp")
             .and_then(|x| x.as_str())
             .and_then(parse_iso8601_utc),
+        bundle_id: v
+            .get("bundleIdentifier")
+            .and_then(|x| x.as_str())
+            .map(|x| x.to_string()),
     })
 }
 
@@ -223,6 +232,7 @@ impl NowPlayingBackend for CliBackend {
                 title,
                 artist,
                 album: env.album,
+                bundle_id: env.bundle_id,
                 duration: env.duration,
                 elapsed: env.elapsed,
                 playing,
@@ -254,6 +264,7 @@ impl NowPlayingBackend for CliBackend {
             title,
             artist,
             album: raw.album.unwrap_or_default(),
+            bundle_id: raw.bundle_id,
             duration: raw.duration.unwrap_or(0.0),
             elapsed: raw.elapsed.unwrap_or(0.0),
             playing,
@@ -412,6 +423,7 @@ mod tests {
             artist: "Beyond".into(),
             title: "海阔天空".into(),
             album: "乐与怒".into(),
+            bundle_id: None,
             duration: 326.0,
             elapsed: 0.0,
             playing: true,
@@ -441,12 +453,14 @@ mod tests {
         let json = r#"{
             "title":"海阔天空","artist":"Beyond","album":"乐与怒",
             "duration":326.0,"elapsedTime":12.5,
-            "playing":true,"playbackRate":1.0
+            "playing":true,"playbackRate":1.0,
+            "bundleIdentifier":"com.tencent.QQMusicMac"
         }"#;
         let env = parse_helper_env(json).expect("valid helper env");
         assert_eq!(env.title, "海阔天空");
         assert_eq!(env.artist, "Beyond");
         assert_eq!(env.album, "乐与怒");
+        assert_eq!(env.bundle_id.as_deref(), Some("com.tencent.QQMusicMac"));
         assert!((env.duration - 326.0).abs() < 1e-6);
         assert!((env.elapsed - 12.5).abs() < 1e-6, "elapsedTime -> elapsed");
         assert!(
@@ -470,6 +484,16 @@ mod tests {
     fn helper_env_missing_playing_is_rejected() {
         assert!(parse_helper_env(r#"{"title":"x","elapsedTime":1.0}"#).is_none());
         assert!(parse_helper_env("not json").is_none());
+    }
+
+    #[test]
+    fn get_raw_maps_bundle_identifier() {
+        let json = r#"{
+            "kMRMediaRemoteNowPlayingInfoTitle":"Song",
+            "kMRMediaRemoteNowPlayingInfoClientBundleIdentifier":"com.spotify.client"
+        }"#;
+        let raw: RawNowPlaying = serde_json::from_str(json).expect("valid raw");
+        assert_eq!(raw.bundle_id.as_deref(), Some("com.spotify.client"));
     }
 
     #[test]

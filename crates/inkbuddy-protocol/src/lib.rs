@@ -32,7 +32,7 @@
 //! # Example response (plugin -> host, one line)
 //!
 //! ```json
-//! {"id":1,"ok":true,"result":{"blocks":[{"type":"lines","lines":[{"text":"Hello","emphasis":"primary","ruby":[]}]}],"refresh_ms":500}}
+//! {"id":1,"ok":true,"result":{"blocks":[{"type":"lines","lines":[{"text":"Hello","emphasis":"primary"}]}],"refresh_ms":500}}
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -180,15 +180,8 @@ pub enum Emphasis {
     Normal,
     /// Smaller, grey. Context lines above/below the focal line.
     Muted,
-}
-
-/// Per-character reading (Cantonese Jyutping, Japanese furigana, ...).
-/// `word` and `reading` are kept as separate fields so a reading can be a
-/// multi-letter romanisation while `word` stays a single glyph.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Ruby {
-    pub word: String,
-    pub reading: String,
+    /// Small, grey reading line, e.g. Jyutping. Rendered on its own row.
+    Reading,
 }
 
 /// An unknown emphasis string from a third-party plugin falls back to Normal,
@@ -201,6 +194,7 @@ where
     Ok(match raw.as_deref() {
         Some("primary") => Emphasis::Primary,
         Some("muted") => Emphasis::Muted,
+        Some("reading") => Emphasis::Reading,
         _ => Emphasis::Normal,
     })
 }
@@ -211,9 +205,6 @@ pub struct Line {
     pub text: String,
     #[serde(deserialize_with = "de_emphasis")]
     pub emphasis: Emphasis,
-    /// When non-empty the host renders `text` as per-character cells with the
-    /// readings above them on a shared grid.
-    pub ruby: Vec<Ruby>,
 }
 
 impl Default for Line {
@@ -221,7 +212,6 @@ impl Default for Line {
         Self {
             text: String::new(),
             emphasis: Emphasis::Normal,
-            ruby: Vec::new(),
         }
     }
 }
@@ -231,7 +221,6 @@ impl Line {
         Self {
             text: text.into(),
             emphasis,
-            ..Default::default()
         }
     }
 }
@@ -303,7 +292,7 @@ mod tests {
         let line = Line::new("我会与你变爱侣", Emphasis::Primary);
         let json = serde_json::to_string(&line).unwrap();
         assert!(json.contains("\"primary\""));
-        assert!(json.contains("\"ruby\":[]"));
+        assert!(!json.contains("ruby"));
     }
 
     #[test]
@@ -330,14 +319,14 @@ mod tests {
 
     #[test]
     fn unknown_emphasis_falls_back_to_normal() {
-        let l: Line =
-            serde_json::from_str(r#"{"text":"hi","emphasis":"blink","ruby":[]}"#).unwrap();
+        let l: Line = serde_json::from_str(r#"{"text":"hi","emphasis":"blink"}"#).unwrap();
         assert_eq!(l.emphasis, Emphasis::Normal);
-        let l2: Line = serde_json::from_str(r#"{"text":"hi","ruby":[]}"#).unwrap();
+        let l2: Line = serde_json::from_str(r#"{"text":"hi"}"#).unwrap();
         assert_eq!(l2.emphasis, Emphasis::Normal);
-        let l3: Line =
-            serde_json::from_str(r#"{"text":"hi","emphasis":"muted","ruby":[]}"#).unwrap();
+        let l3: Line = serde_json::from_str(r#"{"text":"hi","emphasis":"muted"}"#).unwrap();
         assert_eq!(l3.emphasis, Emphasis::Muted);
+        let l4: Line = serde_json::from_str(r#"{"text":"o nei","emphasis":"reading"}"#).unwrap();
+        assert_eq!(l4.emphasis, Emphasis::Reading);
     }
 
     #[test]

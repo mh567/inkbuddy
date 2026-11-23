@@ -4,6 +4,7 @@
 //! on stdin/stdout; diagnostics go to stderr so they never corrupt the stream.
 
 mod nowplaying;
+mod player;
 mod qrc;
 mod source;
 mod state;
@@ -110,6 +111,13 @@ async fn main() -> Result<()> {
             Method::Configure => {
                 if let Some(ms) = req.params.get("latency_ms").and_then(|v| v.as_f64()) {
                     state.set_latency_ms(ms);
+                }
+                if let Some(ms) = req
+                    .params
+                    .get("other_latency_ms")
+                    .and_then(|v| v.as_f64())
+                {
+                    state.set_other_latency_ms(ms);
                 }
                 Response::empty_ok(id)
             }

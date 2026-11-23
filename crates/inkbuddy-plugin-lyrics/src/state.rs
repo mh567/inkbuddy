@@ -5,8 +5,9 @@
 //! 拖到 0 属于变化，需要重设锚点。
 
 use crate::nowplaying::{NowPlayingBackend, Playback};
+use crate::player::{ClockMode, PlayerKind};
 use crate::source::{line_index_at, CachedSong, LyricsSource};
-use inkbuddy_protocol::{Block, Emphasis, Line, RenderResult, Ruby};
+use inkbuddy_protocol::{Block, Emphasis, Line, RenderResult};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
 
@@ -28,9 +29,11 @@ pub struct PluginState {
     position_base: f64,
     position_base_at: Instant,
     last_playing: bool,
-    /// 正值表示歌词提前出现，用于抵消墨水屏刷新延迟。默认 0.0 秒，可通过
-    /// INKBUDDY_LATENCY_MS（毫秒）或 Method::Configure 调整。
-    latency: f64,
+    /// 提前量（秒），按播放器分别保存：QQ 音乐用 INKBUDDY_LATENCY_MS，
+    /// 其它播放器用 INKBUDDY_LATENCY_OTHER_MS。正值表示歌词提前出现，
+    /// 抵消墨水屏刷新延迟；也可通过 Method::Configure 分别调整。
+    qq_latency: f64,
+    other_latency: f64,
 
     cached_track: Option<String>,
     cached_song: Option<CachedSong>,
@@ -38,8 +41,8 @@ pub struct PluginState {
     fetch_deadline: Option<Instant>,
 }
 
-fn latency_from_env() -> f64 {
-    std::env::var("INKBUDDY_LATENCY_MS")
+fn latency_from_env(name: &str) -> f64 {
+    std::env::var(name)
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
         .map(|ms| ms / 1000.0)
@@ -56,26 +59,48 @@ impl PluginState {
             position_base: 0.0,
             position_base_at: Instant::now(),
             last_playing: false,
-            latency: latency_from_env(),
+            qq_latency: latency_from_env("INKBUDDY_LATENCY_MS"),
+            other_latency: latency_from_env("INKBUDDY_LATENCY_OTHER_MS"),
             cached_track: None,
             cached_song: None,
             fetch_deadline: None,
         }
     }
 
-    /// Write back a latency configured by the host, in milliseconds.
+    /// 设置 QQ 音乐的提前量（毫秒）。保留原方法名，兼容既有 Configure 调用。
     pub fn set_latency_ms(&mut self, ms: f64) {
-        self.latency = ms / 1000.0;
+        self.qq_latency = ms / 1000.0;
+    }
+
+    /// 设置其它播放器的提前量（毫秒）。
+    pub fn set_other_latency_ms(&mut self, ms: f64) {
+        self.other_latency = ms / 1000.0;
+    }
+
+    fn player(pb: &Playback) -> PlayerKind {
+        PlayerKind::from_bundle_id(pb.bundle_id.as_deref())
     }
 
     /// Current playback position with latency compensation applied.
     fn position(&self, pb: &Playback) -> f64 {
-        let base = if pb.playing {
-            self.position_base + self.position_base_at.elapsed().as_secs_f64() + self.latency
-        } else {
-            // Paused: freeze the clock and do NOT add latency compensation.
-            self.position_base
+        let player = Self::player(pb);
+        let latency = match player {
+            PlayerKind::QqMusic => self.qq_latency,
+            _ => self.other_latency,
         };
+        let base = match player.clock_mode() {
+            // QQ 冻结上报值：用本地时钟推进。
+            ClockMode::FrozenLocal => {
+                if pb.playing {
+                    self.position_base + self.position_base_at.elapsed().as_secs_f64()
+                } else {
+                    self.position_base
+                }
+            }
+            // 其它播放器上报值可用：直接用它，不本地推进。
+            ClockMode::ReportElapsed => pb.elapsed,
+        };
+        let base = if pb.playing { base + latency } else { base };
         // Never run past the end of the track (the local clock would otherwise
         // keep ticking forever and leave lyrics stuck on the last line).
         if pb.duration > 0.0 {
@@ -131,27 +156,36 @@ impl PluginState {
     fn update_clock(&mut self, pb: &Playback) {
         let track_id = pb.track_id();
         let now = Instant::now();
+        let new_track = self.last_track_id.as_deref() != Some(track_id.as_str());
+        let previous_reported = self.last_reported;
+        self.last_track_id = Some(track_id);
+        self.last_reported = pb.elapsed;
 
-        if self.last_track_id.as_deref() != Some(track_id.as_str()) {
-            self.last_track_id = Some(track_id);
-            self.position_base = Self::aligned_position(pb);
-            self.position_base_at = now;
-            self.last_reported = pb.elapsed;
+        // 其它播放器直接用上报进度，本地时钟不参与。
+        if Self::player(pb).clock_mode() == ClockMode::ReportElapsed {
             self.last_playing = pb.playing;
             return;
         }
 
-        // 只有上报值发生变化才算跳转。把冻结的上报值与本地时钟比较会反复重设\n        // 锚点到 0，歌词在开头几行来回跳。
-        if (pb.elapsed - self.last_reported).abs() > SEEK_EPS {
+        // QQ 音乐：上报值长期冻结，用快照时间对齐起点并本地推进。
+        if new_track {
+            self.position_base = Self::aligned_position(pb);
+            self.position_base_at = now;
+            self.last_playing = pb.playing;
+            return;
+        }
+
+        // 只有上报值发生变化才算跳转。把冻结的上报值与本地时钟比较会反复重设
+        // 锚点到 0，歌词在开头几行来回跳。
+        if (pb.elapsed - previous_reported).abs() > SEEK_EPS {
             debug!(
                 reported = pb.elapsed,
-                previous = self.last_reported,
+                previous = previous_reported,
                 "clock re-anchored after seek"
             );
             self.position_base = Self::aligned_position(pb);
             self.position_base_at = now;
         }
-        self.last_reported = pb.elapsed;
 
         // pause/resume only toggles the local clock; it never corrects position.
         if pb.playing && !self.last_playing {
@@ -169,6 +203,8 @@ impl PluginState {
             Some(v) if v.has_track() => v,
             _ => return idle_frame(),
         };
+        let player = Self::player(&pb);
+        debug!(player = player.as_str(), "now playing source");
         self.update_clock(&pb);
 
         let track_id = pb.track_id();
@@ -178,9 +214,10 @@ impl PluginState {
                 .map(|d| Instant::now() >= d)
                 .unwrap_or(true);
             if allowed {
+                let strategy = player.lyric_strategy();
                 match self
                     .source
-                    .get(&pb.artist, &pb.title, &pb.album, pb.duration)
+                    .get(strategy, &pb.artist, &pb.title, &pb.album, pb.duration)
                     .await
                 {
                     Some(song) => {
@@ -223,24 +260,19 @@ impl PluginState {
 
         // 粤拼按行索引（roma_lines）与 LRC 绑定。LRC 与 QRC 来自不同接口，
         // 时间戳可能整体错开，因此不按时间软匹配。
-        let ruby: Vec<(String, String)> = song
+        let jyutping: Vec<String> = song
             .roma_lines
             .get(idx)
             .and_then(|x| x.as_ref())
-            .map(|r| r.words.clone())
+            .map(|r| r.words.iter().map(|(_, reading)| reading.clone()).collect())
             .unwrap_or_default();
 
         let mut lines = Vec::new();
         lines.push(Line::new(prev.unwrap_or_default(), Emphasis::Muted));
-
-        let mut current = Line::new(cur, Emphasis::Primary);
-        if !ruby.is_empty() {
-            current.ruby = ruby
-                .into_iter()
-                .map(|(word, reading)| Ruby { word, reading })
-                .collect();
+        lines.push(Line::new(cur, Emphasis::Primary));
+        if !jyutping.is_empty() {
+            lines.push(Line::new(jyutping.join(" "), Emphasis::Reading));
         }
-        lines.push(current);
         lines.push(Line::new(next.unwrap_or_default(), Emphasis::Muted));
 
         let meta = if pb.artist.is_empty() {
@@ -295,6 +327,7 @@ mod tests {
             title: "Song".into(),
             artist: "Artist".into(),
             album: "Album".into(),
+            bundle_id: Some("com.tencent.QQMusicMac".into()),
             duration: 300.0,
             elapsed,
             playing,
@@ -326,6 +359,48 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock after epoch")
             .as_secs_f64()
+    }
+
+    #[tokio::test]
+    async fn jyutping_renders_as_a_standalone_line() {
+        let pb = make_pb(5.0, true);
+        let mut s = primed(&pb, 5.0, 5.0, true);
+        s.cached_track = Some(pb.track_id());
+        s.backend = Box::new(FakeBackend(Some(pb)));
+        s.cached_song = Some(CachedSong {
+            lines: vec![
+                (0.0, "上一句".into()),
+                (4.0, "我会与你".into()),
+                (9.0, "下一句".into()),
+            ],
+            roma_lines: vec![
+                None,
+                Some(crate::source::RomaLineCache {
+                    start: 4.0,
+                    end: 9.0,
+                    words: vec![
+                        ("我".into(), "o".into()),
+                        ("会".into(), "wui".into()),
+                        ("与".into(), "jyu".into()),
+                        ("你".into(), "nei".into()),
+                    ],
+                }),
+                None,
+            ],
+            roma_checked: true,
+            ..Default::default()
+        });
+
+        let frame = s.render().await;
+        let Block::Lines { lines } = &frame.blocks[0] else {
+            panic!("first block should be lines");
+        };
+        assert_eq!(lines.len(), 4, "prev + current + jyutping + next");
+        assert_eq!(lines[1].text, "我会与你");
+        assert_eq!(lines[1].emphasis, Emphasis::Primary);
+        assert_eq!(lines[2].text, "o wui jyu nei");
+        assert_eq!(lines[2].emphasis, Emphasis::Reading);
+        assert_eq!(lines[3].text, "下一句");
     }
 
     #[tokio::test]
@@ -420,6 +495,38 @@ mod tests {
             (s.position(&pb_pause) - 10.0).abs() < 0.05,
             "no latency compensation while paused"
         );
+    }
+
+    #[tokio::test]
+    async fn other_player_position_uses_reported_elapsed_not_local_clock() {
+        let mut pb = make_pb(42.0, true);
+        pb.bundle_id = Some("com.spotify.client".into());
+        let mut s = primed(&pb, 0.0, 0.0, true);
+        s.set_other_latency_ms(0.0);
+        // 本地锚点是 0，但 Spotify 上报 42 秒，应直接采用上报值。
+        assert!((s.position(&pb) - 42.0).abs() < 0.05);
+    }
+
+    #[tokio::test]
+    async fn other_player_seek_needs_no_local_reanchor() {
+        let mut pb = make_pb(5.0, true);
+        pb.bundle_id = Some("com.spotify.client".into());
+        let mut s = primed(&pb, 0.0, 0.0, true);
+        s.update_clock(&pb);
+        // 其它播放器不维护本地锚点，position_base 保持原值。
+        assert!((s.position_base - 0.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn latency_is_separate_per_player() {
+        let mut pb = make_pb(10.0, true);
+        let mut s = primed(&pb, 10.0, 10.0, true);
+        s.set_latency_ms(300.0);
+        s.set_other_latency_ms(0.0);
+        assert!((s.position(&pb) - 10.3).abs() < 0.05, "QQ uses 300ms");
+
+        pb.bundle_id = Some("com.spotify.client".into());
+        assert!((s.position(&pb) - 10.0).abs() < 0.05, "Spotify uses 0ms");
     }
 
     #[tokio::test]
