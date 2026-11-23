@@ -10,9 +10,7 @@ use tracing::{debug, warn};
 use crate::qrc::{self, RomaLine};
 
 const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)";
-/// QQ search results below this score are rejected (ported from the Python
-/// prototype's `MIN_CONFIDENCE_THRESHOLD`), so covers / live / wrong-language
-/// versions never win over LRCLIB.
+/// QQ 搜索结果低于此分数会被丢弃，避免翻唱、现场、错语种版本盖过 LRCLIB。
 const QQ_MIN_SCORE: i32 = 65;
 /// Jyutping/LRC time-proximity tolerance when both texts match exactly.
 const ROMA_TIME_TOLERANCE: f64 = 0.5;
@@ -29,10 +27,6 @@ pub struct CachedSong {
     pub source: String,
     /// (seconds, text)
     pub lines: Vec<(f64, String)>,
-    /// Raw QRC alignment result, keyed by its own start time. Kept for
-    /// backward compatibility with existing cache files.
-    #[serde(default)]
-    pub roma: Vec<RomaLineCache>,
     /// Jyutping bound to LRC lines BY INDEX; length == lines.len().
     /// `None` means that line has no romanisation.
     #[serde(default)]
@@ -111,14 +105,12 @@ fn text_similarity(a: &str, b: &str) -> f64 {
     2.0 * lcs_len(&ac, &bc) as f64 / (ac.len() + bc.len()) as f64
 }
 
-/// Bind each QRC `RomaLine` to an LRC line by normalised text. LRC and QRC
-/// come from different endpoints, so their timestamps may be shifted as a
-/// whole: a 0.3s soft time-match used to drop the entire song's Jyutping.
+/// 按规范化文本把 QRC 的 `RomaLine` 绑定到 LRC 行。LRC 和 QRC 来自不同接口，
+/// 时间戳可能整体错开，因此先按文本匹配，时间只作辅助。
 ///
-/// For every LRC line we first look for an unused roma line whose text matches
-/// exactly and whose start is within `ROMA_TIME_TOLERANCE`; if none, we fall
-/// back to the best text-only match (time-independent). Each roma line is used
-/// at most once. The returned vector always has `lines.len()` elements.
+/// 每行 LRC 先找文本完全一致、起始时间差在 `ROMA_TIME_TOLERANCE` 内且尚未使用的
+/// 粤拼行；找不到时取文本最相近的一行。每条粤拼行最多用一次，返回向量长度
+/// 恒为 `lines.len()`。
 fn bind_roma_to_lines(lines: &[(f64, String)], roma: &[RomaLine]) -> Vec<Option<RomaLineCache>> {
     let roma_text: Vec<String> = roma
         .iter()
@@ -179,7 +171,7 @@ fn bind_roma_to_lines(lines: &[(f64, String)], roma: &[RomaLine]) -> Vec<Option<
     out
 }
 
-/// Score a QQ search hit (ported from `qq.py::_score_result`).
+/// 给 QQ 搜索结果打分。
 fn qq_score(
     song: &serde_json::Value,
     artist: &str,
@@ -304,10 +296,8 @@ impl LyricsSource {
         }
     }
 
-    /// Fetch lyrics, using the on-disk cache when present. A cache hit never
-    /// triggers a network request: old caches are upgraded locally (rebinding
-    /// raw `roma` to `roma_lines`) and marked `roma_checked` so the "confirmed
-    /// no Jyutping" result is persisted instead of re-fetched every switch.
+    /// Fetch lyrics, using the on-disk cache when present. A cache hit returns
+    /// the stored lines and Jyutping directly, without a network request.
     pub async fn get(
         &self,
         artist: &str,
@@ -316,27 +306,8 @@ impl LyricsSource {
         duration: f64,
     ) -> Option<CachedSong> {
         let path = self.cache_path(artist, title);
-        if let Some(mut cached) = self.read_cache(&path) {
+        if let Some(cached) = self.read_cache(&path) {
             debug!(artist = %artist, title = %title, "lyrics cache hit");
-            if !cached.roma_checked {
-                // Legacy cache: rebind the raw QRC result to LRC lines locally.
-                if cached.roma_lines.is_empty() && !cached.roma.is_empty() {
-                    let roma: Vec<RomaLine> = cached
-                        .roma
-                        .iter()
-                        .map(|c| RomaLine {
-                            start: c.start,
-                            end: c.end,
-                            words: c.words.clone(),
-                        })
-                        .collect();
-                    let bound = bind_roma_to_lines(&cached.lines, &roma);
-                    cached.roma_lines = bound;
-                }
-                // Whether or not we found any roma, resolve it once and persist.
-                cached.roma_checked = true;
-                self.write_cache(&path, &cached);
-            }
             return Some(cached);
         }
 
@@ -387,8 +358,7 @@ impl LyricsSource {
         None
     }
 
-    /// Send a request and decode JSON, logging the source and reason at every
-    /// failure point (instead of silently swallowing it with `.ok()?`).
+    /// 发请求并解析 JSON，每处失败都记录来源和原因。
     async fn fetch_json(
         &self,
         builder: reqwest::RequestBuilder,
@@ -529,17 +499,13 @@ impl LyricsSource {
         // a second search could pick a different (wrong) track.
         let roma = self.fetch_roma_by_id(id, &mid).await.unwrap_or_default();
         let roma_lines = bind_roma_to_lines(&lines, &roma);
-        let roma_cache: Vec<RomaLineCache> = roma.iter().map(RomaLineCache::from).collect();
 
         Some(CachedSong {
             artist: artist.to_string(),
             title: title.to_string(),
             source: "qq".to_string(),
             lines,
-            roma: roma_cache,
             roma_lines,
-            // The QQ path has now attempted the QRC roma fetch; the outcome
-            // (present or absent) is final, so never re-fetch on a cache hit.
             roma_checked: true,
         })
     }
@@ -686,23 +652,18 @@ impl LyricsSource {
             title: title.to_string(),
             source: "lrclib".to_string(),
             lines,
-            roma: Vec::new(),
             roma_lines: Vec::new(),
-            // LRCLIB has no QRC/Jyutping source; mark as resolved so a cache
-            // hit never re-queries the network.
             roma_checked: true,
         })
     }
 }
 
-/// Parse LRC into sorted (seconds, text) pairs.
+/// 把 LRC 解析成按时间排序的 (秒, 文本) 对。
 ///
-/// Every `[mm:ss.xx]` tag on a line produces its own pair (the body follows
-/// the last leading tag). A `/` in the body only introduces a translation, so
-/// we keep the first segment instead of dropping the whole line. Metadata
-/// tags (`ti/ar/al/by/offset/length/re/ve`) are skipped, matching the Python
-/// prototype; instrumental gaps are handled by `line_index_at` (start
-/// boundary), not here.
+/// 一行里的每个 `[mm:ss.xx]` 时间戳各产生一对，正文取最后那个前置标签之后的内容。
+/// 正文里的 `/` 表示翻译，保留第一段即可。元数据标签
+/// (`ti/ar/al/by/offset/length/re/ve`) 直接跳过；间奏空档由 `line_index_at`
+/// 按起始边界处理。
 pub fn parse_lrc(text: &str) -> Vec<(f64, String)> {
     const METADATA: [&str; 8] = ["ti", "ar", "al", "by", "offset", "length", "re", "ve"];
     let mut out = Vec::new();
@@ -738,7 +699,7 @@ pub fn parse_lrc(text: &str) -> Vec<(f64, String)> {
             cursor = close + 1;
         }
 
-        // Metadata is judged on the first tag, as in the Python prototype.
+        // 元数据标签以第一个为准。
         if first_tag
             .map(|t| METADATA.iter().any(|m| t.starts_with(*m)))
             .unwrap_or(false)
@@ -788,9 +749,7 @@ pub fn line_index_at(lines: &[(f64, String)], t: f64) -> Option<usize> {
 mod tests {
     use super::*;
 
-    // NOTE: updated for the new behaviour. A `/` now only strips the
-    // translation segment instead of discarding the whole line, so this LRC
-    // yields three lines instead of two. Metadata tags are still skipped.
+    // `/` 只去掉翻译段，整行保留，因此这段 LRC 解析出三行。元数据标签跳过。
     #[test]
     fn lrc_parsing_skips_metadata_and_translation() {
         let lrc = "[ti:Song]\n[ar:Artist]\n[00:12.30]第一句\n[00:15.00]a / b\n[00:18.00]第二句";
@@ -911,33 +870,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_with_new_signature_uses_cache_without_network() {
+    async fn get_returns_cached_song_without_network() {
         let dir =
             std::env::temp_dir().join(format!("inkbuddy-lyrics-get-sig-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let source = LyricsSource::new(dir.clone()).expect("test LyricsSource");
         let (artist, title) = ("Artist", "Song");
         let path = source.cache_path(artist, title);
-        // Legacy cache: has raw `roma`, no `roma_lines`, not yet checked.
-        let legacy = CachedSong {
+        let cached = CachedSong {
             lines: vec![(1.0, "歌词".to_string())],
-            roma: vec![RomaLineCache {
+            roma_lines: vec![Some(RomaLineCache {
                 start: 1.0,
                 end: 2.0,
                 words: vec![("歌".into(), "go1".into()), ("词".into(), "ci4".into())],
-            }],
+            })],
+            roma_checked: true,
             ..Default::default()
         };
-        source.write_cache(&path, &legacy);
+        source.write_cache(&path, &cached);
 
-        // 4-argument signature is callable; a cache hit never touches the net.
         let got = source
             .get(artist, title, "Album", 200.0)
             .await
             .expect("cache hit");
-        assert_eq!(got.lines.len(), 1);
-        assert!(got.roma_checked, "legacy cache is marked resolved");
-        assert_eq!(got.roma_lines.len(), 1, "roma bound to the single LRC line");
+        assert_eq!(got.lines, cached.lines);
+        assert_eq!(got.roma_lines.len(), 1);
         assert!(got.roma_lines[0].is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }

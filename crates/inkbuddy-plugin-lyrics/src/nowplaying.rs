@@ -1,13 +1,9 @@
 //! Reads macOS "Now Playing" information: title, artist, elapsed time,
 //! duration and the authoritative play/pause flag.
 //!
-//! Two backends:
-//! * `MediaRemoteBackend` — a reserved native slot, disabled in v1. The
-//!   private framework's C functions return empty data in a normal process;
-//!   see `mediaremote.rs` for the measured result.
-//! * `CliBackend` — the backend in use: prefers the MediaRemoteMini helper,
-//!   which returns the full field set in one process; falls back to
-//!   `nowplaying-cli get-raw` only when the helper is unavailable.
+//! `CliBackend` prefers the MediaRemoteMini helper, which returns the full
+//! field set in one process; it falls back to `nowplaying-cli get-raw` only
+//! when the helper is unavailable.
 
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,9 +53,8 @@ pub trait NowPlayingBackend: Send + Sync {
 // Fallback: nowplaying-cli + its MediaRemoteMini helper
 // ---------------------------------------------------------------------------
 
-/// `nowplaying-cli get-raw` output. Used only on the fallback path.
-/// `PlaybackRate` is deliberately NOT parsed: QQ Music keeps it at 1 while
-/// paused, so it must never be used as a play/pause flag.
+/// `nowplaying-cli get-raw` 的输出，仅在回退路径使用。这里忽略 `PlaybackRate`：
+/// QQ 音乐暂停时它仍为 1，无法反映播放状态。
 #[derive(Debug, Deserialize, Default)]
 struct RawNowPlaying {
     #[serde(rename = "kMRMediaRemoteNowPlayingInfoTitle")]
@@ -89,9 +84,8 @@ struct HelperEnv {
     reported_at: Option<f64>,
 }
 
-/// Parse the helper's JSON. Returns `None` when the payload is not JSON or the
-/// `playing` field is missing/unrecognisable, so the caller falls back to the
-/// sticky value instead of guessing (never assume playback is running).
+/// 解析 helper 的 JSON。载荷格式错误或 `playing` 字段缺失、无法识别时返回
+/// `None`，调用方沿用上一次的播放状态。
 fn parse_helper_env(text: &str) -> Option<HelperEnv> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
     let playing = parse_playing(v.get("playing")?)?;
@@ -160,8 +154,7 @@ fn parse_iso8601_utc(s: &str) -> Option<f64> {
 
 pub struct CliBackend {
     helper: Option<(String, String)>, // (dylib path, perl script path)
-    /// Last known play/pause state. When the helper gives no answer we keep
-    /// this value and never default to `true`.
+    /// 上一次的播放状态。helper 没有给出结果时沿用此值。
     last_playing: AtomicBool,
 }
 
@@ -185,7 +178,7 @@ impl CliBackend {
                 let sticky = self.last_playing.load(Ordering::Relaxed);
                 warn!(
                     playing = sticky,
-                    "helper gave no playing state, keeping last known value (never default true)"
+                    "helper gave no playing state, keeping last known value"
                 );
                 sticky
             }
@@ -237,8 +230,8 @@ impl NowPlayingBackend for CliBackend {
             });
         }
 
-        // Helper unavailable / failed / unparsable: fall back to `get-raw`
-        // for track metadata, but NEVER derive `playing` from PlaybackRate.
+        // helper 不可用或解析失败时，用 `get-raw` 读取曲目信息；播放状态沿用
+        // 上一次的值。
         let playing = self.resolve_playing(None);
         let out = run_command(
             &nowplaying_cli_program(),
@@ -318,8 +311,7 @@ fn find_helper() -> Option<(String, String)> {
             candidates.push((mtime, entry.to_string_lossy().to_string()));
         }
     }
-    // Newest first (by install time), not lexicographic last(): version
-    // strings like 1.9 vs 1.10 sort the wrong way lexicographically.
+    // 按安装时间从新到旧排序；版本号按字典序比较时 1.9 与 1.10 会排反。
     candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
     for (_, dylib) in candidates {
         let prefix = dylib.split("/lib/nowplaying-cli/").next().unwrap_or("");
@@ -345,10 +337,9 @@ fn run_command(program: &str, args: &[&str], timeout: Duration) -> Option<String
     let mut stdout = child.stdout.take()?;
     let mut stderr = child.stderr.take()?;
 
-    // Both `nowplaying-cli get-raw` and the helper emit a ~330 KB JSON blob
-    // with artworkData. Drain stdout on a dedicated thread so the pipe never
-    // fills up and deadlocks the child; send the result over a channel so the
-    // caller can bound the wait with recv_timeout instead of a blocking join().
+    // `nowplaying-cli get-raw` 和 helper 都会输出约 330 KB、含 artworkData 的
+    // JSON。用单独线程排空 stdout，避免管道写满导致子进程阻塞；结果通过 channel
+    // 传回，调用方用 recv_timeout 控制等待时长。
     let (out_tx, out_rx) = mpsc::channel();
     let out_thread = std::thread::spawn(move || {
         let mut buf = Vec::new();
@@ -362,15 +353,14 @@ fn run_command(program: &str, args: &[&str], timeout: Duration) -> Option<String
         let _ = err_tx.send(buf);
     });
 
-    // A hung child never closes stdout, so recv_timeout is our deadline.
+    // 卡住的子进程不会关闭 stdout，用 recv_timeout 作为超时界限。
     let (read_res, buf) = match out_rx.recv_timeout(timeout) {
         Ok(v) => v,
         Err(e) => {
             warn!(program = %program, error = %e, "command timed out or stdout reader disconnected");
             let _ = child.kill();
             let _ = child.wait();
-            // Killing the child closes its pipes, so both readers see EOF and
-            // exit instead of leaking a thread / zombie process.
+            // 终止子进程会关闭管道，两个读取线程看到 EOF 后退出。
             let _ = out_thread.join();
             let _ = err_thread.join();
             return None;
@@ -409,19 +399,8 @@ fn run_command(program: &str, args: &[&str], timeout: Duration) -> Option<String
     Some(String::from_utf8_lossy(&buf).to_string())
 }
 
-/// Pick the backend for this version. The native MediaRemote interface is a
-/// reserved slot that is disabled in v1, so the CLI backend is what runs.
 pub fn create_backend() -> Box<dyn NowPlayingBackend> {
-    match crate::mediaremote::MediaRemoteBackend::new() {
-        Ok(b) => {
-            debug!("using native MediaRemote backend");
-            Box::new(b)
-        }
-        Err(e) => {
-            debug!(error = %e, "native MediaRemote disabled, using nowplaying-cli");
-            Box::new(CliBackend::detect())
-        }
-    }
+    Box::new(CliBackend::detect())
 }
 
 #[cfg(test)]
@@ -499,13 +478,13 @@ mod tests {
             helper: None,
             last_playing: AtomicBool::new(true),
         };
-        // helper gives no answer -> keep last known value, never default true.
+        // helper 无结果 -> 沿用上一次的值。
         assert!(backend.resolve_playing(None));
         assert!(backend.last_playing.load(Ordering::Relaxed));
 
         // helper reports paused -> updates the sticky value.
         assert!(!backend.resolve_playing(Some(false)));
-        // next miss must stay paused, not flip back to playing.
+        // 下一次缺失仍保持暂停。
         assert!(!backend.resolve_playing(None));
         assert!(!backend.last_playing.load(Ordering::Relaxed));
     }

@@ -28,7 +28,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// larger line is treated as broken and its process is replaced.
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 /// Cap on non-protocol / stale-id stdout lines skipped in one call, so a
-/// chatty plugin cannot hold the per-plugin lock forever.
+/// chatty plugin releases the per-plugin lock in bounded time.
 const MAX_SKIPPED_LINES: usize = 64;
 const MAX_BLOCKS: usize = 256;
 const MAX_TEXT_BYTES: usize = 64 * 1024;
@@ -286,8 +286,8 @@ impl PluginProcess {
     }
 }
 
-/// Parse a render response block-by-block. One malformed block is skipped
-/// instead of discarding the whole frame from that plugin.
+/// Parse a render response block-by-block. A malformed block is skipped and
+/// the rest of that plugin's frame is kept.
 fn parse_render_result(plugin_id: &str, raw: Value) -> RenderResult {
     let mut blocks = Vec::new();
     match raw.get("blocks").and_then(|v| v.as_array()) {
@@ -326,8 +326,8 @@ pub struct PluginSet {
     /// Stable display order (directory scan order).
     pub order: Vec<String>,
     /// Processes replaced or removed by `reconcile`. The caller drains this
-    /// after releasing the write lock, then asks each one to shut down, so a
-    /// replaced plugin is not killed while a request is still holding it.
+    /// after releasing the write lock and shuts each one down, so an in-flight
+    /// request keeps its original process until it finishes.
     pub pending_shutdown: Vec<Arc<PluginProcess>>,
 }
 
@@ -397,7 +397,7 @@ impl PluginSet {
         changed
     }
 
-    /// Ids that are enabled. Used when the visitor does not pass `?plugins=`.
+    /// Ids that are enabled. Used when the visitor omits `?plugins=`.
     pub fn default_ids(&self) -> Vec<String> {
         self.order
             .iter()
@@ -476,8 +476,8 @@ pub fn scan(dirs: &[PathBuf]) -> Vec<(Manifest, PathBuf)> {
                 continue;
             }
             // Keep an absolute directory: the child's `current_dir` and the
-            // relative `command` in the manifest must not depend on where
-            // the host process happened to be started.
+            // 相对 `command` 的解析固定以清单所在目录为基准，与宿主进程的
+            // 启动目录无关。
             let dir = match path.canonicalize() {
                 Ok(v) => v,
                 Err(e) => {
@@ -490,8 +490,8 @@ pub fn scan(dirs: &[PathBuf]) -> Vec<(Manifest, PathBuf)> {
         }
     }
 
-    // read_dir order is not guaranteed; make duplicate-id resolution stable
-    // so a rescan does not flip which plugin wins and restart processes.
+    // read_dir 顺序不固定；排序让重复 id 的取舍保持稳定，避免重新扫描时
+    // 换胜出的插件并重启进程。
     found.sort_by(|a, b| {
         a.0.plugin
             .id
@@ -567,7 +567,7 @@ mod tests {
         assert!(set.reconcile(vec![(manifest("demo", "Old"), dir.clone())]));
         set.pending_shutdown.clear();
         assert!(!set.reconcile(vec![(manifest("demo", "Old"), dir.clone())]));
-        // A name change must recreate the plugin, not be silently ignored.
+        // 名称变化要重建插件，让 /manage 显示更新后的信息。
         assert!(set.reconcile(vec![(manifest("demo", "New"), dir.clone())]));
         assert_eq!(set.pending_shutdown.len(), 1);
         assert_eq!(set.order, vec!["demo".to_string()]);

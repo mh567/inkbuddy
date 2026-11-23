@@ -117,10 +117,8 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding {addr}"))?;
 
-    // Print usable LAN addresses so the URL can be typed into the reader.
-    // Only RFC1918 addresses are labelled as recommended; VPN/TUN/CGNAT
-    // addresses are listed separately because a device on the real LAN
-    // usually cannot reach them.
+    // 打印可输入的局域网地址。RFC1918 地址标为推荐；VPN/TUN/CGNAT 地址单列，
+    // 真实局域网里的设备通常访问不到。
     let lan = local_ip_addresses();
     info!("InkBuddy listening on {addr}");
     info!("  E-Ink page : http://127.0.0.1:{port}/");
@@ -171,8 +169,7 @@ async fn shutdown_signal(state: std::sync::Arc<AppState>) {
         _ = terminate => {},
     }
     info!("shutting down, stopping plugins");
-    // Clone the handles and release the read lock before waiting on child
-    // processes, so a shutdown cannot block a concurrent plugin rescan.
+    // 先克隆句柄并释放读锁，再等待子进程退出，避免关闭流程阻塞并发的重扫。
     let handles: Vec<_> = {
         let guard = state.plugins.read().await;
         guard.order.iter().filter_map(|id| guard.get(id)).collect()
@@ -184,16 +181,13 @@ async fn shutdown_signal(state: std::sync::Arc<AppState>) {
 
 /// Candidate IPv4 addresses the E-Ink reader can reach, best one first.
 ///
-/// A UDP socket "connected" to a public address is not a reliable probe on
-/// macOS with a VPN or TUN route: the kernel reports the virtual egress IP
-/// (for example 198.18.0.1), which a device on the real LAN cannot reach.
-/// We therefore enumerate active interfaces and put RFC1918 addresses at the
-/// front, then append any other non-loopback address as a fallback candidate.
+/// 在带 VPN/TUN 路由的 macOS 上，连接公网地址的 UDP socket 探测不可靠：内核
+/// 返回虚拟出口 IP（例如 198.18.0.1），真实局域网设备访问不到。这里枚举活跃
+/// 网卡，把 RFC1918 地址排在前面，其它非回环地址作为候选附在后面。
 fn local_ip_addresses() -> Vec<String> {
     let mut candidates: Vec<String> = Vec::new();
 
-    // Parse ifconfig per interface block, so the order of `inet` and
-    // `status: active` inside a block does not matter.
+    // 按网卡块解析 ifconfig，`inet` 与 `status: active` 的先后顺序不影响结果。
     if let Ok(output) = std::process::Command::new("/sbin/ifconfig").output() {
         let text = String::from_utf8_lossy(&output.stdout);
         let mut block_inets: Vec<String> = Vec::new();

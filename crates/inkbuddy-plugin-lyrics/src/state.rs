@@ -1,9 +1,8 @@
-//! Playback clock and lyric-window state.
+//! 播放时钟与歌词窗口状态。
 //!
-//! QQ Music on current macOS builds freezes `ElapsedTime` at 0 for the whole
-//! track, both in the helper env and in `nowplaying-cli get-raw`. We anchor on
-//! each CHANGE of the reported value and advance locally in between; a frozen
-//! report is not a seek. Seeking to 0 is a legitimate change and must re-anchor.
+//! QQ 音乐在 macOS 上把 `ElapsedTime` 全程冻结在 0（helper 和 get-raw 都是如此）。
+//! 上报值发生变化时重设锚点，其余时间本地时钟自行推进；值保持不变视为没有跳转，
+//! 拖到 0 属于变化，需要重设锚点。
 
 use crate::nowplaying::{NowPlayingBackend, Playback};
 use crate::source::{line_index_at, CachedSong, LyricsSource};
@@ -11,14 +10,11 @@ use inkbuddy_protocol::{Block, Emphasis, Line, RenderResult, Ruby};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
 
-/// A changed player report is treated as a seek only when it moves by more
-/// than this many seconds. Small step changes from integer-second reports do
-/// not disturb the local clock.
+/// 上报值变化超过此秒数才算跳转。按整秒上报时的小幅步进不影响本地时钟。
 const SEEK_EPS: f64 = 1.5;
 /// Refuse a snapshot timestamp older than a day when aligning the clock.
 const MAX_ANCHOR_AGE: f64 = 86_400.0;
-/// After the last lyric line plus this grace period, show an idle note (♪)
-/// instead of freezing on the final line forever.
+/// 最后一行之后再过这段缓冲时间显示休止符（♪）。
 const TAIL_GRACE: f64 = 9.0;
 
 pub struct PluginState {
@@ -26,16 +22,14 @@ pub struct PluginState {
     source: LyricsSource,
 
     last_track_id: Option<String>,
-    /// Last ElapsedTime the player reported. A frozen value is normal and must
-    /// NOT be compared against the local clock: that rewinds the clock to 0
-    /// every 1.5s and makes the lyric window jump between the first lines.
+    /// 播放器上一次上报的 ElapsedTime。该值长期冻结属正常情况，不参与本地时钟
+    /// 比较；比较会把进度反复拨回 0，歌词在开头几行来回跳。
     last_reported: f64,
     position_base: f64,
     position_base_at: Instant,
     last_playing: bool,
-    /// Positive = lyrics appear earlier, to offset E-Ink refresh latency.
-    /// Default 0.0 (matches the Python prototype); configurable via
-    /// INKBUDDY_LATENCY_MS (milliseconds) or Method::Configure.
+    /// 正值表示歌词提前出现，用于抵消墨水屏刷新延迟。默认 0.0 秒，可通过
+    /// INKBUDDY_LATENCY_MS（毫秒）或 Method::Configure 调整。
     latency: f64,
 
     cached_track: Option<String>,
@@ -147,9 +141,7 @@ impl PluginState {
             return;
         }
 
-        // Only a CHANGE in the reported value means a seek. Comparing a frozen
-        // report to the local clock re-anchors to 0 over and over and makes
-        // the lyrics jump backwards through the first lines.
+        // 只有上报值发生变化才算跳转。把冻结的上报值与本地时钟比较会反复重设\n        // 锚点到 0，歌词在开头几行来回跳。
         if (pb.elapsed - self.last_reported).abs() > SEEK_EPS {
             debug!(
                 reported = pb.elapsed,
@@ -211,8 +203,7 @@ impl PluginState {
         };
 
         let t = self.position(&pb);
-        // Once we are well past the last line, show an idle note rather than
-        // freezing on the final line (duration alone may exceed the lyrics).
+        // 超过最后一行后显示休止符；曲目时长可能长于歌词。
         if song
             .lines
             .last()
@@ -230,9 +221,8 @@ impl PluginState {
         let cur = song.lines[idx].1.clone();
         let next = song.lines.get(idx + 1).map(|l| l.1.clone());
 
-        // Jyutping is bound to LRC lines by index (roma_lines), not by a
-        // timestamp soft-match: LRC and QRC come from different endpoints and
-        // their timestamps may be shifted as a whole.
+        // 粤拼按行索引（roma_lines）与 LRC 绑定。LRC 与 QRC 来自不同接口，
+        // 时间戳可能整体错开，因此不按时间软匹配。
         let ruby: Vec<(String, String)> = song
             .roma_lines
             .get(idx)
@@ -348,8 +338,8 @@ mod tests {
 
     #[tokio::test]
     async fn seek_while_paused_reanchors() {
-        // Re-anchoring must NOT be gated on `pb.playing`: a paused seek to 0
-        // used to be swallowed, leaving the wrong position after resume.
+        // 重设锚点不受 `pb.playing` 限制：暂停时拖到 0 也要重设，否则恢复播放
+        // 后进度错误。
         let pb = make_pb(0.0, false);
         let mut s = primed(&pb, 100.0, 100.0, false);
         s.update_clock(&pb);
@@ -361,9 +351,8 @@ mod tests {
 
     #[tokio::test]
     async fn frozen_report_never_rewinds_the_clock() {
-        // QQ Music keeps ElapsedTime at 0 for the entire track. The local
-        // clock must keep advancing instead of being re-anchored to 0 every
-        // 1.5s (that made the lyric window jump between the first lines).
+        // QQ 音乐整首歌的 ElapsedTime 都是 0。本地时钟持续推进，上报值不变时
+        // 重设锚点会把进度拨回 0，歌词在开头几行来回跳。
         let pb = make_pb(0.0, true);
         let mut s = primed(&pb, 0.0, 0.0, true);
         s.position_base_at = Instant::now() - Duration::from_secs(10);

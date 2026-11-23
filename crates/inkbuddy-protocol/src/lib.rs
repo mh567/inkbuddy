@@ -4,25 +4,24 @@
 //!
 //! A plugin is a standalone executable. The host launches it as a child
 //! process and talks to it over **newline-delimited JSON** on stdin/stdout:
-//! one JSON object per line, no framing, no length prefix. This makes plugins
-//! writable in any language (Rust, Python, JS, shell) with no ABI coupling,
-//! and a crashing plugin cannot take the host down.
+//! one JSON object per line. Plugins can be written in any language (Rust,
+//! Python, JS, shell) since there is no shared ABI, and a plugin crash stays
+//! inside that child process.
 //!
 //! The host sends a [`Request`] line and reads exactly one [`Response`] line
-//! with the matching `id`. Anything a plugin writes to stdout that is not a
-//! response line is ignored; diagnostics belong on stderr. Every request must
-//! get exactly one response line, including malformed requests and unknown
-//! methods, otherwise the host waits until its deadline.
+//! with the matching `id`. Non-response stdout lines are ignored; diagnostics
+//! go to stderr. Every request gets exactly one response line, including
+//! malformed requests and unknown methods; otherwise the host waits until
+//! its deadline.
 //!
-//! A single line is capped at 1 MiB by both sides. `id` is a monotonically
-//! increasing `u64` but should stay below 2^53 so JSON implementations in
-//! other languages can echo it without precision loss.
+//! Both sides cap a single line at 1 MiB. `id` is a monotonically increasing
+//! `u64` and stays below 2^53 so JSON implementations in other languages can
+//! echo it without precision loss.
 //!
-//! Plugins return **structured content**, not HTML. The host owns the E-Ink
-//! page and renders every plugin with the same stylesheet. That is what makes
-//! "select one or combine several plugins" work without each plugin having to
-//! know about the others. [`Block::Html`] is an escape hatch for plugins that
-//! genuinely need custom markup; the host sanitizes it with a tag allowlist.
+//! Plugins return **structured content**. The host owns the E-Ink page and
+//! renders every plugin with the same stylesheet, so plugins can be selected
+//! or combined without knowing about each other. [`Block::Html`] lets a plugin
+//! supply custom markup; the host sanitizes it with a tag allowlist.
 //!
 //! # Example request (host -> plugin, one line)
 //!
@@ -165,7 +164,7 @@ pub enum Block {
     /// before inserting it into the page.
     Html { html: String },
     /// Unknown block type from a newer or third-party plugin. The host skips
-    /// it instead of dropping the whole frame.
+    /// that block and keeps the rest of the frame.
     #[serde(other)]
     Unknown,
 }
@@ -192,8 +191,8 @@ pub struct Ruby {
     pub reading: String,
 }
 
-/// An unknown emphasis string from a third-party plugin falls back to Normal
-/// instead of failing the whole `RenderResult` deserialization.
+/// An unknown emphasis string from a third-party plugin falls back to Normal,
+/// keeping the rest of the `RenderResult` deserializable.
 fn de_emphasis<'de, D>(de: D) -> Result<Emphasis, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -213,7 +212,7 @@ pub struct Line {
     #[serde(deserialize_with = "de_emphasis")]
     pub emphasis: Emphasis,
     /// When non-empty the host renders `text` as per-character cells with the
-    /// readings above them on a shared grid, instead of a plain text line.
+    /// readings above them on a shared grid.
     pub ruby: Vec<Ruby>,
 }
 
@@ -247,8 +246,8 @@ pub struct KeyValue {
 // Manifest
 // ---------------------------------------------------------------------------
 
-/// `plugin.toml` placed next to every plugin executable. The host scans a
-/// plugins directory for these files; there is no compile-time registry.
+/// `plugin.toml` placed next to every plugin executable. The host discovers
+/// plugins by scanning directories for these files at runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     pub plugin: PluginManifest,
@@ -276,7 +275,7 @@ fn default_version() -> String {
 #[serde(default)]
 pub struct RuntimeManifest {
     pub enabled: bool,
-    /// Show this plugin by default when the visitor does not pass `?plugins=`.
+    /// Show this plugin by default when the visitor omits `?plugins=`.
     pub default_on: bool,
     /// Upper bound on a single `render` call, in milliseconds.
     pub timeout_ms: u64,

@@ -1,9 +1,7 @@
 //! Server-side renderer: turns structured [`Block`]s into E-Ink friendly HTML.
 //!
-//! Keeping rendering here (rather than in each plugin) is the point of the
-//! structured protocol: every plugin automatically gets the same typography,
-//! the same three-line focus view, and the same "don't repaint unless the
-//! content changed" behaviour.
+//! The host owns rendering so every plugin gets the same typography, the same
+//! three-line focus view, and repaints only when the content changes.
 
 use inkbuddy_protocol::{Block, Emphasis, Line, RenderResult};
 use std::hash::{Hash, Hasher};
@@ -92,9 +90,9 @@ fn render_block(block: &Block) -> String {
     }
 }
 
-/// Allowlist-based HTML filter. Any tag not in [`ALLOWED_TAGS`] is escaped
-/// into plain text, so `<script>`, `<img onerror=...>` and event handlers can
-/// never reach the DOM. Only `class` survives, restricted to a safe charset.
+/// Allowlist-based HTML filter. Tags outside [`ALLOWED_TAGS`] are escaped into
+/// plain text, which keeps `<script>`, `<img onerror=...>` and event handlers
+/// out of the DOM. Only `class` is kept, restricted to a safe charset.
 fn sanitize_html(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let bytes = input.as_bytes();
@@ -137,7 +135,7 @@ fn sanitize_html(input: &str) -> String {
         }
         i = end + 1;
     }
-    // Belt and braces: a javascript: URL must not survive in any form.
+    // 兜底：移除所有 javascript: URL。
     let lower = out.to_ascii_lowercase();
     if lower.contains("javascript:") {
         return out.replace("javascript:", "").replace("JAVASCRIPT:", "");
@@ -185,8 +183,7 @@ pub fn render_frame(parts: &[(String, RenderResult)], fallback_ms: u64) -> Frame
     let mut active = Vec::new();
 
     if parts.is_empty() {
-        // Never hand the browser an empty body: the E-Ink page would clear to
-        // pure white and, with a constant signature, never recover.
+        // 给浏览器一个非空正文：空页面会清成纯白，签名不变时无法自行恢复。
         html.push_str(
             "<section class=\"plugin-section\"><div class=\"block block-text\"><p>无可用插件</p></div></section>",
         );
@@ -216,9 +213,8 @@ pub fn render_frame(parts: &[(String, RenderResult)], fallback_ms: u64) -> Frame
     // Keep polling within a sane band for E-Ink devices.
     let refresh_ms = refresh_ms.clamp(250, 30_000);
 
-    // Hash the final markup, not the input blocks: if the markup is identical
-    // the browser must not repaint, and no separator in plugin text can forge
-    // a collision with another frame.
+    // 对最终 HTML 取哈希：HTML 相同则浏览器跳过重绘，插件文本里的分隔符也
+    // 无法伪造出与其它帧相同的签名。
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     html.hash(&mut hasher);
     let signature = format!("{:016x}", hasher.finish());

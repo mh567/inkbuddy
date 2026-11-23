@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
-/// Upper bound on the `?plugins=` value, so a long query cannot make the
-/// host allocate an unbounded number of strings.
+/// Upper bound on the `?plugins=` value, so the host allocates at most
+/// MAX_PLUGIN_IDS strings for a query.
 const MAX_QUERY_BYTES: usize = 4096;
 const MAX_PLUGIN_IDS: usize = 64;
 
@@ -93,9 +93,8 @@ struct PluginSummary {
     running: bool,
 }
 
-/// Resolve the requested plugin ids, ignoring unknown/disabled ones.
-/// An explicitly empty value (`?plugins=` or `?plugins=,,`) falls back to the
-/// default set, matching the documented behaviour.
+/// Resolve the requested plugin ids; unknown and disabled ones are dropped.
+/// An explicitly empty value (`?plugins=` or `?plugins=,,`) uses the default set.
 fn resolve_ids(set: &PluginSet, query: &Option<String>) -> Vec<String> {
     let requested: Option<Vec<String>> = query.as_ref().and_then(|raw| {
         if raw.len() > MAX_QUERY_BYTES {
@@ -136,8 +135,8 @@ async fn get_frame(State(state): State<Shared>, Query(q): Query<FrameQuery>) -> 
     };
     let fallback_ms = state.config.display.refresh_ms;
 
-    // Snapshot the selected plugins, then release the read lock before any
-    // child-process IO so a rescan is never blocked behind a slow plugin.
+    // 先快照选中的插件，再释放读锁，之后才做子进程 IO；慢插件不会阻塞
+    // 目录重扫。
     let (ids, selected) = {
         let guard = state.plugins.read().await;
         let ids = resolve_ids(&guard, &q.plugins);
@@ -148,9 +147,8 @@ async fn get_frame(State(state): State<Shared>, Query(q): Query<FrameQuery>) -> 
         (ids, selected)
     };
 
-    // Decide which plugins actually need a fresh render. Each plugin keeps
-    // its own interval, so a 30s clock is not re-rendered every 500ms when
-    // it is combined with lyrics.
+    // 判断哪些插件需要重新渲染。每个插件用自己的刷新间隔：和歌词组合显示时，
+    // 30 秒刷新的时钟不会每 500 毫秒重渲染一次。
     let (to_render, mut resolved) = {
         let cache = state.render_cache.lock().await;
         let mut to_render = Vec::new();
@@ -181,8 +179,7 @@ async fn get_frame(State(state): State<Shared>, Query(q): Query<FrameQuery>) -> 
     }
     let results = futures::future::join_all(futures).await;
 
-    // Failures are isolated. If the plugin failed but we still have its last
-    // good frame, keep showing it instead of dropping the whole section.
+    // 失败隔离。插件本次渲染失败时，继续显示它的最后一帧有效内容。
     let mut stale_fallback: HashMap<String, RenderResult> = {
         let cache = state.render_cache.lock().await;
         cache
@@ -296,8 +293,8 @@ async fn get_health(State(state): State<Shared>) -> impl IntoResponse {
     ([(header::CACHE_CONTROL, "no-store")], Json(body))
 }
 
-/// The E-Ink entry point. Both `/` and `/ink` land here; no path beyond the
-/// server address is required on the device.
+/// The E-Ink entry point. Both `/` and `/ink` land here; the device only needs
+/// the server address, with no extra path.
 async fn get_ink(State(state): State<Shared>) -> Response {
     let page = INK_PAGE.replace("__TITLE__", &html_escape(&state.config.display.title));
     (
@@ -427,7 +424,7 @@ mod tests {
     fn empty_query_falls_back_to_defaults() {
         // Both plugins are default_on, so the default set has both entries.
         // What matters is that an explicitly empty query resolves the same
-        // way as no query at all, instead of producing an empty page.
+        // way as no query at all, so the page stays populated.
         let set = set_with(&["lyrics", "clock"], true);
         let expected = vec!["lyrics".to_string(), "clock".to_string()];
         assert_eq!(resolve_ids(&set, &None), expected);

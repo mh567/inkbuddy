@@ -15,8 +15,8 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     /// Listen address. 0.0.0.0 so the E-Ink reader on the LAN can reach it.
-    /// The HTTP service has no authentication, so only use it on a trusted LAN;
-    /// set bind to 127.0.0.1 and forward explicitly if the network is shared.
+    /// HTTP 服务不带认证，仅在可信局域网使用；网络共享时把 bind 设为
+    /// 127.0.0.1，再按需做转发。
     pub bind: String,
     pub port: u16,
 }
@@ -48,9 +48,9 @@ impl Default for DisplayConfig {
     }
 }
 
-/// Absolute path holding config, caches and installed plugins.
-/// A relative or empty `INKBUDDY_HOME` is resolved against the current
-/// directory, so config and plugins never end up in two different places.
+/// Absolute path holding config, caches and installed plugins. A relative or
+/// empty `INKBUDDY_HOME` resolves against the current directory, keeping config
+/// and plugins in one place.
 pub fn home_dir() -> Result<PathBuf> {
     let raw = std::env::var("INKBUDDY_HOME").unwrap_or_default();
     let path = if raw.trim().is_empty() {
@@ -114,7 +114,7 @@ pub fn ensure_default_file() -> Result<PathBuf> {
 ///
 /// Every entry is absolute. A background app started by Finder or launchd has
 /// an arbitrary cwd, so a bare relative `plugins` would silently point at the
-/// wrong directory and the page would end up with no plugins at all.
+/// a wrong directory, leaving the page with no plugins.
 pub fn plugin_dirs(explicit: Option<&Path>) -> Vec<PathBuf> {
     let absolutize = |p: PathBuf| -> PathBuf {
         if p.is_absolute() {

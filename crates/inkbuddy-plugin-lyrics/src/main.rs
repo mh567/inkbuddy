@@ -3,7 +3,6 @@
 //! Standalone executable. Speaks the inkbuddy newline-delimited JSON protocol
 //! on stdin/stdout; diagnostics go to stderr so they never corrupt the stream.
 
-mod mediaremote;
 mod nowplaying;
 mod qrc;
 mod source;

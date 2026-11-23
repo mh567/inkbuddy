@@ -1,11 +1,8 @@
 //! QRC 歌词解密与粤拼对齐。
 //!
-//! 算法参考 QQMusicApi / QQMusicDecoder 的行为，DES 表来自 FIPS 46-3。
-//! DES / 3DES 的算法结构与 S-box 数值均为公开的 FIPS 标准事实；本文件用
-//! Rust 独立实现，未复制参考项目的代码文本，也未引入其 GPL 许可声明。
-//!
-//! QQ 音乐 QRC 使用一套自定义 3DES 密钥扩展（PC-2 表为标准 PC-2 的 0-based 形式），
-//! 标准 des / openssl 实现无法解开，必须按参考实现的行为精确复现。
+//! QQ 音乐的 QRC 数据经过 hex 编码、自定义 3DES 加密和 zlib 压缩。DES 表采用
+//! FIPS 46-3 公开标准数值；密钥扩展使用自定义的 PC-2 表（标准 PC-2 表的
+//! 0-based 形式），标准 des / openssl 实现无法解开，因此这里按该密钥扩展实现。
 
 use flate2::read::ZlibDecoder;
 use std::fmt;
@@ -192,7 +189,7 @@ pub fn align_roma(lyric_xml: &str, roma_xml: &str) -> Vec<RomaLine> {
 
 // ===================== DES 常量 =====================
 
-// ===== DES 表（FIPS 46-3 公开标准数值，按参考实现行为精确导出） =====
+// ===== DES 表（FIPS 46-3 公开标准数值） =====
 const SBOX: [[u8; 64]; 8] = [
     [
         14, 4, 13, 1, 2, 15, 11, 8, 3, 10, 6, 12, 5, 9, 0, 7, 0, 15, 7, 4, 14, 2, 13, 1, 10, 6, 12,
