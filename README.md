@@ -85,6 +85,8 @@ inkbuddy --list-plugins
 
 `./scripts/build-app.sh` 会生成 `dist/InkBuddy.app`。它是后台运行、没有 Dock 图标的 app 包，双击即启动服务；墨水屏仍然只需打开浏览器地址。第一版没有菜单栏 UI，插件选择通过 `/manage` 页面完成。
 
+从 Finder 双击启动时，进程拿到的 `PATH` 通常不含 Homebrew 的 `/opt/homebrew/bin`，会让按 `PATH` 查找 `nowplaying-cli` 失败。app 包在 `Info.plist` 里通过 `LSEnvironment` 显式设置了包含 brew 前缀的 `PATH`；歌词插件本身也会先试 `/opt/homebrew/bin/nowplaying-cli`、`/usr/local/bin/nowplaying-cli` 等绝对路径再回退 `PATH`，两层保障。
+
 停止：`pkill -f InkBuddy.app/Contents/MacOS/inkbuddy`。
 
 ## 歌词插件
@@ -96,12 +98,17 @@ inkbuddy --list-plugins
 - 三行聚焦视图：上一句 / 当前句 / 下一句，当前句最大
 - 粤语歌在当前句每个字上方标逐字粤拼，读音和汉字分两套 grid 排版
 - 进度用本地时钟推进：上报值变化（包括拖回开头）时重设锚点，暂停时冻结
+- 显示延迟可用环境变量 `INKBUDDY_LATENCY_MS`（毫秒，除以 1000 换算成秒）补偿，默认 `0.0` 秒；也可通过 `configure` 请求的 `latency_ms` 参数在运行时调整
 - 歌词和粤拼缓存到 `~/.inkbuddy/cache/lyrics/*.json`
+
+缓存文件里 `lines` 是 LRC 行；`roma` 保留 QRC 对齐出的原始粤拼结果，另有 `roma_lines` 与 `lines` 等长、按 LRC 行索引绑定粤拼（没有对应读音的行为空），读取时直接按当前行索引取，不再做时间戳软匹配。`roma_checked` 表示已确认这首歌没有粤拼，之后不再联网补抓。这两个字段都带默认值，旧缓存文件可以照常读取。
+
+命中缓存时不再为补粤拼发网络请求。升级前已经写好、且里面没有粤拼的缓存不会自动补抓，删掉 `~/.inkbuddy/cache/lyrics/` 后重新播放这些歌即可重新抓取。
 
 播放信息读取有两个后端。`crates/inkbuddy-plugin-lyrics/src/mediaremote.rs` 是原生 MediaRemote 框架的预留接口，第一版未启用；启动时 `create_backend()` 会先尝试它，失败后回退到 `nowplaying-cli`。实际生效的是后者，需要本机装过 `nowplaying-cli`（`brew install nowplaying-cli`）：
 
-- `nowplaying-cli get-raw` 取标题、歌手、时长和进度。`get elapsedTime` 在部分播放器上恒为 0，所以走原始字段 `kMRMediaRemoteNowPlayingInfoElapsedTime`。
-- `mediaremote-mini.pl adapter_get_env` 读权威的 `playing` 状态。QQ 音乐暂停时 `PlaybackRate` 仍可能是 1，只有这里的状态可靠。
+- 优先用 `mediaremote-mini.pl adapter_get_env` 一次取全量字段（标题、歌手、专辑、时长、进度、`playing`、`playbackRate`）。QQ 音乐暂停时 `PlaybackRate` 仍可能是 1，只有 helper 给的 `playing` 可靠；helper 偶发取不到时 `playing` 保持上一次已知值，不会默认成正在播放。
+- helper 不可用或解析失败时才回退到 `nowplaying-cli get-raw`。`get elapsedTime` 在部分播放器上恒为 0，所以走原始字段 `kMRMediaRemoteNowPlayingInfoElapsedTime`。
 
 这条链路不调用 AppleScript，因此不会把 Music.app 自动拉起。
 
@@ -133,7 +140,7 @@ Rust 插件可直接依赖 `inkbuddy-protocol` crate 拿到全部类型定义。
 
 ## 说明
 
-- HTTP 服务没有认证，默认监听 `0.0.0.0` 供局域网设备访问。只在可信局域网使用；需要隔离时把 `bind` 改成 `127.0.0.1` 并自行做转发。
+- HTTP 服务默认监听 `0.0.0.0` 且没有任何认证，同一局域网里的任何设备都能读取展示内容、查看插件列表并切换显示组合。只在可信局域网使用；需要隔离时把 `bind` 改成 `127.0.0.1` 并自行做转发或加一层鉴权代理。
 - 墨水屏刷新慢且有残影，页面只在内容真正变化时才改 DOM，不做逐帧动画。
 - 墨水屏浏览器若缓存了旧页面，在地址后加 `?v=2` 破一次缓存；页面本身已返回 `no-store`。
 

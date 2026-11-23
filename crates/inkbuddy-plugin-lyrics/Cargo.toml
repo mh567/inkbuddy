@@ -3,6 +3,7 @@ name = "inkbuddy-plugin-lyrics"
 description = "First-party inkbuddy plugin: synced lyrics with Cantonese Jyutping"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 

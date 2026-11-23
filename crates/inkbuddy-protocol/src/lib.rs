@@ -10,13 +10,19 @@
 //!
 //! The host sends a [`Request`] line and reads exactly one [`Response`] line
 //! with the matching `id`. Anything a plugin writes to stdout that is not a
-//! response line is ignored; diagnostics belong on stderr.
+//! response line is ignored; diagnostics belong on stderr. Every request must
+//! get exactly one response line, including malformed requests and unknown
+//! methods, otherwise the host waits until its deadline.
+//!
+//! A single line is capped at 1 MiB by both sides. `id` is a monotonically
+//! increasing `u64` but should stay below 2^53 so JSON implementations in
+//! other languages can echo it without precision loss.
 //!
 //! Plugins return **structured content**, not HTML. The host owns the E-Ink
 //! page and renders every plugin with the same stylesheet. That is what makes
 //! "select one or combine several plugins" work without each plugin having to
 //! know about the others. [`Block::Html`] is an escape hatch for plugins that
-//! genuinely need custom markup.
+//! genuinely need custom markup; the host sanitizes it with a tag allowlist.
 //!
 //! # Example request (host -> plugin, one line)
 //!
@@ -125,8 +131,6 @@ pub struct PluginInfo {
     pub name: String,
     pub version: String,
     pub description: String,
-    /// How often the host should ask for new content, in milliseconds.
-    pub refresh_ms: u64,
     pub protocol: u32,
 }
 
@@ -153,12 +157,17 @@ pub enum Block {
     /// A group of text lines, e.g. the three-line lyrics view.
     Lines { lines: Vec<Line> },
     /// Label/value pairs, e.g. a clock or system status plugin.
+    #[serde(alias = "kv", alias = "keyvalue")]
     KeyValue { items: Vec<KeyValue> },
     /// A plain text paragraph.
     Text { text: String },
-    /// Escape hatch: raw HTML inserted as-is. Use sparingly; it bypasses the
-    /// host stylesheet and may not age well on E-Ink devices.
+    /// Escape hatch: raw HTML. The host sanitizes it with a tag allowlist
+    /// before inserting it into the page.
     Html { html: String },
+    /// Unknown block type from a newer or third-party plugin. The host skips
+    /// it instead of dropping the whole frame.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Visual weight of a line. The host maps these onto the E-Ink stylesheet.
@@ -183,10 +192,25 @@ pub struct Ruby {
     pub reading: String,
 }
 
+/// An unknown emphasis string from a third-party plugin falls back to Normal
+/// instead of failing the whole `RenderResult` deserialization.
+fn de_emphasis<'de, D>(de: D) -> Result<Emphasis, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(de)?;
+    Ok(match raw.as_deref() {
+        Some("primary") => Emphasis::Primary,
+        Some("muted") => Emphasis::Muted,
+        _ => Emphasis::Normal,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Line {
     pub text: String,
+    #[serde(deserialize_with = "de_emphasis")]
     pub emphasis: Emphasis,
     /// When non-empty the host renders `text` as per-character cells with the
     /// readings above them on a shared grid, instead of a plain text line.
@@ -225,14 +249,14 @@ pub struct KeyValue {
 
 /// `plugin.toml` placed next to every plugin executable. The host scans a
 /// plugins directory for these files; there is no compile-time registry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     pub plugin: PluginManifest,
     #[serde(default)]
     pub runtime: RuntimeManifest,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginManifest {
     pub id: String,
     pub name: String,
@@ -288,5 +312,48 @@ mod tests {
         let r = Response::empty_ok(7);
         assert_eq!(r.id, 7);
         assert!(r.ok);
+    }
+
+    #[test]
+    fn unknown_block_type_becomes_unknown() {
+        let b: Block = serde_json::from_str(r#"{"type":"future_block","data":1}"#).unwrap();
+        assert!(matches!(b, Block::Unknown));
+    }
+
+    #[test]
+    fn keyvalue_aliases_are_accepted() {
+        for tag in ["key_value", "kv", "keyvalue"] {
+            let s = format!(r#"{{"type":"{tag}","items":[{{"key":"a","value":"b"}}]}}"#);
+            let b: Block = serde_json::from_str(&s).unwrap();
+            assert!(matches!(b, Block::KeyValue { .. }));
+        }
+    }
+
+    #[test]
+    fn unknown_emphasis_falls_back_to_normal() {
+        let l: Line =
+            serde_json::from_str(r#"{"text":"hi","emphasis":"blink","ruby":[]}"#).unwrap();
+        assert_eq!(l.emphasis, Emphasis::Normal);
+        let l2: Line = serde_json::from_str(r#"{"text":"hi","ruby":[]}"#).unwrap();
+        assert_eq!(l2.emphasis, Emphasis::Normal);
+        let l3: Line =
+            serde_json::from_str(r#"{"text":"hi","emphasis":"muted","ruby":[]}"#).unwrap();
+        assert_eq!(l3.emphasis, Emphasis::Muted);
+    }
+
+    #[test]
+    fn manifest_comparison_covers_display_fields() {
+        let make = |name: &str| Manifest {
+            plugin: PluginManifest {
+                id: "demo".to_string(),
+                name: name.to_string(),
+                version: "0.1.0".to_string(),
+                description: String::new(),
+                command: "./demo".to_string(),
+            },
+            runtime: RuntimeManifest::default(),
+        };
+        assert_eq!(make("旧名字"), make("旧名字"));
+        assert_ne!(make("旧名字"), make("新名字"));
     }
 }

@@ -71,6 +71,13 @@
   var qs = new URLSearchParams(location.search);
   var selected = qs.get('plugins') || '';
 
+  var REQUEST_TIMEOUT_MS = 8000;
+
+  function setStatus(text) {
+    // Writing the same text every 500ms is a pointless DOM write on E-Ink.
+    if (statusEl.textContent !== text) statusEl.textContent = text;
+  }
+
   function schedule(ms) {
     if (timer) clearTimeout(timer);
     timer = setTimeout(poll, ms);
@@ -78,19 +85,45 @@
 
   function poll() {
     var url = '/api/frame' + (selected ? '?plugins=' + encodeURIComponent(selected) : '');
-    fetch(url, { cache: 'no-store' })
-      .then(function (r) { return r.json(); })
+    // A half-open connection can leave fetch pending forever. AbortSignal is
+    // not available on every embedded browser, so use AbortController.
+    var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    var timedOut = false;
+    var watchdog = setTimeout(function () {
+      timedOut = true;
+      if (controller) controller.abort();
+      setStatus('连接超时');
+      schedule(2000);
+    }, REQUEST_TIMEOUT_MS);
+    var options = { cache: 'no-store' };
+    if (controller) options.signal = controller.signal;
+
+    fetch(url, options)
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
       .then(function (d) {
+        if (timedOut) return;
+        clearTimeout(watchdog);
         // E-Ink: only touch the DOM when the content actually changed.
-        if (d.signature !== lastSig) {
+        if (d.signature && d.signature !== lastSig) {
           frameEl.innerHTML = d.html;
           lastSig = d.signature;
+        } else if (!d.signature || !d.active || !d.active.length) {
+          // Never clear to a blank white page; keep a visible placeholder
+          // and stay on the retry loop so a recovering plugin is picked up.
+          var placeholder = '<div class="block block-text"><p>无可用插件</p></div>';
+          if (frameEl.innerHTML !== placeholder) frameEl.innerHTML = placeholder;
+          lastSig = null;
         }
-        statusEl.textContent = d.active.length ? d.active.join(' + ') : '无插件';
+        setStatus(d.active && d.active.length ? d.active.join(' + ') : '无插件');
         schedule(d.refresh_ms || 500);
       })
       .catch(function () {
-        statusEl.textContent = '连接失败';
+        if (timedOut) return;
+        clearTimeout(watchdog);
+        setStatus('连接失败');
         schedule(2000);
       });
   }

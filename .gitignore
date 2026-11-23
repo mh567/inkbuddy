@@ -4,6 +4,14 @@
 *.log
 # Local runtime state (config, caches, installed plugins)
 .inkbuddy/
+/config.toml
+/cache/
+/my-plugins/
 # macOS app bundle build output
 /dist/
 *.app/
+# Editor and macOS cruft
+.idea/
+.vscode/
+*.swp
+._*

@@ -8,26 +8,42 @@
 use crate::nowplaying::{NowPlayingBackend, Playback};
 use crate::source::{line_index_at, CachedSong, LyricsSource};
 use inkbuddy_protocol::{Block, Emphasis, Line, RenderResult, Ruby};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, info};
 
-/// Positive = lyrics appear earlier, to offset E-Ink refresh latency.
-const LATENCY_COMPENSATION: f64 = 1.5;
+/// A seek is only recognised when the player's report diverges from our
+/// locally extrapolated clock by more than this many seconds. Normal playback
+/// keeps the two in lock-step, so the local clock stays authoritative.
+const SEEK_EPS: f64 = 1.5;
+/// After the last lyric line plus this grace period, show an idle note (♪)
+/// instead of freezing on the final line forever.
+const TAIL_GRACE: f64 = 9.0;
 
 pub struct PluginState {
     backend: Box<dyn NowPlayingBackend>,
     source: LyricsSource,
 
     last_track_id: Option<String>,
-    last_reported: Option<f64>,
     position_base: f64,
     position_base_at: Instant,
     last_playing: bool,
+    /// Positive = lyrics appear earlier, to offset E-Ink refresh latency.
+    /// Default 0.0 (matches the Python prototype); configurable via
+    /// INKBUDDY_LATENCY_MS (milliseconds) or Method::Configure.
+    latency: f64,
 
     cached_track: Option<String>,
     cached_song: Option<CachedSong>,
     /// Set when a fetch failed, to avoid hammering the network every 500ms.
     fetch_deadline: Option<Instant>,
+}
+
+fn latency_from_env() -> f64 {
+    std::env::var("INKBUDDY_LATENCY_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .map(|ms| ms / 1000.0)
+        .unwrap_or(0.0)
 }
 
 impl PluginState {
@@ -36,24 +52,36 @@ impl PluginState {
             backend,
             source,
             last_track_id: None,
-            last_reported: None,
             position_base: 0.0,
             position_base_at: Instant::now(),
             last_playing: false,
+            latency: latency_from_env(),
             cached_track: None,
             cached_song: None,
             fetch_deadline: None,
         }
     }
 
+    /// Write back a latency configured by the host, in milliseconds.
+    pub fn set_latency_ms(&mut self, ms: f64) {
+        self.latency = ms / 1000.0;
+    }
+
     /// Current playback position with latency compensation applied.
     fn position(&self, pb: &Playback) -> f64 {
         let base = if pb.playing {
-            self.position_base + self.position_base_at.elapsed().as_secs_f64()
+            self.position_base + self.position_base_at.elapsed().as_secs_f64() + self.latency
         } else {
+            // Paused: freeze the clock and do NOT add latency compensation.
             self.position_base
         };
-        base + LATENCY_COMPENSATION
+        // Never run past the end of the track (the local clock would otherwise
+        // keep ticking forever and leave lyrics stuck on the last line).
+        if pb.duration > 0.0 {
+            base.min(pb.duration)
+        } else {
+            base
+        }
     }
 
     fn update_clock(&mut self, pb: &Playback) {
@@ -62,27 +90,28 @@ impl PluginState {
 
         if self.last_track_id.as_deref() != Some(track_id.as_str()) {
             self.last_track_id = Some(track_id);
-            self.last_reported = Some(pb.elapsed);
             self.position_base = pb.elapsed;
             self.position_base_at = now;
             self.last_playing = pb.playing;
             return;
         }
 
-        // Re-anchor on ANY changed report, including a jump to 0.
-        if self
-            .last_reported
-            .map(|v| (v - pb.elapsed).abs() > 0.01)
-            .unwrap_or(true)
-        {
-            debug!(from = ?self.last_reported, to = pb.elapsed, "clock re-anchored");
-            self.last_reported = Some(pb.elapsed);
-            if pb.playing {
-                self.position_base = pb.elapsed;
-                self.position_base_at = now;
-            }
+        // Compare the player's report against what our local clock predicts.
+        // While playing both advance together, so a normal frame is a no-op;
+        // only a real seek (forward or back to 0, in ANY play state) exceeds
+        // SEEK_EPS and re-anchors. Re-anchoring is NOT gated on `playing`.
+        let local = self.position_base + self.position_base_at.elapsed().as_secs_f64();
+        if (pb.elapsed - local).abs() > SEEK_EPS {
+            debug!(
+                reported = pb.elapsed,
+                local = local,
+                "clock re-anchored after seek"
+            );
+            self.position_base = pb.elapsed;
+            self.position_base_at = now;
         }
 
+        // pause/resume only toggles the local clock; it never corrects position.
         if pb.playing && !self.last_playing {
             self.position_base_at = now; // resume: restart the local clock
         } else if !pb.playing && self.last_playing {
@@ -107,7 +136,11 @@ impl PluginState {
                 .map(|d| Instant::now() >= d)
                 .unwrap_or(true);
             if allowed {
-                match self.source.get(&pb.artist, &pb.title).await {
+                match self
+                    .source
+                    .get(&pb.artist, &pb.title, &pb.album, pb.duration)
+                    .await
+                {
                     Some(song) => {
                         info!(title = %pb.title, source = %song.source, lines = song.lines.len(),
                               "lyrics loaded");
@@ -117,8 +150,7 @@ impl PluginState {
                     }
                     None => {
                         debug!(title = %pb.title, "no lyrics found, backing off");
-                        self.fetch_deadline =
-                            Some(Instant::now() + std::time::Duration::from_secs(10));
+                        self.fetch_deadline = Some(Instant::now() + Duration::from_secs(10));
                     }
                 }
             }
@@ -129,6 +161,17 @@ impl PluginState {
         };
 
         let t = self.position(&pb);
+        // Once we are well past the last line, show an idle note rather than
+        // freezing on the final line (duration alone may exceed the lyrics).
+        if song
+            .lines
+            .last()
+            .map(|last| t > last.0 + TAIL_GRACE)
+            .unwrap_or(false)
+        {
+            return one_line_frame(&pb.title, "♪");
+        }
+
         let Some(idx) = line_index_at(&song.lines, t) else {
             return one_line_frame(&pb.title, "♪");
         };
@@ -137,9 +180,15 @@ impl PluginState {
         let cur = song.lines[idx].1.clone();
         let next = song.lines.get(idx + 1).map(|l| l.1.clone());
 
-        // Jyutping for the current line. Use the same start-based boundary as
-        // the lyric line so the annotation never vanishes during a gap.
-        let ruby = find_roma(&song.roma, &song.lines, idx);
+        // Jyutping is bound to LRC lines by index (roma_lines), not by a
+        // timestamp soft-match: LRC and QRC come from different endpoints and
+        // their timestamps may be shifted as a whole.
+        let ruby: Vec<(String, String)> = song
+            .roma_lines
+            .get(idx)
+            .and_then(|x| x.as_ref())
+            .map(|r| r.words.clone())
+            .unwrap_or_default();
 
         let mut lines = Vec::new();
         lines.push(Line::new(prev.unwrap_or_default(), Emphasis::Muted));
@@ -167,31 +216,6 @@ impl PluginState {
     }
 }
 
-/// Match the roma line by the current line's start time, falling back to a
-/// nearest-start match within 0.3s (QRC and LRC timestamps can differ slightly).
-fn find_roma(
-    roma: &[crate::source::RomaLineCache],
-    lines: &[(f64, String)],
-    idx: usize,
-) -> Vec<(String, String)> {
-    if roma.is_empty() {
-        return Vec::new();
-    }
-    let start = lines[idx].0;
-    let mut best: Option<(f64, &crate::source::RomaLineCache)> = None;
-    for r in roma {
-        // Never let a later line's annotation leak onto the previous line.
-        if r.start > start + 0.3 {
-            continue;
-        }
-        let d = (r.start - start).abs();
-        if d <= 0.3 && best.map(|(bd, _)| d < bd).unwrap_or(true) {
-            best = Some((d, r));
-        }
-    }
-    best.map(|(_, r)| r.words.clone()).unwrap_or_default()
-}
-
 fn idle_frame() -> RenderResult {
     RenderResult {
         blocks: vec![Block::Lines {
@@ -212,5 +236,142 @@ fn one_line_frame(title: &str, message: &str) -> RenderResult {
             },
         ],
         refresh_ms: Some(1000),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FakeBackend(Option<Playback>);
+    impl NowPlayingBackend for FakeBackend {
+        fn read(&self) -> Option<Playback> {
+            self.0.clone()
+        }
+    }
+
+    fn make_pb(elapsed: f64, playing: bool) -> Playback {
+        Playback {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            duration: 300.0,
+            elapsed,
+            playing,
+        }
+    }
+
+    fn state_with(pb: Option<Playback>) -> PluginState {
+        let dir =
+            std::env::temp_dir().join(format!("inkbuddy-lyrics-state-test-{}", std::process::id()));
+        let source = LyricsSource::new(dir).expect("test LyricsSource");
+        PluginState::new(Box::new(FakeBackend(pb)), source)
+    }
+
+    /// A state already anchored on `pb`'s track, with a known clock base.
+    fn primed(pb: &Playback, base: f64, playing: bool) -> PluginState {
+        let mut s = state_with(None);
+        s.last_track_id = Some(pb.track_id());
+        s.position_base = base;
+        s.position_base_at = Instant::now();
+        s.last_playing = playing;
+        s
+    }
+
+    #[tokio::test]
+    async fn seek_to_zero_reanchors() {
+        let pb = make_pb(0.0, true);
+        let mut s = primed(&pb, 100.0, true);
+        s.update_clock(&pb);
+        assert!(s.position_base.abs() < 1e-6, "seek to 0 must re-anchor");
+    }
+
+    #[tokio::test]
+    async fn seek_while_paused_reanchors() {
+        // Re-anchoring must NOT be gated on `pb.playing`: a paused seek to 0
+        // used to be swallowed, leaving the wrong position after resume.
+        let pb = make_pb(0.0, false);
+        let mut s = primed(&pb, 100.0, false);
+        s.update_clock(&pb);
+        assert!(
+            s.position_base.abs() < 1e-6,
+            "paused seek to 0 must re-anchor"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_extrapolation_reanchor_threshold() {
+        let mut s = state_with(None);
+        let pb = make_pb(12.0, true);
+        s.last_track_id = Some(pb.track_id());
+        s.position_base = 10.0;
+        // Local clock has advanced ~2s, so local ~= 12 == reported 12.
+        s.position_base_at = Instant::now() - Duration::from_secs(2);
+        s.last_playing = true;
+
+        s.update_clock(&pb);
+        assert!(
+            (s.position_base - 10.0).abs() < 1e-6,
+            "small drift must NOT re-anchor (local clock stays authoritative)"
+        );
+
+        let seek = make_pb(20.0, true);
+        s.update_clock(&seek);
+        assert!(
+            (s.position_base - 20.0).abs() < 1e-6,
+            "divergence > SEEK_EPS must re-anchor"
+        );
+    }
+
+    #[tokio::test]
+    async fn position_clamped_to_duration() {
+        let pb = make_pb(0.0, true);
+        let mut s = primed(&pb, 1000.0, true);
+        s.set_latency_ms(0.0);
+        assert!(
+            (s.position(&pb) - 300.0).abs() < 1e-6,
+            "position must never exceed duration"
+        );
+    }
+
+    #[tokio::test]
+    async fn latency_configuration_takes_effect() {
+        let pb_play = make_pb(0.0, true);
+        let mut s = primed(&pb_play, 10.0, true);
+        s.set_latency_ms(1500.0);
+        assert!(
+            (s.position(&pb_play) - 11.5).abs() < 0.05,
+            "latency added while playing"
+        );
+
+        let pb_pause = make_pb(0.0, false);
+        assert!(
+            (s.position(&pb_pause) - 10.0).abs() < 0.05,
+            "no latency compensation while paused"
+        );
+    }
+
+    #[tokio::test]
+    async fn after_last_line_shows_idle_note() {
+        let pb = make_pb(100.0, true);
+        let mut s = state_with(Some(pb.clone()));
+        s.last_track_id = Some(pb.track_id());
+        // Inject a loaded song so render() skips the network entirely.
+        s.cached_track = Some(pb.track_id());
+        s.cached_song = Some(CachedSong {
+            lines: vec![(0.0, "line1".into()), (10.0, "line2".into())],
+            ..Default::default()
+        });
+        s.position_base = 100.0;
+        s.position_base_at = Instant::now();
+        s.last_playing = true;
+        s.set_latency_ms(0.0);
+
+        let frame = s.render().await;
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(
+            json.contains("♪"),
+            "past last line + grace should show the idle note: {json}"
+        );
     }
 }

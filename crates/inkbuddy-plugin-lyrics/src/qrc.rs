@@ -4,13 +4,15 @@
 //! DES / 3DES 的算法结构与 S-box 数值均为公开的 FIPS 标准事实；本文件用
 //! Rust 独立实现，未复制参考项目的代码文本，也未引入其 GPL 许可声明。
 //!
-//! QQ 音乐 QRC 使用一套自定义 3DES 密钥扩展（PC-2 偏移量与标准不同），
+//! QQ 音乐 QRC 使用一套自定义 3DES 密钥扩展（PC-2 表为标准 PC-2 的 0-based 形式），
 //! 标准 des / openssl 实现无法解开，必须按参考实现的行为精确复现。
 
 use flate2::read::ZlibDecoder;
-use std::collections::HashMap;
 use std::fmt;
 use std::io::Read;
+
+/// zlib 解压输出上限（4 MiB），防止解压炸弹耗尽内存。
+const MAX_DECOMPRESSED: usize = 4 * 1024 * 1024;
 
 // ===================== 错误类型 =====================
 
@@ -20,6 +22,7 @@ pub enum QrcError {
     InvalidBlockLength(usize),
     Decompress(String),
     InvalidUtf8(std::string::FromUtf8Error),
+    PayloadTooLarge { limit: usize },
 }
 
 impl fmt::Display for QrcError {
@@ -29,6 +32,9 @@ impl fmt::Display for QrcError {
             QrcError::InvalidBlockLength(n) => write!(f, "密文长度 {} 不是 8 的倍数", n),
             QrcError::Decompress(s) => write!(f, "zlib 解压失败: {}", s),
             QrcError::InvalidUtf8(e) => write!(f, "UTF-8 解码失败: {}", e),
+            QrcError::PayloadTooLarge { limit } => {
+                write!(f, "解压后的数据超过上限 {} 字节", limit)
+            }
         }
     }
 }
@@ -59,7 +65,7 @@ pub struct RomaLine {
 /// hex -> 自定义 3DES -> zlib -> QRC XML 文本。失败返回 Err。
 pub fn qrc_decrypt(encrypted_hex: &str) -> Result<String, QrcError> {
     if encrypted_hex.is_empty() {
-        return Ok(String::new());
+        return Err(QrcError::InvalidHex("输入为空".into()));
     }
     let data = hex_decode(encrypted_hex)?;
     if data.len() % 8 != 0 {
@@ -71,24 +77,37 @@ pub fn qrc_decrypt(encrypted_hex: &str) -> Result<String, QrcError> {
         let block: [u8; 8] = chunk.try_into().unwrap();
         decrypted.extend_from_slice(&tripledes_crypt(&block, &schedule));
     }
-    let mut decoder = ZlibDecoder::new(decrypted.as_slice());
+    // take 最多读 4 MiB + 1 字节：多读 1 字节用于区分「恰好到上限」与「超出上限」，
+    // 同时避免把整个解压炸弹读进内存。
+    let decoder = ZlibDecoder::new(decrypted.as_slice());
+    let mut limited = decoder.take(MAX_DECOMPRESSED as u64 + 1);
     let mut out = Vec::new();
-    decoder
+    limited
         .read_to_end(&mut out)
         .map_err(|e| QrcError::Decompress(e.to_string()))?;
+    if out.len() > MAX_DECOMPRESSED {
+        return Err(QrcError::PayloadTooLarge {
+            limit: MAX_DECOMPRESSED,
+        });
+    }
     String::from_utf8(out).map_err(QrcError::InvalidUtf8)
 }
 
 /// 从 QRC XML 的 LyricContent="..." 属性取出内容并做 HTML 实体反转义。
+/// 取不到属性时返回空字符串，不会把整份 XML 误当歌词内容。
+/// 保留这个公开入口给插件作者；插件内部走 [`align_roma`]。
+#[allow(dead_code)]
 pub fn extract_lyric_content(xml: &str) -> String {
+    try_extract_lyric_content(xml).unwrap_or_default()
+}
+
+/// 内部版本：找不到 LyricContent 属性时返回 None，供 [`align_roma`] 区分「无内容」。
+fn try_extract_lyric_content(xml: &str) -> Option<String> {
     const MARK: &str = "LyricContent=\"";
-    if let Some(start) = xml.find(MARK) {
-        let begin = start + MARK.len();
-        if let Some(rel) = xml[begin..].find('"') {
-            return html_unescape(&xml[begin..begin + rel]);
-        }
-    }
-    xml.to_string()
+    let start = xml.find(MARK)?;
+    let begin = start + MARK.len();
+    let rel = xml[begin..].find('"')?;
+    Some(html_unescape(&xml[begin..begin + rel]))
 }
 
 /// 解析 QRC 逐字行，过滤含「音译标注 / AI 工具」的声明行。
@@ -108,38 +127,65 @@ pub fn parse_qrc_lines(content: &str) -> Vec<QrcLine> {
         .collect()
 }
 
-/// 把两个 QRC 文本（原文 + 罗马音）按行 start 时间对齐，产出带粤拼的行。
-/// 仅保留能按 start 匹配到罗马音行、且逐字对齐成功的原文行
+/// 把两个 QRC 文本（原文 + 罗马音）按行 start 时间就近对齐，产出带粤拼的行。
+/// 仅保留能在 0.3 秒内匹配到罗马音行、字数一致且存在非空读音的原文行
 /// （元数据行、无音译行会被跳过）。
 pub fn align_roma(lyric_xml: &str, roma_xml: &str) -> Vec<RomaLine> {
-    let lyric_lines = parse_lines(&extract_lyric_content(lyric_xml));
-    let roma_lines = parse_lines(&extract_lyric_content(roma_xml));
+    let Some(lyric_content) = try_extract_lyric_content(lyric_xml) else {
+        tracing::warn!("align_roma: 原文 XML 缺少 LyricContent 属性，跳过粤拼对齐");
+        return Vec::new();
+    };
+    let Some(roma_content) = try_extract_lyric_content(roma_xml) else {
+        tracing::warn!("align_roma: 罗马音 XML 缺少 LyricContent 属性，跳过粤拼对齐");
+        return Vec::new();
+    };
 
-    let mut roma_by_start: HashMap<i64, &ParsedLine> = HashMap::new();
-    for r in &roma_lines {
-        let key = (r.start * 1000.0).round() as i64;
-        roma_by_start.insert(key, r);
-    }
+    let lyric_lines = parse_lines(&lyric_content);
+    let roma_lines = parse_lines(&roma_content);
 
+    const TOLERANCE: f64 = 0.3;
+    let mut unmatched = 0usize;
     let mut result = Vec::new();
     for l in &lyric_lines {
-        let key = (l.start * 1000.0).round() as i64;
-        if let Some(r) = roma_by_start.get(&key) {
-            let words: Vec<(String, String)> = l
-                .words
-                .iter()
-                .zip(r.words.iter())
-                .map(|((lw, _), (rw, _))| (lw.clone(), rw.trim().to_string()))
-                .collect();
-            if words.is_empty() {
-                continue;
-            }
-            result.push(RomaLine {
-                start: l.start,
-                end: l.end,
-                words,
-            });
+        // 在容差内取时间最接近的罗马音行，避免 1ms 抖动就让整行丢失。
+        let Some(r) = roma_lines
+            .iter()
+            .filter(|r| (r.start - l.start).abs() <= TOLERANCE)
+            .min_by(|a, b| {
+                (a.start - l.start)
+                    .abs()
+                    .total_cmp(&(b.start - l.start).abs())
+            })
+        else {
+            unmatched += 1;
+            continue;
+        };
+        // 字数不等时跳过整行，避免 zip 静默截断产生错位粤拼。
+        if l.words.len() != r.words.len() {
+            unmatched += 1;
+            continue;
         }
+        let words: Vec<(String, String)> = l
+            .words
+            .iter()
+            .zip(r.words.iter())
+            .filter_map(|((lw, _), (rw, _))| {
+                let pron = rw.trim();
+                (!pron.is_empty()).then(|| (lw.clone(), pron.to_string()))
+            })
+            .collect();
+        if words.is_empty() {
+            unmatched += 1;
+            continue;
+        }
+        result.push(RomaLine {
+            start: l.start,
+            end: l.end,
+            words,
+        });
+    }
+    if unmatched > 0 {
+        tracing::debug!(unmatched, "align_roma: 未能产出粤拼的歌词行数");
     }
     result
 }
@@ -202,6 +248,7 @@ const KEY_PERM_D: [u32; 28] = [
     27, 19, 11, 3,
 ];
 
+// 标准 PC-2 的 0-based 形式：48 项即标准 PC-2 各值减 1，并非自定义偏移量。
 const KEY_COMPRESSION: [u32; 48] = [
     13, 16, 10, 23, 0, 4, 2, 27, 14, 5, 20, 9, 22, 18, 11, 3, 25, 7, 15, 6, 26, 19, 12, 1, 40, 51,
     30, 36, 46, 54, 29, 39, 50, 44, 32, 47, 43, 48, 38, 55, 33, 52, 45, 41, 49, 35, 28, 31,
@@ -318,15 +365,15 @@ fn initial_permutation(input: &[u8; 8]) -> (u32, u32) {
 /// 逆初始置换：(L, R) -> 8 字节。
 fn inverse_permutation(s0: u32, s1: u32) -> [u8; 8] {
     let mut data = [0u8; 8];
-    for n in 0..8usize {
+    for (n, slot) in data.iter_mut().enumerate() {
         let b = if n < 4 { 27 - n as i32 } else { 35 - n as i32 };
         let mut byte = 0u8;
         for k in 0..4 {
-            let sh = (b - 8 * k as i32) as u32;
+            let sh = (b - 8 * k) as u32;
             byte |= (((s1 >> sh) & 1) as u8) << (7 - 2 * k as u32);
             byte |= (((s0 >> sh) & 1) as u8) << (6 - 2 * k as u32);
         }
-        data[n] = byte;
+        *slot = byte;
     }
     data
 }
@@ -334,16 +381,16 @@ fn inverse_permutation(s0: u32, s1: u32) -> [u8; 8] {
 /// 单块 DES：16 轮 Feistel（15 轮迭代 + 第 16 轮 + 逆置换）。
 fn crypt(input: &[u8; 8], key: &[[u8; 6]; 16]) -> [u8; 8] {
     let (mut s0, mut s1) = initial_permutation(input);
-    for idx in 0..15 {
+    for subkey in key.iter().take(15) {
         let prev_s1 = s1;
-        s1 = f(s1, &key[idx]) ^ s0;
+        s1 = f(s1, subkey) ^ s0;
         s0 = prev_s1;
     }
-    s0 = f(s1, &key[15]) ^ s0;
+    s0 ^= f(s1, &key[15]);
     inverse_permutation(s0, s1)
 }
 
-/// DES 密钥扩展（含参考实现的自定义 PC-2 偏移量）。
+/// DES 密钥扩展（PC-2 表采用标准 PC-2 的 0-based 形式，即标准值减 1）。
 fn key_schedule(key: &[u8; 8], mode: Mode) -> [[u8; 6]; 16] {
     let mut schedule = [[0u8; 6]; 16];
     let v0 = u32::from_le_bytes([key[0], key[1], key[2], key[3]]);
@@ -368,8 +415,7 @@ fn key_schedule(key: &[u8; 8], mode: Mode) -> [[u8; 6]; 16] {
         d |= bit << (31 - i as u32);
     }
 
-    for i in 0..16 {
-        let sh = KEY_RND_SHIFT[i];
+    for (i, &sh) in KEY_RND_SHIFT.iter().enumerate() {
         c = ((c << sh) | (c >> (28 - sh))) & 0xFFFF_FFF0;
         d = ((d << sh) | (d >> (28 - sh))) & 0xFFFF_FFF0;
 
@@ -412,8 +458,8 @@ fn tripledes_key_setup(key: &[u8; 24], mode: Mode) -> [[[u8; 6]; 16]; 3] {
 /// 3DES 单块：依次用 3 组子密钥跑 DES。
 fn tripledes_crypt(data: &[u8; 8], key: &[[[u8; 6]; 16]; 3]) -> [u8; 8] {
     let mut buf = *data;
-    for i in 0..3 {
-        buf = crypt(&buf, &key[i]);
+    for k in key.iter().take(3) {
+        buf = crypt(&buf, k);
     }
     buf
 }
@@ -425,7 +471,8 @@ fn hex_val(b: u8) -> Result<u8, QrcError> {
         b'0'..=b'9' => Ok(b - b'0'),
         b'a'..=b'f' => Ok(b - b'a' + 10),
         b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => Err(QrcError::InvalidHex(format!("非法字符 {:?}", b as char))),
+        // 用十六进制字节值而非 `b as char`，避免非 ASCII 字节打出乱码。
+        _ => Err(QrcError::InvalidHex(format!("非法字符 0x{:02x}", b))),
     }
 }
 
@@ -449,6 +496,14 @@ fn decode_entity(ent: &str) -> Option<String> {
         "quot" => Some("\"".into()),
         "apos" | "#39" => Some("'".into()),
         "nbsp" => Some("\u{00a0}".into()),
+        "hellip" => Some("\u{2026}".into()),
+        "mdash" => Some("\u{2014}".into()),
+        "ndash" => Some("\u{2013}".into()),
+        "middot" => Some("\u{00b7}".into()),
+        "ldquo" => Some("\u{201c}".into()),
+        "rdquo" => Some("\u{201d}".into()),
+        "lsquo" => Some("\u{2018}".into()),
+        "rsquo" => Some("\u{2019}".into()),
         _ if ent.starts_with("#x") || ent.starts_with("#X") => u32::from_str_radix(&ent[2..], 16)
             .ok()
             .and_then(char::from_u32)
@@ -462,7 +517,10 @@ fn decode_entity(ent: &str) -> Option<String> {
     }
 }
 
-fn html_unescape(s: &str) -> String {
+/// HTML 实体反转义。单遍扫描，解码结果直接写入输出且不再回扫，
+/// 等价于「amp 实体最后替换」：以 amp 实体开头的组合只还原成字面实体文本，
+/// 不会被二次解码（例如不会还原出小于号）。
+pub(crate) fn html_unescape(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = String::with_capacity(s.len());
     let mut i = 0usize;
@@ -492,8 +550,9 @@ struct ParsedLine {
     words: Vec<(String, f64)>,
 }
 
+/// 纯数字且长度不超过 10 位，保证一定能安全解析为 u64（不会溢出 panic）。
 fn is_digits(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit())
+    !s.is_empty() && s.len() <= 10 && s.bytes().all(|c| c.is_ascii_digit())
 }
 
 /// 手写扫描复现「文本 + 紧跟 (数字,数字)」的逐字匹配，文本段不含括号。
@@ -518,8 +577,13 @@ fn parse_lines(content: &str) -> Vec<ParsedLine> {
         if body.is_empty() {
             continue;
         }
-        let start_ms: u64 = a.parse().unwrap();
-        let dur_ms: u64 = b.parse().unwrap();
+        // is_digits 已限制位数，这里仍用 let-else 兜底，彻底消除 unwrap panic。
+        let Ok(start_ms) = a.parse::<u64>() else {
+            continue;
+        };
+        let Ok(dur_ms) = b.parse::<u64>() else {
+            continue;
+        };
 
         let bb = body.as_bytes();
         let mut words: Vec<(String, f64)> = Vec::new();
@@ -534,26 +598,24 @@ fn parse_lines(content: &str) -> Vec<ParsedLine> {
                         if is_digits(p) && is_digits(q) {
                             let text = body[text_start..i].trim();
                             if !text.is_empty() {
-                                let ms: f64 = p.parse::<u64>().unwrap() as f64;
-                                words.push((text.to_string(), ms / 1000.0));
+                                // 解析失败只跳过该字：此处不能 continue，
+                                // 否则 while 里 i 不前进会造成死循环。
+                                if let Ok(ms) = p.parse::<u64>() {
+                                    words.push((text.to_string(), ms as f64 / 1000.0));
+                                }
                             }
                         }
                     }
                     i = j + 1;
                     text_start = i;
                     continue;
-                } else {
-                    i += 1;
-                    text_start = i;
-                    continue;
                 }
+                // 裸 '('（后面没有配对的 ')'）：当作普通正文字符，
+                // 不重置 text_start，避免吞掉此前积累的文字。
             } else if bb[i] == b')' {
-                i += 1;
-                text_start = i;
-                continue;
-            } else {
-                i += 1;
+                // 裸 ')'：同样只前进游标，不重置 text_start。
             }
+            i += 1;
         }
 
         if words.is_empty() {
@@ -633,5 +695,166 @@ mod tests {
         );
         // 文本段不含括号, "(6259,569)" 的数字不会污染文字
         assert_eq!(lines[1].text, "半边生命-梁汉文Edmond");
+    }
+
+    // ===================== 失败路径与健壮性 =====================
+
+    /// 用 QRC 的 3DES 加密明文并转成 hex，便于构造自定义密文。
+    fn encrypt_to_hex(plain: &[u8]) -> String {
+        let mut padded = plain.to_vec();
+        padded.resize(plain.len().div_ceil(8) * 8, 0);
+        let sched = tripledes_key_setup(&QRC_KEY, Mode::Encrypt);
+        let mut out = Vec::with_capacity(padded.len());
+        for chunk in padded.chunks_exact(8) {
+            let block: [u8; 8] = chunk.try_into().unwrap();
+            out.extend_from_slice(&tripledes_crypt(&block, &sched));
+        }
+        out.iter().map(|b| format!("{:02X}", b)).collect()
+    }
+
+    fn qrc_xml(content: &str) -> String {
+        format!("<Lyric_1 LyricContent=\"{}\"/>", content)
+    }
+
+    #[test]
+    fn tripledes_encrypt_decrypt_roundtrip() {
+        let plain = b"roundtrip payload 123";
+        let data = hex_decode(&encrypt_to_hex(plain)).unwrap();
+        let sched = tripledes_key_setup(&QRC_KEY, Mode::Decrypt);
+        let mut dec = Vec::new();
+        for chunk in data.chunks_exact(8) {
+            let block: [u8; 8] = chunk.try_into().unwrap();
+            dec.extend_from_slice(&tripledes_crypt(&block, &sched));
+        }
+        assert_eq!(&dec[..plain.len()], &plain[..]);
+    }
+
+    #[test]
+    fn qrc_decrypt_rejects_empty_input() {
+        assert!(matches!(qrc_decrypt(""), Err(QrcError::InvalidHex(_))));
+    }
+
+    #[test]
+    fn qrc_decrypt_rejects_odd_length_hex() {
+        assert!(matches!(qrc_decrypt("ABC"), Err(QrcError::InvalidHex(_))));
+    }
+
+    #[test]
+    fn qrc_decrypt_rejects_invalid_hex_chars() {
+        let err = qrc_decrypt("ZZ").unwrap_err();
+        assert!(err.to_string().contains("0x5a"), "实际: {err}");
+        // 非 ASCII 字节必须打印成十六进制，而不是乱码字符。
+        let err = qrc_decrypt("é").unwrap_err();
+        assert!(err.to_string().contains("0xc3"), "实际: {err}");
+    }
+
+    #[test]
+    fn qrc_decrypt_rejects_non_multiple_of_eight() {
+        assert!(matches!(
+            qrc_decrypt("AABBCC"),
+            Err(QrcError::InvalidBlockLength(3))
+        ));
+    }
+
+    #[test]
+    fn qrc_decrypt_rejects_corrupt_zlib() {
+        let hex = encrypt_to_hex(b"this is definitely not a zlib stream");
+        assert!(
+            matches!(qrc_decrypt(&hex), Err(QrcError::Decompress(_))),
+            "损坏的 zlib 应返回 Decompress"
+        );
+    }
+
+    #[test]
+    fn qrc_decrypt_rejects_decompression_bomb() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::fast());
+        enc.write_all(&vec![b'x'; MAX_DECOMPRESSED + 1024]).unwrap();
+        let compressed = enc.finish().unwrap();
+        let hex = encrypt_to_hex(&compressed);
+        assert!(
+            matches!(qrc_decrypt(&hex), Err(QrcError::PayloadTooLarge { .. })),
+            "解压超过 4 MiB 应返回 PayloadTooLarge"
+        );
+    }
+
+    #[test]
+    fn oversized_timestamps_do_not_panic() {
+        // 行头时间戳超长：整行跳过，不能触发 u64 解析 panic。
+        let head_overflow = "[999999999999999999999999,1000]你(0,50)好(50,50)";
+        assert!(parse_qrc_lines(head_overflow).is_empty());
+        // 逐字时间戳超长：该字被跳过，但不应 panic，也不应死循环。
+        let word_overflow = "[0,1000]你(99999999999999999999,50)好(50,50)";
+        let lines = parse_qrc_lines(word_overflow);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "好");
+    }
+
+    #[test]
+    fn bare_parenthesis_does_not_swallow_text() {
+        // 裸 ')' 不应吞掉其前的正文文字。
+        let lines = parse_qrc_lines("[0,1000]喂(0,50)你好)世界(100,50)");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "喂你好)世界");
+    }
+
+    #[test]
+    fn align_roma_matches_nearest_timestamp_within_tolerance() {
+        let lyric = qrc_xml("[1000,900]你(1000,50)好(1050,50)");
+        let roma = qrc_xml("[1100,900]nei(1100,50)hou(1150,50)");
+        let lines = align_roma(&lyric, &roma);
+        assert_eq!(lines.len(), 1, "0.1s 错位应能就近匹配");
+        assert_eq!(
+            lines[0].words,
+            vec![
+                ("你".to_string(), "nei".to_string()),
+                ("好".to_string(), "hou".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn align_roma_skips_timestamps_out_of_tolerance() {
+        let lyric = qrc_xml("[1000,900]你(0,50)好(50,50)");
+        let roma = qrc_xml("[2000,900]nei(0,50)hou(50,50)");
+        assert!(align_roma(&lyric, &roma).is_empty(), "相差 1s 应不匹配");
+    }
+
+    #[test]
+    fn align_roma_skips_mismatched_word_counts() {
+        let lyric = qrc_xml("[0,1000]你(0,50)好(50,50)吗(100,50)");
+        let roma = qrc_xml("[0,1000]nei(0,50)hou(50,50)");
+        assert!(align_roma(&lyric, &roma).is_empty(), "字数不等应跳过整行");
+    }
+
+    #[test]
+    fn align_roma_returns_empty_when_lyric_content_missing() {
+        let xml = "<?xml version=\"1.0\"?><Lyric_1/>";
+        assert!(align_roma(xml, xml).is_empty());
+        // 公开 helper 也不再把整份 XML 误当歌词内容。
+        assert_eq!(extract_lyric_content(xml), "");
+    }
+
+    #[test]
+    fn html_unescape_handles_named_entities_and_amp_last() {
+        // 用 concat! 拼接，避免源码里直接写实体串被工具链当成 HTML 解码。
+        let input = concat!(
+            "a", "&", "hellip;", "b", "&", "mdash;", "c", "&", "middot;", "d", "&", "ldquo;", "e",
+            "&", "rdquo;", "f"
+        );
+        assert_eq!(
+            html_unescape(input),
+            "a\u{2026}b\u{2014}c\u{00b7}d\u{201c}e\u{201d}f"
+        );
+        // amp 实体等价于最后替换：以 amp 开头的组合只还原成字面实体文本。
+        let amp_then_lt = concat!("&", "amp;", "lt;");
+        assert_eq!(html_unescape(amp_then_lt), concat!("&", "lt;"));
+        assert_eq!(
+            html_unescape(concat!("&", "#x4F60;", "&", "#20320;")),
+            "你你"
+        );
     }
 }

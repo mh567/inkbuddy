@@ -7,7 +7,8 @@
 
 use anyhow::{anyhow, Context, Result};
 use inkbuddy_protocol::{
-    Manifest, Method, PluginInfo, RenderParams, RenderResult, Request, Response, PROTOCOL_VERSION,
+    Block, Manifest, Method, PluginInfo, RenderParams, RenderResult, Request, Response,
+    PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -18,10 +19,19 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout_at, Duration, Instant};
 use tracing::{debug, warn};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Cap on a single NDJSON line in either direction. A plugin that writes a
+/// larger line is treated as broken and its process is replaced.
+const MAX_LINE_BYTES: usize = 1024 * 1024;
+/// Cap on non-protocol / stale-id stdout lines skipped in one call, so a
+/// chatty plugin cannot hold the per-plugin lock forever.
+const MAX_SKIPPED_LINES: usize = 64;
+const MAX_BLOCKS: usize = 256;
+const MAX_TEXT_BYTES: usize = 64 * 1024;
 
 /// One installed plugin: its manifest plus a lazily-started child process.
 pub struct PluginProcess {
@@ -107,57 +117,114 @@ impl PluginProcess {
     }
 
     /// Send one request and read the matching response line.
-    /// Non-JSON lines on stdout (accidental prints) are skipped.
+    ///
+    /// One deadline covers the lock wait, the spawn, the write and the whole
+    /// read loop. Any failure discards the child process and its pipes: a
+    /// cancelled `write_all` may have left a partial line in stdin, and an
+    /// unread response may still be sitting in stdout, so reusing the same
+    /// pipes would make the next request silently fail.
     async fn call(&self, method: Method, params: Value) -> Result<Value> {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let req = Request { id, method, params };
         let line = serde_json::to_string(&req)?;
+        if line.len() > MAX_LINE_BYTES {
+            return Err(anyhow!("request line exceeds 1 MiB"));
+        }
 
-        let mut guard = self.state.lock().await;
-        self.ensure_running(&mut guard).await?;
+        let deadline = Instant::now() + self.timeout;
+        let mut guard = timeout_at(deadline, self.state.lock())
+            .await
+            .context("plugin state lock timed out")?;
 
-        let s = guard.as_mut().unwrap();
+        let outcome = timeout_at(deadline, self.call_locked(&mut guard, &line, id)).await;
+        match outcome {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => {
+                self.poison(&mut guard).await;
+                Err(e)
+            }
+            Err(_) => {
+                self.poison(&mut guard).await;
+                Err(anyhow!("plugin call timed out"))
+            }
+        }
+    }
+
+    /// The part of `call` that runs while holding the per-plugin state lock.
+    async fn call_locked(
+        &self,
+        state: &mut Option<ChildState>,
+        line: &str,
+        id: u64,
+    ) -> Result<Value> {
+        self.ensure_running(state).await?;
+        let s = state.as_mut().unwrap();
+
         let payload = format!("{line}\n");
-        let write = s.stdin.write_all(payload.as_bytes());
-        timeout(self.timeout, write)
+        s.stdin
+            .write_all(payload.as_bytes())
             .await
-            .context("plugin write timed out")?
             .context("writing to plugin stdin")?;
-        let flush = s.stdin.flush();
-        timeout(self.timeout, flush)
-            .await
-            .context("plugin flush timed out")?
-            .context("flushing plugin stdin")?;
+        s.stdin.flush().await.context("flushing plugin stdin")?;
 
-        // Read lines until we get a parseable Response with our id.
+        let mut skipped = 0usize;
         loop {
-            let mut buf = String::new();
-            let read = s.stdout.read_line(&mut buf);
-            let n = timeout(self.timeout, read)
+            let mut buf: Vec<u8> = Vec::new();
+            let n = s
+                .stdout
+                .read_until(b'\n', &mut buf)
                 .await
-                .context("plugin read timed out")?
                 .context("reading plugin stdout")?;
             if n == 0 {
                 return Err(anyhow!("plugin closed stdout"));
             }
-            let trimmed = buf.trim();
+            if buf.len() > MAX_LINE_BYTES {
+                return Err(anyhow!("plugin response line exceeds 1 MiB"));
+            }
+            let text = String::from_utf8_lossy(&buf);
+            let trimmed = text.trim();
             if trimmed.is_empty() {
                 continue;
             }
             let resp: Response = match serde_json::from_str(trimmed) {
                 Ok(v) => v,
                 Err(_) => {
-                    debug!(plugin = self.id(), line = %trimmed.chars().take(120).collect::<String>(), "ignoring non-protocol stdout line");
+                    debug!(
+                        plugin = self.id(),
+                        line = %trimmed.chars().take(120).collect::<String>(),
+                        "ignoring non-protocol stdout line"
+                    );
+                    skipped += 1;
+                    if skipped > MAX_SKIPPED_LINES {
+                        return Err(anyhow!("too many non-protocol stdout lines"));
+                    }
                     continue;
                 }
             };
             if resp.id != id {
+                skipped += 1;
+                if skipped > MAX_SKIPPED_LINES {
+                    return Err(anyhow!("too many stale responses on stdout"));
+                }
                 continue;
             }
             if !resp.ok {
                 return Err(anyhow!("{}", resp.error.unwrap_or_default()));
             }
-            return Ok(resp.result.unwrap_or(Value::Null));
+            let result = resp.result.unwrap_or(Value::Null);
+            if serde_json::to_string(&result)?.len() > MAX_LINE_BYTES {
+                return Err(anyhow!("plugin result exceeds 1 MiB"));
+            }
+            return Ok(result);
+        }
+    }
+
+    /// Kill and reap the child, leaving `state` empty so the next call gets a
+    /// fresh process with clean pipes.
+    async fn poison(&self, state: &mut Option<ChildState>) {
+        if let Some(mut s) = state.take() {
+            let _ = s.child.start_kill();
+            let _ = s.child.wait().await;
         }
     }
 
@@ -186,8 +253,7 @@ impl PluginProcess {
         let v = self
             .call(Method::Render, serde_json::to_value(params)?)
             .await?;
-        let result: RenderResult = serde_json::from_value(v).context("parsing render result")?;
-        Ok(result)
+        Ok(parse_render_result(self.id(), v))
     }
 
     /// Kept for the protocol: push host-side settings into a plugin.
@@ -198,14 +264,60 @@ impl PluginProcess {
     }
 
     pub async fn shutdown(&self) {
-        if let Ok(v) = self.call(Method::Shutdown, Value::Null).await {
-            let _ = v;
+        // Only ask a live child to exit. Calling `call` on an unstarted plugin
+        // would spawn a process just to immediately kill it.
+        let live = {
+            let mut guard = self.state.lock().await;
+            guard
+                .as_mut()
+                .map(|s| s.child.try_wait().ok().flatten().is_none())
+                .unwrap_or(false)
+        };
+        if live {
+            let _ = self.call(Method::Shutdown, Value::Null).await;
         }
         let mut guard = self.state.lock().await;
         if let Some(mut s) = guard.take() {
-            let _ = s.child.start_kill();
+            if s.child.try_wait().ok().flatten().is_none() {
+                let _ = s.child.start_kill();
+            }
+            let _ = s.child.wait().await;
         }
     }
+}
+
+/// Parse a render response block-by-block. One malformed block is skipped
+/// instead of discarding the whole frame from that plugin.
+fn parse_render_result(plugin_id: &str, raw: Value) -> RenderResult {
+    let mut blocks = Vec::new();
+    match raw.get("blocks").and_then(|v| v.as_array()) {
+        Some(items) => {
+            for (i, item) in items.iter().take(MAX_BLOCKS).enumerate() {
+                match serde_json::from_value::<Block>(item.clone()) {
+                    // `#[serde(other)]` variants are deserialise-only.
+                    Ok(Block::Unknown) => {
+                        debug!(plugin = plugin_id, block = i, "unknown block type skipped")
+                    }
+                    Ok(b) => match serde_json::to_string(&b) {
+                        Ok(s) if s.len() <= MAX_TEXT_BYTES => blocks.push(b),
+                        Ok(_) => warn!(plugin = plugin_id, block = i, "block too large, skipped"),
+                        Err(e) => {
+                            warn!(plugin = plugin_id, block = i, error = %e, "block not serializable, skipped")
+                        }
+                    },
+                    Err(e) => warn!(
+                        plugin = plugin_id,
+                        block = i,
+                        error = %e,
+                        "invalid block skipped"
+                    ),
+                }
+            }
+        }
+        None => warn!(plugin = plugin_id, "render result has no blocks array"),
+    }
+    let refresh_ms = raw.get("refresh_ms").and_then(|v| v.as_u64());
+    RenderResult { blocks, refresh_ms }
 }
 
 /// All discovered plugins, keyed by id.
@@ -213,6 +325,10 @@ pub struct PluginSet {
     pub plugins: HashMap<String, Arc<PluginProcess>>,
     /// Stable display order (directory scan order).
     pub order: Vec<String>,
+    /// Processes replaced or removed by `reconcile`. The caller drains this
+    /// after releasing the write lock, then asks each one to shut down, so a
+    /// replaced plugin is not killed while a request is still holding it.
+    pub pending_shutdown: Vec<Arc<PluginProcess>>,
 }
 
 /// A scanned manifest, before any process is started.
@@ -247,9 +363,9 @@ impl PluginSet {
         for id in &order {
             let f = fresh.get(id).unwrap();
             if let Some(existing) = self.plugins.get(id) {
-                let same = existing.manifest.plugin.command == f.manifest.plugin.command
-                    && existing.manifest.runtime == f.manifest.runtime
-                    && existing.dir == f.dir;
+                // Compare the whole manifest: changing name/version/
+                // description must also refresh what /manage displays.
+                let same = existing.manifest == f.manifest && existing.dir == f.dir;
                 if same {
                     next.insert(id.clone(), existing.clone());
                     continue;
@@ -266,6 +382,15 @@ impl PluginSet {
             changed = true;
         }
         if changed {
+            let previous: Vec<(String, Arc<PluginProcess>)> = self.plugins.drain().collect();
+            let mut retired = Vec::new();
+            for (id, old) in previous {
+                match next.get(&id) {
+                    Some(new) if Arc::ptr_eq(&old, new) => {}
+                    _ => retired.push(old),
+                }
+            }
+            self.pending_shutdown.extend(retired);
             self.plugins = next;
             self.order = order;
         }
@@ -286,6 +411,8 @@ impl PluginSet {
             .collect()
     }
 
+    /// Kept for callers that prefer to shut the whole set down at once.
+    #[allow(dead_code)]
     pub async fn shutdown_all(&self) {
         for id in &self.order {
             if let Some(p) = self.plugins.get(id) {
@@ -303,9 +430,20 @@ pub fn scan(dirs: &[PathBuf]) -> Vec<(Manifest, PathBuf)> {
     for dir in dirs {
         let entries = match std::fs::read_dir(dir) {
             Ok(v) => v,
-            Err(_) => continue, // missing dir is fine
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                warn!(dir = %dir.display(), error = %e, "cannot scan plugin directory");
+                continue;
+            }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(dir = %dir.display(), error = %e, "cannot read directory entry");
+                    continue;
+                }
+            };
             let path = entry.path();
             if !path.is_dir() {
                 continue;
@@ -328,15 +466,38 @@ pub fn scan(dirs: &[PathBuf]) -> Vec<(Manifest, PathBuf)> {
                     continue;
                 }
             };
+            let id = &manifest.plugin.id;
+            let id_ok = !id.is_empty()
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            if !id_ok || manifest.plugin.command.trim().is_empty() {
+                warn!(file = %manifest_file.display(), id = %id, "invalid plugin id or empty command, skipped");
+                continue;
+            }
             // Keep an absolute directory: the child's `current_dir` and the
             // relative `command` in the manifest must not depend on where
             // the host process happened to be started.
-            let dir = path.canonicalize().unwrap_or(path);
-            debug!(plugin = %manifest.plugin.id, dir = %dir.display(), "discovered plugin");
+            let dir = match path.canonicalize() {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "cannot resolve plugin directory, skipped");
+                    continue;
+                }
+            };
+            debug!(plugin = %id, dir = %dir.display(), "discovered plugin");
             found.push((manifest, dir));
         }
     }
 
+    // read_dir order is not guaranteed; make duplicate-id resolution stable
+    // so a rescan does not flip which plugin wins and restart processes.
+    found.sort_by(|a, b| {
+        a.0.plugin
+            .id
+            .cmp(&b.0.plugin.id)
+            .then_with(|| a.1.cmp(&b.1))
+    });
     found
 }
 
@@ -344,7 +505,86 @@ pub fn discover(dirs: &[PathBuf]) -> Result<PluginSet> {
     let mut set = PluginSet {
         plugins: HashMap::new(),
         order: Vec::new(),
+        pending_shutdown: Vec::new(),
     };
     set.reconcile(scan(dirs));
+    set.pending_shutdown.clear(); // nothing was ever started
     Ok(set)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use inkbuddy_protocol::{PluginManifest, RuntimeManifest};
+
+    fn manifest(id: &str, name: &str) -> Manifest {
+        Manifest {
+            plugin: PluginManifest {
+                id: id.to_string(),
+                name: name.to_string(),
+                version: "0.1.0".to_string(),
+                description: String::new(),
+                command: "./plugin".to_string(),
+            },
+            runtime: RuntimeManifest::default(),
+        }
+    }
+
+    #[test]
+    fn render_result_skips_bad_blocks_but_keeps_good_ones() {
+        let raw = serde_json::json!({
+            "blocks": [
+                {"type": "text", "text": "hello"},
+                {"type": "future_widget", "x": 1},
+                {"type": "lines", "lines": [
+                    {"text": "hi", "emphasis": "bogus", "ruby": []}
+                ]},
+                {"type": "lines", "lines": "not-an-array"}
+            ],
+            "refresh_ms": 750
+        });
+        let r = parse_render_result("demo", raw);
+        // text + lines; unknown type and malformed lines are skipped.
+        assert_eq!(r.blocks.len(), 2);
+        assert_eq!(r.refresh_ms, Some(750));
+    }
+
+    #[test]
+    fn missing_blocks_array_yields_empty_frame() {
+        let r = parse_render_result("demo", serde_json::json!({"refresh_ms": 500}));
+        assert!(r.blocks.is_empty());
+        assert_eq!(r.refresh_ms, Some(500));
+    }
+
+    #[test]
+    fn reconcile_detects_display_field_change_and_collects_retired() {
+        let dir = PathBuf::from("/tmp/inkbuddy-review-test");
+        let mut set = PluginSet {
+            plugins: HashMap::new(),
+            order: Vec::new(),
+            pending_shutdown: Vec::new(),
+        };
+        assert!(set.reconcile(vec![(manifest("demo", "Old"), dir.clone())]));
+        set.pending_shutdown.clear();
+        assert!(!set.reconcile(vec![(manifest("demo", "Old"), dir.clone())]));
+        // A name change must recreate the plugin, not be silently ignored.
+        assert!(set.reconcile(vec![(manifest("demo", "New"), dir.clone())]));
+        assert_eq!(set.pending_shutdown.len(), 1);
+        assert_eq!(set.order, vec!["demo".to_string()]);
+    }
+
+    #[test]
+    fn reconcile_collects_removed_plugins() {
+        let dir = PathBuf::from("/tmp/inkbuddy-review-test");
+        let mut set = PluginSet {
+            plugins: HashMap::new(),
+            order: Vec::new(),
+            pending_shutdown: Vec::new(),
+        };
+        set.reconcile(vec![(manifest("demo", "Demo"), dir)]);
+        set.pending_shutdown.clear();
+        assert!(set.reconcile(Vec::new()));
+        assert!(set.plugins.is_empty());
+        assert_eq!(set.pending_shutdown.len(), 1);
+    }
 }

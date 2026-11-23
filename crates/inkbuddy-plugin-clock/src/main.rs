@@ -33,7 +33,6 @@ async fn main() -> Result<()> {
                     name: "时钟".to_string(),
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     description: "当前日期与时间".to_string(),
-                    refresh_ms: 30_000,
                     protocol: PROTOCOL_VERSION,
                 },
             ),
@@ -69,7 +68,7 @@ async fn main() -> Result<()> {
                             ],
                         },
                     ],
-                    refresh_ms: Some(30_000),
+                    refresh_ms: Some(15_000),
                 };
                 Response::success(req.id, &result)
             }

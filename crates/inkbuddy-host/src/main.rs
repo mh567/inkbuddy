@@ -109,6 +109,7 @@ async fn main() -> Result<()> {
         plugins: tokio::sync::RwLock::new(plugins),
         plugin_dirs: dirs,
         last_scan: tokio::sync::Mutex::new(std::time::Instant::now()),
+        render_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     });
     let app = server::router(state.clone());
 
@@ -116,20 +117,30 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding {addr}"))?;
 
-    // Print every usable LAN address so the URL can be typed into the reader.
+    // Print usable LAN addresses so the URL can be typed into the reader.
+    // Only RFC1918 addresses are labelled as recommended; VPN/TUN/CGNAT
+    // addresses are listed separately because a device on the real LAN
+    // usually cannot reach them.
     let lan = local_ip_addresses();
     info!("InkBuddy listening on {addr}");
     info!("  E-Ink page : http://127.0.0.1:{port}/");
-    if let Some((first, rest)) = lan.split_first() {
+    let recommended: Vec<&String> = lan.iter().filter(|ip| lan_rank(ip) <= 2).collect();
+    if let Some(first) = recommended.first() {
         info!(
             "  LAN        : http://{}:{port}/   (推荐，输入到墨水屏浏览器)",
             first
         );
-        for ip in rest {
+        for ip in recommended.iter().skip(1) {
             info!("  LAN 备选   : http://{}:{port}/", ip);
         }
     } else {
-        warn!("  LAN        : 没检测到可用局域网地址，可用 127.0.0.1 本机验证");
+        warn!("  LAN        : 没检测到私有局域网地址，可用 127.0.0.1 本机验证");
+    }
+    for ip in lan.iter().filter(|ip| lan_rank(ip) > 2) {
+        info!(
+            "  LAN 其他   : http://{}:{port}/   (VPN/虚拟网卡，设备可能无法访问)",
+            ip
+        );
     }
     info!("  Manage     : http://127.0.0.1:{port}/manage");
 
@@ -160,7 +171,15 @@ async fn shutdown_signal(state: std::sync::Arc<AppState>) {
         _ = terminate => {},
     }
     info!("shutting down, stopping plugins");
-    state.plugins.read().await.shutdown_all().await;
+    // Clone the handles and release the read lock before waiting on child
+    // processes, so a shutdown cannot block a concurrent plugin rescan.
+    let handles: Vec<_> = {
+        let guard = state.plugins.read().await;
+        guard.order.iter().filter_map(|id| guard.get(id)).collect()
+    };
+    for p in handles {
+        p.shutdown().await;
+    }
 }
 
 /// Candidate IPv4 addresses the E-Ink reader can reach, best one first.
@@ -225,26 +244,79 @@ fn local_ip_addresses() -> Vec<String> {
         }
     }
 
-    candidates.sort_by(|a, b| lan_rank(a).cmp(&lan_rank(b)).then(a.cmp(b)));
+    candidates.retain(|ip| parse_ipv4(ip).is_some());
+    candidates.sort_by(|a, b| {
+        lan_rank(a)
+            .cmp(&lan_rank(b))
+            .then_with(|| parse_ipv4(a).cmp(&parse_ipv4(b)))
+    });
     candidates.dedup();
     candidates
 }
 
+fn parse_ipv4(ip: &str) -> Option<[u8; 4]> {
+    let parts: Vec<u8> = ip
+        .split('.')
+        .map(|p| p.parse().ok())
+        .collect::<Option<_>>()?;
+    parts.as_slice().try_into().ok()
+}
+
 fn usable(ip: &str) -> bool {
-    !ip.is_empty() && !ip.starts_with("127.") && !ip.starts_with("169.254.") && ip != "0.0.0.0"
+    let Some(o) = parse_ipv4(ip) else {
+        return false;
+    };
+    !(o[0] == 127 || (o[0] == 169 && o[1] == 254) || o == [0, 0, 0, 0])
 }
 
 /// Home-router LAN addresses first, other private ranges next, virtual
-/// egress addresses (VPN/TUN, CGNAT) last.
+/// egress addresses (VPN/TUN, CGNAT) last. Invalid addresses sort to the end.
 fn lan_rank(ip: &str) -> u8 {
-    let parts: Vec<u8> = ip.split('.').filter_map(|p| p.parse().ok()).collect();
-    if parts.len() != 4 {
+    let Some(o) = parse_ipv4(ip) else {
         return 4;
-    }
-    match (parts[0], parts[1]) {
+    };
+    match (o[0], o[1]) {
         (192, 168) => 0,
         (10, _) => 1,
         (172, 16..=31) => 2,
         _ => 3,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_lan_addresses_rank_first() {
+        assert_eq!(lan_rank("192.168.28.21"), 0);
+        assert_eq!(lan_rank("10.0.0.5"), 1);
+        assert_eq!(lan_rank("172.20.1.1"), 2);
+        assert_eq!(lan_rank("198.18.0.1"), 3);
+        assert_eq!(lan_rank("999.1.1.1"), 4);
+    }
+
+    #[test]
+    fn unusable_addresses_are_filtered() {
+        assert!(!usable("127.0.0.1"));
+        assert!(!usable("169.254.1.1"));
+        assert!(!usable("0.0.0.0"));
+        assert!(!usable("not-an-ip"));
+        assert!(usable("192.168.28.21"));
+    }
+
+    #[test]
+    fn ipv4_sorting_is_numeric_not_lexical() {
+        let mut v = vec![
+            "192.168.1.10".to_string(),
+            "192.168.1.9".to_string(),
+            "10.0.0.2".to_string(),
+        ];
+        v.sort_by(|a, b| {
+            lan_rank(a)
+                .cmp(&lan_rank(b))
+                .then_with(|| parse_ipv4(a).cmp(&parse_ipv4(b)))
+        });
+        assert_eq!(v, vec!["192.168.1.9", "192.168.1.10", "10.0.0.2"]);
     }
 }

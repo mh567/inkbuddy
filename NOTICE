@@ -1,0 +1,19 @@
+关于 QQ 音乐 QRC 歌词解密的说明
+
+本项目 crates/inkbuddy-plugin-lyrics/src/qrc.rs 中用于解密 QRC 逐字歌词的
+DES 相关数值（S-box、置换表等）取自公开的 FIPS 46-3 标准（Data Encryption
+Standard）。这部分 Rust 代码是独立重写，目的是兼容 QRC 接口既有的加密数据
+格式。
+
+Python 原型项目 ink-lyrics 中包含一个以 GPL-3.0 授权的文件 tripledes_gpl.py。
+本项目没有复制、移植或引用该文件的任何代码。本项目的 DES 实现只依据公开的
+FIPS 46-3 标准数值编写，与 tripledes_gpl.py 的源码没有派生关系，因此该文件
+的 GPL-3.0 许可不延伸至本项目。
+
+参考项目
+
+mh567/ink-lyrics 是本项目的 Python 原型，用于梳理 QRC 接口、歌词对齐与粤拼
+显示的产品流程。SyncLyrics 是 ink-lyrics 的上游项目，提供同步歌词服务的最初
+实现。本项目参考的只是上述流程与接口行为，没有引入这两个项目的 GPL 代码。
+
+本项目各 crate 采用 MIT 许可。
