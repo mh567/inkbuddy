@@ -85,45 +85,18 @@ inkbuddy --list-plugins
 
 `./scripts/build-app.sh` 会生成 `dist/InkBuddy.app`。它是后台运行、没有 Dock 图标的 app 包，双击即启动服务；墨水屏仍然只需打开浏览器地址。插件选择通过 `/manage` 页面完成。
 
-从 Finder 双击启动时，进程拿到的 `PATH` 通常不含 Homebrew 的 `/opt/homebrew/bin`，会让按 `PATH` 查找 `nowplaying-cli` 失败。app 包在 `Info.plist` 里通过 `LSEnvironment` 显式设置了包含 brew 前缀的 `PATH`；歌词插件本身也会先试 `/opt/homebrew/bin/nowplaying-cli`、`/usr/local/bin/nowplaying-cli` 等绝对路径再回退 `PATH`，两层保障。
+从 Finder 双击启动时，进程拿到的 `PATH` 通常不含 Homebrew 的 `/opt/homebrew/bin`，app 包在 `Info.plist` 里通过 `LSEnvironment` 显式补上。各插件的运行依赖见各自的说明文件。
 
 停止：`pkill -f InkBuddy.app/Contents/MacOS/inkbuddy`。
 
-## 歌词插件
+## 自带插件
 
-`crates/inkbuddy-plugin-lyrics` 是第一个自带插件：
+每个插件在自己的目录里维护说明文件，写输出内容、依赖、配置和工作原理。
 
-- 读取 macOS 正在播放的曲目、播放器、进度和播放/暂停状态
-- 按播放器选择歌词来源、进度算法和提前量，见下表
-- 三行聚焦视图：上一句 / 当前句 / 下一句，当前句最大
-- 粤语歌在当前句下方单独显示一行粤拼，和中文行各自居中排版
-- 歌词和粤拼缓存到 `~/.inkbuddy/cache/lyrics/*.json`，按策略分开存
-
-播放器身份取 MediaRemote 的 bundle id（`bundleIdentifier` / `kMRMediaRemoteNowPlayingInfoClientBundleIdentifier`），映射如下：
-
-| 播放器 | bundle id 关键字 | 歌词来源 | 进度算法 | 提前量环境变量 |
-| --- | --- | --- | --- | --- |
-| QQ 音乐 | `qqmusic` | QQ 曲库优先，LRCLIB 兜底 | 本地时钟 | `INKBUDDY_LATENCY_MS` |
-| 网易云 | `cloudmusic` / `netease` | QQ 与 LRCLIB 并发 | 用上报进度 | `INKBUDDY_LATENCY_OTHER_MS` |
-| Spotify | `spotify` | QQ 与 LRCLIB 并发 | 用上报进度 | `INKBUDDY_LATENCY_OTHER_MS` |
-| 其它 | — | QQ 与 LRCLIB 并发 | 用上报进度 | `INKBUDDY_LATENCY_OTHER_MS` |
-
-网易云和 Spotify 目前与其它播放器共用同一套策略，各自的官方音源后续接入 `src/player.rs` 和 `src/source.rs`。并发策略下两个来源同时发请求，先用先返回的有效歌词；QQ 这一路跳过粤拼解密，让两边耗时只取决于歌词本身。
-
-提前量单位为毫秒，正值让歌词提前出现，抵消墨水屏刷新延迟；暂停时不叠加。默认都是 `0.0` 秒，也可通过 `configure` 请求调整：`latency_ms` 改 QQ 的值，`other_latency_ms` 改其它播放器的值。
-
-QQ 音乐 Mac 把 `ElapsedTime` 一直冻结在 0，helper 和 `get-raw` 都读不到真实进度。本地时钟按「上报值是否变化」工作：值不变就自行推进，播放器拖动进度时上报值变化，歌词随之对齐。其它播放器上报值可用，进度直接取 `ElapsedTime`。
-
-helper 返回的 `timestamp` 是这条播放信息的发布时间，`ElapsedTime` 是那个时刻的进度。QQ 音乐切歌或进度值变化时，用 `ElapsedTime + (当前时间 - timestamp)` 算出实际位置，并按歌曲时长取模，单曲循环时也能对上。这个校正只在切歌和进度值变化时做一次，之后完全靠本地时钟推进。设 `INKBUDDY_TIMESTAMP_ANCHOR=0` 可以关掉，只用上报值。
-
-缓存文件里 `lines` 是 LRC 行；`roma_lines` 与 `lines` 等长、按行索引绑定粤拼（没有对应读音的行为空）。`roma_checked` 表示这首歌的粤拼已确认，读取时直接按行索引取，命中缓存不发网络请求。策略名称进入缓存文件名，QQ 的简体+粤拼结果与并发策略的结果不会互相覆盖。
-
-播放信息通过 `nowplaying-cli` 读取，需要本机装过（`brew install nowplaying-cli`）：
-
-- 优先用 `mediaremote-mini.pl adapter_get_env` 一次取全量字段（标题、歌手、专辑、时长、进度、`playing`、`playbackRate`、`timestamp`、`bundleIdentifier`）。QQ 音乐暂停时 `PlaybackRate` 仍可能是 1，播放状态取 helper 给的 `playing`；helper 偶发取不到时沿用上一次的值。
-- helper 不可用或解析失败时回退到 `nowplaying-cli get-raw`，读原始字段 `kMRMediaRemoteNowPlayingInfoElapsedTime`。`get-raw` 没有 `timestamp`，这条路径直接从上报值开始本地计时。
-
-QQ 的逐字粤拼来自 QRC 接口，返回的是 hex + 自定义 3DES + zlib 加密数据。`crates/inkbuddy-plugin-lyrics/src/qrc.rs` 用 Rust 实现了这个解密与读音对齐，DES 表来自公开的 FIPS 46-3 标准。
+| 插件 | 用途 | 说明 |
+| --- | --- | --- |
+| `lyrics` | 正在播放的同步歌词，粤语歌带粤拼 | [crates/inkbuddy-plugin-lyrics/README.md](crates/inkbuddy-plugin-lyrics/README.md) |
+| `clock` | 当前日期与时间 | [crates/inkbuddy-plugin-clock/README.md](crates/inkbuddy-plugin-clock/README.md) |
 
 ## 写自己的插件
 
@@ -137,8 +110,8 @@ Rust 插件可直接依赖 `inkbuddy-protocol` crate 拿到全部类型定义。
 | --- | --- |
 | `crates/inkbuddy-protocol` | 共享协议与内容模型，插件作者可依赖 |
 | `crates/inkbuddy-host` | 主程序：插件进程管理、HTTP 服务、页面渲染 |
-| `crates/inkbuddy-plugin-lyrics` | 歌词插件（核心功能） |
-| `crates/inkbuddy-plugin-clock` | 时钟插件，演示组合与最小插件写法 |
+| `crates/inkbuddy-plugin-lyrics` | 歌词插件（核心功能），[说明](crates/inkbuddy-plugin-lyrics/README.md) |
+| `crates/inkbuddy-plugin-clock` | 时钟插件，演示组合与最小插件写法，[说明](crates/inkbuddy-plugin-clock/README.md) |
 | `web/ink.html` | 墨水屏展示页（编译进主程序） |
 | `plugins/*/plugin.toml` | 开发用的插件清单 |
 | `scripts/install.sh` | 编译并安装 |

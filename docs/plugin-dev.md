@@ -8,6 +8,12 @@
 - 插件独立部署，没有 ABI 兼容问题。
 - 插件只返回结构化内容，页面样式由主程序统一提供。
 
+## 插件说明文件
+
+每个插件在仓库里的 crate 根目录维护一份 `README.md`，写这个插件的输出内容、外部依赖、配置方式和实现原理。主 README 只放插件索引和链接，不写单个插件的细节。新增插件时一并补上这份说明。
+
+仓库里的两个示例：[歌词插件](../crates/inkbuddy-plugin-lyrics/README.md)、[时钟插件](../crates/inkbuddy-plugin-clock/README.md)。
+
 ## 安装位置
 
 在 `~/.inkbuddy/plugins/<任意目录名>/` 下放两个文件：
