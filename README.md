@@ -17,6 +17,10 @@
 
 插件返回结构化内容（文本行、键值对、段落），主程序负责排版。选择单个插件或把几个插件组合显示时，样式始终一致，插件之间互不依赖。
 
+## 下载 app（推荐）
+
+在 [Releases](https://github.com/mh567/inkbuddy/releases) 下载 `InkBuddy-macOS-arm64.dmg`（Apple Silicon），打开后把 InkBuddy 拖进 Applications 即可。app 内嵌 host 与插件，双击即用；设置里支持自动检查更新和一键升级。
+
 ## 快速开始
 
 ```bash
