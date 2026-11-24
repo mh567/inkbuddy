@@ -104,8 +104,14 @@ async fn main() -> Result<()> {
         .parse()
         .with_context(|| format!("invalid listen address {bind}:{port}"))?;
 
+    let initial_display = server::DisplayState {
+        mode: cfg.display.mode.clone(),
+        invert: cfg.display.invert,
+    };
     let state = std::sync::Arc::new(AppState {
         config: cfg,
+        display: tokio::sync::RwLock::new(initial_display),
+        active: tokio::sync::RwLock::new(server::load_active()),
         plugins: tokio::sync::RwLock::new(plugins),
         plugin_dirs: dirs,
         last_scan: tokio::sync::Mutex::new(std::time::Instant::now()),

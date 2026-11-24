@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::plugin::PluginSet;
 use crate::render::render_frame;
 use axum::extract::{Query, State};
@@ -20,8 +20,47 @@ const MAX_PLUGIN_IDS: usize = 64;
 
 const INK_PAGE: &str = include_str!("../../../web/ink.html");
 
+/// 可由控制端在运行时修改的显示设置，墨水屏每次取帧都会读到最新值。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayState {
+    pub mode: String,
+    pub invert: bool,
+}
+
+/// 控制端选择的启用插件。None 表示尚未设置，跟随各插件的 default_on；
+/// Some(list) 表示显式选择（可为空列表，表示全部关闭）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ActiveState {
+    ids: Option<Vec<String>>,
+}
+
+fn active_path() -> Option<std::path::PathBuf> {
+    config::home_dir().ok().map(|p| p.join("active.json"))
+}
+
+pub fn load_active() -> Option<Vec<String>> {
+    let path = active_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let state: ActiveState = serde_json::from_str(&text).ok()?;
+    state.ids
+}
+
+fn save_active(ids: &Option<Vec<String>>) {
+    let Some(path) = active_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let state = ActiveState { ids: ids.clone() };
+    if let Ok(text) = serde_json::to_string_pretty(&state) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
 pub struct AppState {
     pub config: Config,
+    pub display: tokio::sync::RwLock<DisplayState>,
+    /// 控制端设置的启用插件。取帧时优先于 URL 参数，保证设备侧无需改地址。
+    pub active: tokio::sync::RwLock<Option<Vec<String>>>,
     pub plugins: tokio::sync::RwLock<PluginSet>,
     pub plugin_dirs: Vec<std::path::PathBuf>,
     /// Throttles directory rescans so 500ms polling stays cheap.
@@ -80,6 +119,8 @@ struct FrameResponse {
     signature: String,
     refresh_ms: u64,
     active: Vec<String>,
+    mode: String,
+    invert: bool,
 }
 
 #[derive(Serialize)]
@@ -93,29 +134,30 @@ struct PluginSummary {
     running: bool,
 }
 
-/// Resolve the requested plugin ids; unknown and disabled ones are dropped.
-/// An explicitly empty value (`?plugins=` or `?plugins=,,`) uses the default set.
-fn resolve_ids(set: &PluginSet, query: &Option<String>) -> Vec<String> {
-    let requested: Option<Vec<String>> = query.as_ref().and_then(|raw| {
-        if raw.len() > MAX_QUERY_BYTES {
-            warn!(len = raw.len(), "plugins query too long, using defaults");
-            return None;
-        }
-        let mut seen = HashSet::new();
-        let ids: Vec<String> = raw
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .filter(|s| seen.insert((*s).to_string()))
-            .take(MAX_PLUGIN_IDS)
-            .map(|s| s.to_string())
-            .collect();
-        if ids.is_empty() {
-            None
-        } else {
-            Some(ids)
-        }
-    });
+/// Resolve the plugin ids to render. Control-side selection wins when set;
+/// otherwise fall back to the URL parameter, then to each plugin's default_on.
+/// Unknown and disabled ones are dropped.
+fn resolve_ids(set: &PluginSet, query: &Option<String>, active: &Option<Vec<String>>) -> Vec<String> {
+    let requested: Option<Vec<String>> = if let Some(ids) = active {
+        Some(ids.clone())
+    } else {
+        query.as_ref().and_then(|raw| {
+            if raw.len() > MAX_QUERY_BYTES {
+                warn!(len = raw.len(), "plugins query too long, using defaults");
+                return None;
+            }
+            let mut seen = HashSet::new();
+            let ids: Vec<String> = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .filter(|s| seen.insert((*s).to_string()))
+                .take(MAX_PLUGIN_IDS)
+                .map(|s| s.to_string())
+                .collect();
+            if ids.is_empty() { None } else { Some(ids) }
+        })
+    };
     let ids = requested.unwrap_or_else(|| set.default_ids());
     ids.into_iter()
         .filter(|id| {
@@ -139,7 +181,8 @@ async fn get_frame(State(state): State<Shared>, Query(q): Query<FrameQuery>) -> 
     // 目录重扫。
     let (ids, selected) = {
         let guard = state.plugins.read().await;
-        let ids = resolve_ids(&guard, &q.plugins);
+        let active = state.active.read().await.clone();
+        let ids = resolve_ids(&guard, &q.plugins, &active);
         let selected: Vec<(String, Arc<crate::plugin::PluginProcess>)> = ids
             .iter()
             .filter_map(|id| guard.get(id).map(|p| (id.clone(), p)))
@@ -220,6 +263,7 @@ async fn get_frame(State(state): State<Shared>, Query(q): Query<FrameQuery>) -> 
 
     let frame = render_frame(&parts, fallback_ms);
     debug!(active = ?frame.active, refresh_ms = frame.refresh_ms, "frame built");
+    let display = state.display.read().await.clone();
     (
         [(header::CACHE_CONTROL, "no-store")],
         Json(FrameResponse {
@@ -227,12 +271,31 @@ async fn get_frame(State(state): State<Shared>, Query(q): Query<FrameQuery>) -> 
             signature: frame.signature,
             refresh_ms: frame.refresh_ms,
             active: frame.active,
+            mode: display.mode,
+            invert: display.invert,
         }),
     )
 }
 
+/// 控制端推送显示设置。mode 只接受 gray/bw/text，写入后下一次取帧即生效。
+async fn set_display(
+    State(state): State<Shared>,
+    Json(update): Json<DisplayState>,
+) -> impl IntoResponse {
+    let mode = if update.mode == "bw" || update.mode == "text" {
+        update.mode
+    } else {
+        "gray".to_string()
+    };
+    let mut guard = state.display.write().await;
+    *guard = DisplayState { mode, invert: update.invert };
+    debug!(mode = %guard.mode, invert = guard.invert, "display settings updated");
+    ([(header::CACHE_CONTROL, "no-store")], StatusCode::OK)
+}
+
 async fn get_plugins(State(state): State<Shared>) -> impl IntoResponse {
     refresh_plugins(&state).await;
+    let active = state.active.read().await.clone();
     // Clone the handles and drop the read lock before the child-process
     // round trips; otherwise a slow describe blocks every rescan and frame.
     let entries: Vec<(String, Arc<crate::plugin::PluginProcess>)> = {
@@ -261,8 +324,13 @@ async fn get_plugins(State(state): State<Shared>) -> impl IntoResponse {
                 (false, None)
             }
         };
+        let enabled = active
+            .as_ref()
+            .map(|ids| ids.contains(&id))
+            .unwrap_or(m.runtime.default_on);
         out.push(PluginSummary {
             id,
+            enabled,
             name: i
                 .as_ref()
                 .map(|v| v.name.clone())
@@ -275,7 +343,6 @@ async fn get_plugins(State(state): State<Shared>) -> impl IntoResponse {
                 .as_ref()
                 .map(|v| v.description.clone())
                 .unwrap_or_else(|| m.plugin.description.clone()),
-            enabled: m.runtime.enabled,
             default_on: m.runtime.default_on,
             running,
         });
@@ -304,52 +371,29 @@ async fn get_ink(State(state): State<Shared>) -> Response {
         .into_response()
 }
 
-/// A tiny control page for choosing which plugins (and in what order) to show.
-async fn get_manage(State(state): State<Shared>) -> Response {
-    refresh_plugins(&state).await;
-    let guard = state.plugins.read().await;
-    let mut rows = String::new();
-    for id in &guard.order {
-        let Some(p) = guard.get(id) else { continue };
-        let checked = if p.manifest.runtime.default_on {
-            " checked"
-        } else {
-            ""
-        };
-        rows.push_str(&format!(
-            "<label><input type=checkbox value=\"{}\"{}><b>{}</b> <span>{}</span></label>",
-            html_escape(id),
-            checked,
-            html_escape(&p.manifest.plugin.name),
-            html_escape(&p.manifest.plugin.description),
-        ));
+/// 控制端读取/设置启用插件。写入后立即生效，并持久化到 active.json。
+async fn get_active(State(state): State<Shared>) -> impl IntoResponse {
+    let ids = state.active.read().await.clone();
+    ([(header::CACHE_CONTROL, "no-store")], Json(ActiveState { ids }))
+}
+
+#[derive(Deserialize)]
+struct ActiveUpdate {
+    ids: Vec<String>,
+}
+
+async fn set_active(
+    State(state): State<Shared>,
+    Json(update): Json<ActiveUpdate>,
+) -> impl IntoResponse {
+    let mut ids = update.ids;
+    if ids.len() > MAX_PLUGIN_IDS {
+        ids.truncate(MAX_PLUGIN_IDS);
     }
-    let page = format!(
-        r#"<!DOCTYPE html><html lang=zh-CN><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1"><title>InkBuddy 管理</title>
-<style>
-body{{margin:0;padding:32px;background:#fafafa;color:#1a1a1a;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;max-width:680px}}
-h1{{font-size:22px;margin:0 0 4px}} p.hint{{color:#666;font-size:13px;margin:0 0 24px}}
-label{{display:flex;gap:10px;align-items:baseline;padding:12px 14px;margin-bottom:8px;background:#fff;border:1px solid #e5e5e5;border-radius:8px;font-size:14px}}
-label span{{color:#888;font-size:12px}}
-input[type=checkbox]{{width:16px;height:16px}}
-#url{{margin-top:20px;padding:14px;background:#fff;border:1px solid #e5e5e5;border-radius:8px;word-break:break-all;font-family:ui-monospace,monospace;font-size:13px}}
-a{{color:#0066cc}}
-</style></head><body>
-<h1>InkBuddy</h1>
-<p class=hint>勾选要显示的内容，顺序即页面从上到下的顺序。把生成的地址输入墨水屏浏览器即可。</p>
-<div id=list>{rows}</div>
-<div id=url></div>
-<script>
-function update(){{
-  var ids=[].slice.call(document.querySelectorAll('input:checked')).map(function(x){{return x.value}});
-  var base=location.origin+'/';
-  document.getElementById('url').innerHTML='地址：<a href="'+(ids.length?base+'?plugins='+encodeURIComponent(ids.join(',')):base)+'">'+(ids.length?base+'?plugins='+encodeURIComponent(ids.join(',')):base)+'</a>';
-}}
-document.getElementById('list').addEventListener('change',update); update();
-</script></body></html>"#
-    );
-    ([(header::CACHE_CONTROL, "no-store")], Html(page)).into_response()
+    *state.active.write().await = Some(ids.clone());
+    save_active(&Some(ids.clone()));
+    debug!(ids = ?ids, "active plugins updated");
+    ([(header::CACHE_CONTROL, "no-store")], StatusCode::OK)
 }
 
 fn html_escape(s: &str) -> String {
@@ -372,9 +416,10 @@ pub fn router(state: Shared) -> Router {
     Router::new()
         .route("/", get(get_ink))
         .route("/ink", get(get_ink))
-        .route("/manage", get(get_manage))
         .route("/api/frame", get(get_frame))
+        .route("/api/display", axum::routing::post(set_display))
         .route("/api/plugins", get(get_plugins))
+        .route("/api/plugins/active", get(get_active).post(set_active))
         .route("/api/health", get(get_health))
         .fallback(not_found)
         .with_state(state)
@@ -427,24 +472,36 @@ mod tests {
         // way as no query at all, so the page stays populated.
         let set = set_with(&["lyrics", "clock"], true);
         let expected = vec!["lyrics".to_string(), "clock".to_string()];
-        assert_eq!(resolve_ids(&set, &None), expected);
-        assert_eq!(resolve_ids(&set, &Some(String::new())), expected);
-        assert_eq!(resolve_ids(&set, &Some(",, ,".to_string())), expected);
+        assert_eq!(resolve_ids(&set, &None, &None), expected);
+        assert_eq!(resolve_ids(&set, &Some(String::new()), &None), expected);
+        assert_eq!(resolve_ids(&set, &Some(",, ,".to_string()), &None), expected);
     }
 
     #[test]
     fn duplicate_ids_are_deduplicated_in_order() {
         let set = set_with(&["lyrics", "clock"], false);
-        let got = resolve_ids(&set, &Some("clock,lyrics,clock".to_string()));
+        let got = resolve_ids(&set, &Some("clock,lyrics,clock".to_string()), &None);
         assert_eq!(got, vec!["clock", "lyrics"]);
     }
 
     #[test]
     fn unknown_ids_are_ignored_and_long_query_is_capped() {
         let set = set_with(&["lyrics"], true);
-        assert!(resolve_ids(&set, &Some("ghost".to_string())).is_empty());
+        assert!(resolve_ids(&set, &Some("ghost".to_string()), &None).is_empty());
         let long = "lyrics,".repeat(2000);
-        assert_eq!(resolve_ids(&set, &Some(long)), vec!["lyrics"]);
+        assert_eq!(resolve_ids(&set, &Some(long), &None), vec!["lyrics"]);
+    }
+
+    #[test]
+    fn active_selection_overrides_query() {
+        let set = set_with(&["lyrics", "clock"], true);
+        let active = Some(vec!["clock".to_string()]);
+        // 控制端只启用 clock，即便 URL 请求两个也应只渲染 clock
+        let got = resolve_ids(&set, &Some("lyrics,clock".to_string()), &active);
+        assert_eq!(got, vec!["clock"]);
+        // 控制端清空列表表示全部关闭
+        let got = resolve_ids(&set, &Some("lyrics".to_string()), &Some(vec![]));
+        assert!(got.is_empty());
     }
 
     #[test]

@@ -51,6 +51,30 @@
 
   #status { position: fixed; right: 8px; bottom: 6px; font-size: 10px;
             color: #c8c8c8; }
+
+  /* 黑白：把所有灰阶推到纯黑，去掉拼音行的浅色 */
+  body.mode-bw .line-muted, body.mode-bw .line-reading,
+  body.mode-bw .kv-k, body.mode-bw #status { color: #000000; }
+  body.mode-bw .plugin-section + .plugin-section { border-top-color: #000000; }
+
+  /* 纯文本：隐藏注音行和装饰性的衬线标题，正文放大 */
+  body.mode-text .line-reading { display: none; }
+  body.mode-text .block-text p {
+    font-family: inherit; letter-spacing: 0; font-size: 5vw; font-weight: 700;
+  }
+  body.mode-text .line-muted { color: #000000; }
+
+  /* 反色：黑底白字 */
+  body.invert { background: #000000; color: #ffffff; }
+  body.invert .line-primary, body.invert .line-normal,
+  body.invert .kv-v { color: #ffffff; }
+  body.invert .line-muted, body.invert .kv-k { color: #b0b0b0; }
+  body.invert .line-reading { color: #d0d0d0; }
+  body.invert .plugin-section + .plugin-section { border-top-color: #555555; }
+  body.invert #status { color: #555555; }
+  body.invert.mode-bw .line-muted, body.invert.mode-bw .line-reading,
+  body.invert.mode-bw .kv-k, body.invert.mode-bw #status { color: #ffffff; }
+  body.invert.mode-bw .plugin-section + .plugin-section { border-top-color: #ffffff; }
 </style>
 </head>
 <body>
@@ -67,6 +91,18 @@
   // devices with different plugin combinations. No storage, no cookies.
   var qs = new URLSearchParams(location.search);
   var selected = qs.get('plugins') || '';
+
+  var body = document.body;
+
+  // 按服务端下发的设置切换样式；参数缺省时退回灰度、不反色。
+  function applyDisplay(mode, invert) {
+    var m = (mode === 'bw' || mode === 'text') ? mode : 'gray';
+    body.classList.remove('mode-gray', 'mode-bw', 'mode-text', 'invert');
+    body.classList.add('mode-' + m);
+    if (invert) body.classList.add('invert');
+  }
+  // 首帧前先用地址里的值兜底，避免等待期间闪一下默认样式
+  applyDisplay(qs.get('mode'), qs.get('invert') === '1');
 
   var REQUEST_TIMEOUT_MS = 8000;
 
@@ -103,6 +139,8 @@
       .then(function (d) {
         if (timedOut) return;
         clearTimeout(watchdog);
+        // 显示设置由服务端下发，控制端改设置后下一次取帧即生效，无需改地址。
+        applyDisplay(d.mode, d.invert);
         // E-Ink: only touch the DOM when the content actually changed.
         if (d.signature && d.signature !== lastSig) {
           frameEl.innerHTML = d.html;
@@ -115,7 +153,10 @@
           lastSig = null;
         }
         setStatus(d.active && d.active.length ? d.active.join(' + ') : '无插件');
-        schedule(d.refresh_ms || 500);
+        // 轮询间隔与墨水屏重绘解耦：refresh_ms 是插件内容的变化节奏（时钟 15 秒），
+        // 但控制端改插件开关后设备要尽快感知，所以轮询固定走短间隔。
+        // 内容没变时签名相同，不会碰 DOM，因此不会增加墨水屏刷新次数。
+        schedule(300);
       })
       .catch(function () {
         if (timedOut) return;

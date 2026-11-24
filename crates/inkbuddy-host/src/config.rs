@@ -28,6 +28,10 @@ pub struct DisplayConfig {
     pub title: String,
     /// Fallback refresh interval when no plugin reports one.
     pub refresh_ms: u64,
+    /// E-Ink rendering mode: gray / bw / text. Pushed by the macOS control app.
+    pub mode: String,
+    /// Invert colors on the E-Ink page.
+    pub invert: bool,
 }
 
 impl Default for ServerConfig {
@@ -44,6 +48,8 @@ impl Default for DisplayConfig {
         Self {
             title: "InkBuddy".to_string(),
             refresh_ms: 500,
+            mode: "gray".to_string(),
+            invert: false,
         }
     }
 }
