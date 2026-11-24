@@ -2,7 +2,7 @@
 
 显示当前时间和日期的插件。它同时是最短的完整插件示例，演示如何用 `inkbuddy-protocol` 返回内容块。
 
-插件 id 为 `clock`，安装后的清单在 `plugins/clock/plugin.toml`。默认不随展示页开启，用 `?plugins=clock` 或 `/manage` 页面启用。
+插件 id 为 `clock`，安装后的清单在 `plugins/clock/plugin.toml`。默认不随展示页开启，用 `?plugins=clock` 参数、视图（在 macOS app 里把时钟加进视图）或 `default_on = true` 启用。
 
 ## 输出内容
 

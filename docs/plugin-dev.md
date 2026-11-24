@@ -167,7 +167,7 @@ http://<mac-ip>:9012/?plugins=lyrics
 http://<mac-ip>:9012/?plugins=lyrics,clock
 ```
 
-不带参数时使用所有 `default_on = true` 的插件。管理页 `http://127.0.0.1:9012/manage` 可以勾选并生成对应地址。选择放在 URL 里，浏览器无需保存状态，同一台主机可以给不同墨水屏设备配不同组合。
+不带参数时使用所有 `default_on = true` 的插件。显示内容优先跟随当前视图（见仓库 README「视图」）；没有选中视图时按 URL 参数组合。选择放在 URL 里，浏览器无需保存状态，同一台主机可以给不同墨水屏设备配不同组合。
 
 ## 最小可用插件（Python）
 
@@ -197,7 +197,7 @@ for line in sys.stdin:
     print(json.dumps({"id":rid,"ok":True,"result":result}), flush=True)
 ```
 
-存为可执行文件，`plugin.toml` 的 `command` 指向它。主程序每 2 秒重扫一次插件目录，保存后最多等 2 秒就会自动发现，在 `/manage` 里即可看到。
+存为可执行文件，`plugin.toml` 的 `command` 指向它。主程序会定期重扫插件目录，保存后很快就会自动发现，`GET /api/plugins` 或 macOS app 的设置窗口里即可看到。
 
 ## Rust 插件
 
