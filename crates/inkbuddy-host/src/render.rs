@@ -3,7 +3,9 @@
 //! The host owns rendering so every plugin gets the same typography, the same
 //! three-line focus view, and repaints only when the content changes.
 
+use crate::views::Region;
 use inkbuddy_protocol::{Block, Emphasis, Line, RenderResult};
+use serde::Serialize;
 use std::hash::{Hash, Hasher};
 use tracing::warn;
 
@@ -155,26 +157,295 @@ fn safe_class(rest: &str) -> Option<String> {
     }
 }
 
-/// A frame is the complete body HTML for all selected plugins, plus a stable
+/// 预览用的结构化文本行。菜单栏 app 不跑 WebKit，直接按 role 排版。
+#[derive(Debug, Clone, Serialize)]
+pub struct PreviewLine {
+    pub text: String,
+    pub role: String,
+}
+
+/// 预览用的一块内容：块内行紧挨着排，块与块之间有间距。
+/// 与墨水屏页面的 .block + .block margin-top 语义一致。
+#[derive(Debug, Clone, Serialize)]
+pub struct PreviewBlock {
+    pub lines: Vec<PreviewLine>,
+}
+
+/// 一个屏幕区域的结构化内容：几何信息 + 该插件摊平后的文本行。
+/// 控制端（菜单栏预览、编辑器画布）用它做原生渲染，与墨水屏同源。
+#[derive(Debug, Clone, Serialize)]
+pub struct FrameRegion {
+    pub plugin: String,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// 服务端算好的字号缩放系数，原生预览直接使用，与墨水屏保持一致。
+    pub scale: f32,
+    pub lines: Vec<PreviewLine>,
+}
+
+fn preview_role(e: Emphasis) -> &'static str {
+    match e {
+        Emphasis::Primary => "primary",
+        Emphasis::Normal => "normal",
+        Emphasis::Muted => "muted",
+        Emphasis::Reading => "reading",
+    }
+}
+
+/// 把插件的结构化内容按块分组，供控制端复刻页面排版（块间距、块内行距）。
+/// kv 行的 role 标为 "kv"（页面上 .kv 字号 4vw、行高 1.8，与普通行不同）。
+fn collect_preview_blocks(blocks: &mut Vec<PreviewBlock>, result: &RenderResult) {
+    for block in &result.blocks {
+        let mut lines = Vec::new();
+        match block {
+            Block::Lines { lines: ls } => {
+                for line in ls {
+                    lines.push(PreviewLine {
+                        text: line.text.clone(),
+                        role: preview_role(line.emphasis).to_string(),
+                    });
+                }
+            }
+            Block::KeyValue { items } => {
+                for kv in items {
+                    lines.push(PreviewLine {
+                        text: format!("{} {}", kv.key, kv.value),
+                        role: "kv".to_string(),
+                    });
+                }
+            }
+            Block::Text { text } => {
+                lines.push(PreviewLine {
+                    text: text.clone(),
+                    role: "text".to_string(),
+                });
+            }
+            Block::Html { .. } | Block::Unknown => {}
+        }
+        if !lines.is_empty() {
+            blocks.push(PreviewBlock { lines });
+        }
+    }
+}
+
+/// 把插件的结构化内容摊平成纯文本行，供控制端原生渲染预览。
+fn collect_preview_lines(lines: &mut Vec<PreviewLine>, result: &RenderResult) {
+    for block in &result.blocks {
+        match block {
+            Block::Lines { lines: ls } => {
+                for line in ls {
+                    lines.push(PreviewLine {
+                        text: line.text.clone(),
+                        role: preview_role(line.emphasis).to_string(),
+                    });
+                }
+            }
+            Block::KeyValue { items } => {
+                for kv in items {
+                    lines.push(PreviewLine {
+                        text: format!("{} {}", kv.key, kv.value),
+                        role: "normal".to_string(),
+                    });
+                }
+            }
+            Block::Text { text } => {
+                lines.push(PreviewLine {
+                    text: text.clone(),
+                    role: "text".to_string(),
+                });
+            }
+            Block::Html { .. } | Block::Unknown => {}
+        }
+    }
+}
+
+/// A frame is the complete body HTML for the selected plugins, plus a stable
 /// signature the browser uses to skip DOM writes when nothing changed.
+/// `layout` 存在时按区域绝对定位渲染；None 时竖排流式（无视图/URL 模式）。
 pub struct Frame {
     pub html: String,
     pub signature: String,
     pub refresh_ms: u64,
     pub active: Vec<String>,
+    /// 每个已渲染插件占用的屏幕区域及其文本行，供原生预览。
+    pub regions: Vec<FrameRegion>,
+    /// 是否按区域布局渲染（当前视图生效）。页面据此切换容器样式。
+    pub layout: bool,
 }
 
-pub fn render_frame(parts: &[(String, RenderResult)], fallback_ms: u64) -> Frame {
-    let mut html = String::new();
-    let mut refresh_ms = u64::MAX;
-    let mut active = Vec::new();
+/// 区域内容的缩放系数：宽度与高度两个约束取较小值。
+/// - 宽度：字号以 vw 定义，宽度占比直接决定文字相对区域的填充比例，
+///   全宽区域恒为 1（与旧竖排布局字号一致）。
+/// - 高度：内容装不下时自动缩小。`content_vh` 是内容按基准字号需要的
+///   高度（屏幕高度的百分比，已含宽高比换算），fit = 区域高度 / 内容高度，
+///   装得下时 fit ≥ 1 不起作用，装不下时把字号压到刚好放得下。
+fn region_scale(w: f32, h: f32, content_vh: f32) -> f32 {
+    let width_scale = (w / 100.0).clamp(0.1, 1.0);
+    let fit = if content_vh > 0.01 && h > 0.01 {
+        (h / content_vh).clamp(0.1, 1.0)
+    } else {
+        1.0
+    };
+    let s = width_scale.min(fit);
+    (s * 100.0).round() / 100.0
+}
 
-    if parts.is_empty() {
-        // 给浏览器一个非空正文：空页面会清成纯白，签名不变时无法自行恢复。
-        html.push_str(
-            "<section class=\"plugin-section\"><div class=\"block block-text\"><p>无可用插件</p></div></section>",
-        );
+/// 估算插件内容按基准字号渲染需要的高度，单位是「正方形屏幕下的 vh」
+/// （即 1vw 字体按 1vh 计）。真实屏幕的换算在调用处乘以宽高比。
+/// 数值与 ink.html 的 CSS 保持一致：行高约 1.4，primary 行有上下边距，
+/// muted 行有最小高度，块与块之间有间距。
+fn content_height_units(result: &RenderResult, text_mode: bool) -> f32 {
+    let mut total = 0.0;
+    for (block_index, block) in result.blocks.iter().enumerate() {
+        if block_index > 0 {
+            total += 2.0; // .block + .block 的 margin-top: 2vh
+        }
+        match block {
+            Block::Lines { lines } => {
+                for line in lines {
+                    total += match line.emphasis {
+                        Emphasis::Primary => 6.2 * 1.4 + 5.0, // 字号×行高 + 上下 margin 2.5vh×2
+                        Emphasis::Normal => 5.0 * 1.4,
+                        Emphasis::Muted => 7.0, // min-height: 7vw
+                        // 4.6×行高 1.25 + margin(-2.4+1.8)vh
+                        Emphasis::Reading => 4.6 * 1.25 - 0.6,
+                    };
+                }
+            }
+            Block::KeyValue { items } => {
+                total += 4.0 * 1.8 * items.len() as f32; // .kv line-height: 1.8
+            }
+            Block::Text { .. } => {
+                let title = if text_mode { 5.0 } else { 3.8 };
+                total += title * 1.6;
+            }
+            Block::Html { .. } | Block::Unknown => {}
+        }
     }
+    total
+}
+
+/// /api/preview 用：单个插件当前内容的预览文本行与估算内容高度。
+pub struct PluginPreview {
+    pub lines: Vec<PreviewLine>,
+    /// 按块分组的内容，控制端用它复刻墨水屏的块间距与行距。
+    pub blocks: Vec<PreviewBlock>,
+    /// 内容按基准字号需要的高度（正方形屏幕下的 vh），控制端用它算 fit。
+    pub content_units: f32,
+}
+
+pub fn preview_content(result: &RenderResult, text_mode: bool) -> PluginPreview {
+    let mut lines = Vec::new();
+    collect_preview_lines(&mut lines, result);
+    let mut blocks = Vec::new();
+    collect_preview_blocks(&mut blocks, result);
+    PluginPreview {
+        lines,
+        blocks,
+        content_units: content_height_units(result, text_mode),
+    }
+}
+
+/// 字号覆盖的 CSS 选择器里直接拼接插件 id，只接受受限字符集；
+/// 含其它字符（引号、反斜杠、花括号等）的 id 跳过覆盖，避免破坏样式表。
+fn css_safe_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// 单个区域的字号覆盖规则：基准尺寸 × 缩放系数，算成具体数值输出。
+/// 这是接入规范的一部分：插件只要用标准块/行类型输出内容，
+/// 缩放就自动生效，插件自身不需要处理尺寸。scale=1 的区域不输出。
+/// text_mode（纯文本显示模式）下标题块用更大的基准字号，与页面 CSS 一致。
+fn section_overrides(plugin: &str, scale: f32, text_mode: bool) -> String {
+    if scale >= 0.995 {
+        return String::new();
+    }
+    let m = |v: f32| fmt_pct(v * scale);
+    let sel = format!(".frame-canvas section[data-plugin=\"{}\"]", esc(plugin));
+    let mut css = String::new();
+    css.push_str(&format!(
+        "{sel} .line-primary {{ font-size: {}vw; margin: {}vh 0; }}",
+        m(6.2),
+        m(2.5)
+    ));
+    css.push_str(&format!("{sel} .line-normal {{ font-size: {}vw; }}", m(5.0)));
+    css.push_str(&format!(
+        "{sel} .line-muted {{ font-size: {}vw; min-height: {}vw; }}",
+        m(5.0),
+        m(7.0)
+    ));
+    css.push_str(&format!(
+        "{sel} .line-reading {{ font-size: {}vw; margin: {}vh 0 {}vh; }}",
+        m(4.6),
+        m(-2.4),
+        m(1.8)
+    ));
+    css.push_str(&format!("{sel} .kv {{ font-size: {}vw; }}", m(4.0)));
+    css.push_str(&format!(
+        "{sel} .block + .block {{ margin-top: {}vh; }}",
+        m(2.0)
+    ));
+    let title = if text_mode { 5.0 } else { 3.8 };
+    css.push_str(&format!(
+        "{sel} .block-text p {{ font-size: {}vw; }}",
+        m(title)
+    ));
+    css
+}
+
+fn html_for_regions(
+    parts: &[(String, RenderResult)],
+    layout: &[Region],
+    text_mode: bool,
+    aspect: f32,
+) -> String {
+    // 有内容的区域才生成字号覆盖；scale=1 的区域不产生规则。
+    let mut rules = String::new();
+    for region in layout {
+        if let Some((_, result)) = parts.iter().find(|(id, _)| id == &region.plugin) {
+            // 字体是 vw，区域高度是屏幕高度的百分比：乘以宽高比才能比。
+            let units = content_height_units(result, text_mode);
+            let scale = region_scale(region.w, region.h, units * aspect);
+            if css_safe_id(&region.plugin) {
+                rules.push_str(&section_overrides(&region.plugin, scale, text_mode));
+            } else {
+                warn!(plugin = %region.plugin, "plugin id has characters unsafe for CSS selectors; skipping font-size overrides");
+            }
+        }
+    }
+    let mut html = String::new();
+    if !rules.is_empty() {
+        html.push_str(&format!("<style>{rules}</style>"));
+    }
+    html.push_str("<div class=\"frame-canvas\">");
+    for region in layout {
+        let Some((_, result)) = parts.iter().find(|(id, _)| id == &region.plugin) else {
+            continue;
+        };
+        let inner: String = result.blocks.iter().map(render_block).collect();
+        html.push_str(&format!(
+            "<section class=\"plugin-section\" data-plugin=\"{}\" style=\"left:{}%;top:{}%;width:{}%;height:{}%;\">",
+            esc(&region.plugin),
+            fmt_pct(region.x),
+            fmt_pct(region.y),
+            fmt_pct(region.w),
+            fmt_pct(region.h)
+        ));
+        html.push_str(&inner);
+        html.push_str("</section>");
+    }
+    html.push_str("</div>");
+    html
+}
+
+/// 流式竖排：无布局时的回退排版。
+fn html_stacked(parts: &[(String, RenderResult)]) -> String {
+    let mut html = String::new();
     for (id, result) in parts {
         html.push_str(&format!(
             "<section class=\"plugin-section\" data-plugin=\"{}\">",
@@ -184,7 +455,97 @@ pub fn render_frame(parts: &[(String, RenderResult)], fallback_ms: u64) -> Frame
             html.push_str(&render_block(block));
         }
         html.push_str("</section>");
+    }
+    html
+}
 
+/// 去掉浮点尾零：12.0 → "12"，12.5 → "12.5"。
+fn fmt_pct(v: f32) -> String {
+    let v = (v * 100.0).round() / 100.0;
+    if v.fract() == 0.0 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v}")
+    }
+}
+
+/// 把每个插件的内容与它的屏幕区域配对。layout 为 None 时生成竖排等分。
+fn frame_regions(
+    parts: &[(String, RenderResult)],
+    layout: Option<&[Region]>,
+    text_mode: bool,
+    aspect: f32,
+) -> Vec<FrameRegion> {
+    let scale_of = |r: &Region, result: &RenderResult| {
+        let units = content_height_units(result, text_mode);
+        region_scale(r.w, r.h, units * aspect)
+    };
+    match layout {
+        Some(regions) => regions
+            .iter()
+            .filter_map(|r| {
+                let (_, result) = parts.iter().find(|(id, _)| id == &r.plugin)?;
+                let scale = scale_of(r, result);
+                let mut lines = Vec::new();
+                collect_preview_lines(&mut lines, result);
+                Some(FrameRegion {
+                    plugin: r.plugin.clone(),
+                    x: r.x,
+                    y: r.y,
+                    w: r.w,
+                    h: r.h,
+                    scale,
+                    lines,
+                })
+            })
+            .collect(),
+        None => parts
+            .iter()
+            .enumerate()
+            .map(|(i, (id, result))| {
+                let mut lines = Vec::new();
+                collect_preview_lines(&mut lines, result);
+                let r = Region::stacked(id, i, parts.len());
+                FrameRegion {
+                    plugin: id.clone(),
+                    x: r.x,
+                    y: r.y,
+                    w: r.w,
+                    h: r.h,
+                    // 流式布局无字号覆盖，原生预览按全尺寸渲染。
+                    scale: 1.0,
+                    lines,
+                }
+            })
+            .collect(),
+    }
+}
+
+/// `text_mode` 对应显示设置的纯文本模式：区域布局下标题块用更大的基准字号。
+/// `aspect` 是墨水屏的宽高比（宽/高），由页面轮询时上报；未知按 1（正方形）。
+pub fn render_frame_with_mode(
+    parts: &[(String, RenderResult)],
+    fallback_ms: u64,
+    layout: Option<&[Region]>,
+    text_mode: bool,
+    aspect: f32,
+) -> Frame {
+    let mut refresh_ms = u64::MAX;
+    let mut active = Vec::new();
+
+    let html = if parts.is_empty() {
+        // 空视图/无已安装扩展时的占位。标记必须与 web/ink.html 页面脚本里的
+        // placeholder 完全一致：两边不一致时，浏览器会每 300ms 在两个 DOM
+        // 之间来回改写，墨水屏整屏重绘、看起来在闪。
+        "<div class=\"block block-text\"><p>无可用扩展</p></div>".to_string()
+    } else {
+        match layout {
+            Some(regions) => html_for_regions(parts, regions, text_mode, aspect),
+            None => html_stacked(parts),
+        }
+    };
+
+    for (id, result) in parts {
         active.push(id.clone());
         if let Some(ms) = result.refresh_ms {
             if ms == 0 || ms > 30_000 {
@@ -193,6 +554,8 @@ pub fn render_frame(parts: &[(String, RenderResult)], fallback_ms: u64) -> Frame
             refresh_ms = refresh_ms.min(ms);
         }
     }
+
+    let regions = frame_regions(parts, layout, text_mode, aspect);
 
     if refresh_ms == u64::MAX {
         refresh_ms = fallback_ms;
@@ -211,12 +574,23 @@ pub fn render_frame(parts: &[(String, RenderResult)], fallback_ms: u64) -> Frame
         signature,
         refresh_ms,
         active,
+        regions,
+        layout: layout.is_some(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试便捷封装：默认灰度模式、正方形屏幕。
+    fn render_frame(
+        parts: &[(String, RenderResult)],
+        fallback_ms: u64,
+        layout: Option<&[Region]>,
+    ) -> Frame {
+        render_frame_with_mode(parts, fallback_ms, layout, false, 1.0)
+    }
 
     fn text_block(text: &str) -> RenderResult {
         RenderResult {
@@ -228,10 +602,105 @@ mod tests {
     }
 
     #[test]
+    fn region_scale_tracks_width_and_height_fit() {
+        // 宽度约束不变：全宽恒为 1，半宽 0.5，极窄夹到 0.1。
+        assert_eq!(region_scale(100.0, 50.0, 10.0), 1.0);
+        assert_eq!(region_scale(50.0, 50.0, 10.0), 0.5);
+        assert_eq!(region_scale(2.0, 50.0, 10.0), 0.1);
+        // 高度装不下时缩小：时钟型内容约 20.7 vh，压到 13.8 高后约 0.67。
+        let clock_units = 6.2 * 1.4 + 5.0 + 7.0;
+        assert_eq!(region_scale(100.0, 13.8, clock_units), 0.67);
+        // 装得下时高度不起作用。
+        assert_eq!(region_scale(100.0, 86.2, clock_units), 1.0);
+        // 极矮区域夹到下限附近（3 / 20.68 ≈ 0.145）。
+        assert_eq!(region_scale(100.0, 3.0, clock_units), 0.15);
+    }
+
+    #[test]
+    fn content_height_units_matches_css_numbers() {
+        // 单行 primary：6.2×1.4 + 上下边距 5.0。
+        let result = RenderResult {
+            blocks: vec![Block::Lines {
+                lines: vec![Line {
+                    text: "12:00".into(),
+                    emphasis: Emphasis::Primary,
+                }],
+            }],
+            refresh_ms: Some(500),
+        };
+        assert_eq!(content_height_units(&result, false), 6.2 * 1.4 + 5.0);
+    }
+
+    #[test]
+    fn content_height_units_kv_and_reading_match_css() {
+        // kv 行：.kv 字号 4vw、行高 1.8。
+        let kv = RenderResult {
+            blocks: vec![Block::KeyValue {
+                items: vec![inkbuddy_protocol::KeyValue {
+                    key: "日期".into(),
+                    value: "11月25日".into(),
+                }],
+            }],
+            refresh_ms: Some(500),
+        };
+        assert_eq!(content_height_units(&kv, false), 4.0 * 1.8);
+        // reading 行：字号 4.6vw、行高 1.25、margin -2.4vh 0 1.8vh。
+        let reading = RenderResult {
+            blocks: vec![Block::Lines {
+                lines: vec![Line {
+                    text: "goeng3 si4".into(),
+                    emphasis: Emphasis::Reading,
+                }],
+            }],
+            refresh_ms: Some(500),
+        };
+        assert_eq!(content_height_units(&reading, false), 4.6 * 1.25 - 0.6);
+    }
+
+    #[test]
+    fn fullscreen_region_needs_no_override() {
+        let parts = vec![("clock".into(), text_block("时间"))];
+        let layout = vec![Region { plugin: "clock".into(), x: 0.0, y: 0.0, w: 100.0, h: 100.0 }];
+        let frame = render_frame(&parts, 500, Some(&layout));
+        // scale=1 的区域直接用页面基准样式，不输出覆盖规则
+        assert!(!frame.html.contains("<style>"));
+        assert!(!frame.html.contains("font-size:"));
+    }
+
+    #[test]
+    fn text_mode_uses_larger_title_baseline() {
+        let parts = vec![("clock".into(), text_block("时间"))];
+        let layout = vec![Region { plugin: "clock".into(), x: 0.0, y: 0.0, w: 50.0, h: 50.0 }];
+        let normal = render_frame(&parts, 500, Some(&layout));
+        let text = render_frame_with_mode(&parts, 500, Some(&layout), true, 1.0);
+        // 3.8vw × 0.5 = 1.9vw（常规）；5vw × 0.5 = 2.5vw（纯文本模式）
+        assert!(normal.html.contains(".block-text p { font-size: 1.9vw;"));
+        assert!(text.html.contains(".block-text p { font-size: 2.5vw;"));
+    }
+
+    #[test]
+    fn empty_parts_render_a_stable_placeholder() {
+        // 空视图（regions 为空或引用的扩展都未安装）必须返回签名恒定的
+        // 占位 HTML；签名一变，页面脚本就会整屏重写，墨水屏闪烁。
+        let a = render_frame(&[], 500, None);
+        let b = render_frame(&[], 500, Some(&[]));
+        assert_eq!(a.signature, b.signature);
+        assert_eq!(a.signature, render_frame(&[], 500, None).signature);
+        assert!(a.html.contains("无可用扩展"));
+        assert!(a.active.is_empty());
+        // 与 web/ink.html 页面脚本里的 placeholder 保持同一份标记，
+        // 防止两边不一致导致浏览器每轮询一次就改写一次 DOM。
+        assert_eq!(
+            a.html,
+            "<div class=\"block block-text\"><p>无可用扩展</p></div>"
+        );
+    }
+
+    #[test]
     fn signature_tracks_the_rendered_markup() {
-        let a = render_frame(&[("demo".into(), text_block("第一句"))], 500);
-        let b = render_frame(&[("demo".into(), text_block("第一句"))], 500);
-        let c = render_frame(&[("demo".into(), text_block("第二句"))], 500);
+        let a = render_frame(&[("demo".into(), text_block("第一句"))], 500, None);
+        let b = render_frame(&[("demo".into(), text_block("第一句"))], 500, None);
+        let c = render_frame(&[("demo".into(), text_block("第二句"))], 500, None);
         assert_eq!(a.signature, b.signature);
         assert_ne!(a.signature, c.signature);
         assert_ne!(a.html, c.html);
@@ -241,8 +710,8 @@ mod tests {
     fn signature_is_independent_of_text_containing_separators() {
         // The old `id:json|` concatenation could be forged by text containing
         // `|` or `:`. Hashing the markup makes the two frames distinct.
-        let a = render_frame(&[("demo".into(), text_block("a|b:c"))], 500);
-        let b = render_frame(&[("demo".into(), text_block("a|b:c|"))], 500);
+        let a = render_frame(&[("demo".into(), text_block("a|b:c"))], 500, None);
+        let b = render_frame(&[("demo".into(), text_block("a|b:c|"))], 500, None);
         assert_ne!(a.signature, b.signature);
     }
 
@@ -272,35 +741,85 @@ mod tests {
     #[test]
     fn unknown_block_contributes_no_markup() {
         let frame = render_frame(
-            &[(
-                "demo".into(),
-                RenderResult {
-                    blocks: vec![Block::Unknown],
-                    refresh_ms: None,
-                },
-            )],
+            &[
+                (
+                    "demo".into(),
+                    RenderResult {
+                        blocks: vec![Block::Unknown],
+                        refresh_ms: None,
+                    },
+                ),
+            ],
             500,
+            None,
         );
         assert!(!frame.html.contains("block-unknown"));
         assert_eq!(frame.refresh_ms, 500);
     }
 
     #[test]
+    fn layout_render_positions_sections_absolutely() {
+        let parts = vec![("lyrics".into(), text_block("歌词")), ("clock".into(), text_block("时间"))];
+        let layout = vec![
+            Region { plugin: "lyrics".into(), x: 0.0, y: 0.0, w: 60.0, h: 100.0 },
+            Region { plugin: "clock".into(), x: 60.0, y: 0.0, w: 40.0, h: 100.0 },
+        ];
+        let frame = render_frame(&parts, 500, Some(&layout));
+        assert!(frame.html.contains("frame-canvas"));
+        assert!(frame.html.contains("left:0%;top:0%;width:60%;height:100%"));
+        assert!(frame.html.contains("left:60%;top:0%;width:40%;height:100%"));
+        // 字号覆盖由服务端算好直接输出（60x100 → 0.6，40x100 → 0.4）：
+        // 6.2vw × 0.6 = 3.72vw，6.2vw × 0.4 = 2.48vw。不依赖 CSS 变量。
+        assert!(frame.html.contains(
+            ".frame-canvas section[data-plugin=\"lyrics\"] .line-primary { font-size: 3.72vw;"
+        ));
+        assert!(frame.html.contains(
+            ".frame-canvas section[data-plugin=\"clock\"] .line-primary { font-size: 2.48vw;"
+        ));
+        assert!(!frame.html.contains("--ink-scale"));
+        assert_eq!(frame.regions.len(), 2);
+        assert_eq!(frame.regions[0].plugin, "lyrics");
+        assert_eq!(frame.regions[0].lines.len(), 1);
+        // 布局里没引用的插件不出现在 regions
+        let partial = render_frame(&parts, 500, Some(&layout[..1]));
+        assert_eq!(partial.regions.len(), 1);
+        assert!(!partial.html.contains("data-plugin=\"clock\""));
+    }
+
+    #[test]
+    fn stacked_mode_emits_even_regions() {
+        let parts = vec![
+            ("lyrics".into(), text_block("歌词")),
+            ("clock".into(), text_block("时间")),
+        ];
+        let frame = render_frame(&parts, 500, None);
+        assert_eq!(frame.regions.len(), 2);
+        assert_eq!(frame.regions[0].y, 0.0);
+        assert_eq!(frame.regions[0].h, 50.0);
+        assert_eq!(frame.regions[1].y, 50.0);
+        // 流式 html 不含绝对定位容器
+        assert!(!frame.html.contains("frame-canvas"));
+    }
+
+    #[test]
     fn reading_line_renders_as_plain_text() {
         let frame = render_frame(
-            &[(
-                "lyrics".into(),
-                RenderResult {
-                    blocks: vec![Block::Lines {
-                        lines: vec![
-                            Line::new("我会与你", Emphasis::Primary),
-                            Line::new("o wui jyu nei", Emphasis::Reading),
-                        ],
-                    }],
-                    refresh_ms: Some(500),
-                },
-            )],
+            &[
+                (
+                    "lyrics".into(),
+                    RenderResult {
+                        blocks: vec![Block::Lines {
+                            lines: vec![
+                                Line::new("我会与你", Emphasis::Primary),
+                                Line::new("o wui jyu nei", Emphasis::Reading),
+                            ],
+                        }],
+                        refresh_ms: Some(500),
+                    },
+                ),
+            ],
             500,
+            None,
         );
         assert!(frame.html.contains("line-primary\">我会与你</div>"));
         assert!(frame.html.contains("line-reading\">o wui jyu nei</div>"));

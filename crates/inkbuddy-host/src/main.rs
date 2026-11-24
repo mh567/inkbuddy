@@ -2,6 +2,7 @@ mod config;
 mod plugin;
 mod render;
 mod server;
+mod views;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -111,11 +112,14 @@ async fn main() -> Result<()> {
     let state = std::sync::Arc::new(AppState {
         config: cfg,
         display: tokio::sync::RwLock::new(initial_display),
-        active: tokio::sync::RwLock::new(server::load_active()),
+        uninstalled: tokio::sync::RwLock::new(server::load_uninstalled()),
+        views: tokio::sync::RwLock::new(views::load_or_seed(&plugins)),
         plugins: tokio::sync::RwLock::new(plugins),
         plugin_dirs: dirs,
         last_scan: tokio::sync::Mutex::new(std::time::Instant::now()),
         render_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        device_aspect: std::sync::atomic::AtomicU32::new(0),
+        device_aspect_at: std::sync::atomic::AtomicU64::new(0),
     });
     let app = server::router(state.clone());
 
@@ -146,7 +150,6 @@ async fn main() -> Result<()> {
             ip
         );
     }
-    info!("  Manage     : http://127.0.0.1:{port}/manage");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(state))

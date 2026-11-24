@@ -22,6 +22,19 @@
     border-top: 1px solid #d0d0d0;
     padding-top: 4vh;
   }
+  /* 区域布局模式（当前视图生效时）：frame-canvas 铺满屏幕，
+     每个扩展按视图里保存的百分比区域绝对定位。body.layout-region 由
+     页面脚本根据 frame 响应的 layout 字段切换，容器去掉留白。 */
+  body.layout-region #wrap { padding: 0; }
+  .frame-canvas { position: relative; width: 100vw; height: 100vh; }
+  .frame-canvas .plugin-section {
+    position: absolute; overflow: hidden;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center; text-align: center;
+  }
+  .frame-canvas .plugin-section + .plugin-section {
+    margin: 0; border-top: 0; padding-top: 0;
+  }
   .block { width: 100%; }
   .block + .block { margin-top: 2vh; }
 
@@ -87,6 +100,10 @@
   var lastSig = null;
   var timer = null;
 
+  // 页面版本号由服务端注入（页面内容哈希）。frame 响应里的版本与本地
+  // 不一致说明 host 升级换了页面，自动刷新一次拿新页面，无需人工干预。
+  var PAGE_VERSION = '__PAGE_VERSION__';
+
   // Selection lives in the URL so the same host can serve different E-Ink
   // devices with different plugin combinations. No storage, no cookies.
   var qs = new URLSearchParams(location.search);
@@ -118,6 +135,12 @@
 
   function poll() {
     var url = '/api/frame' + (selected ? '?plugins=' + encodeURIComponent(selected) : '');
+    // 上报视口尺寸：服务端把字号(vw)换算到区域高度(vh)时需要宽高比，
+    // 拿不到就按正方形屏幕估算。
+    var vw = window.innerWidth, vh = window.innerHeight;
+    if (vw && vh) {
+      url += (url.indexOf('?') >= 0 ? '&' : '?') + 'vw=' + vw + '&vh=' + vh;
+    }
     // A half-open connection can leave fetch pending forever. AbortSignal is
     // not available on every embedded browser, so use AbortController.
     var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
@@ -139,16 +162,28 @@
       .then(function (d) {
         if (timedOut) return;
         clearTimeout(watchdog);
+        // 页面版本不一致：host 已更新，重载自己拿新页面（一次性）。
+        if (d.page_version && PAGE_VERSION.indexOf('__') !== 0 && d.page_version !== PAGE_VERSION) {
+          location.reload();
+          return;
+        }
         // 显示设置由服务端下发，控制端改设置后下一次取帧即生效，无需改地址。
         applyDisplay(d.mode, d.invert);
+        // 区域布局模式切换容器样式；只在变化时写 DOM，避免无谓重绘。
+        if (body.classList.contains('layout-region') !== !!d.layout) {
+          body.classList.toggle('layout-region', !!d.layout);
+        }
         // E-Ink: only touch the DOM when the content actually changed.
+        // 签名存在时以签名为准：签名相同绝不碰 DOM。这里不能因为 active
+        // 为空就重写占位——空视图时服务端一直返回同一个签名，若再覆盖
+        // DOM 并重置 lastSig，两个占位会每 300ms 互刷一次，墨水屏整屏闪。
         if (d.signature && d.signature !== lastSig) {
           frameEl.innerHTML = d.html;
           lastSig = d.signature;
-        } else if (!d.signature || !d.active || !d.active.length) {
-          // Never clear to a blank white page; keep a visible placeholder
-          // and stay on the retry loop so a recovering plugin is picked up.
-          var placeholder = '<div class="block block-text"><p>无可用插件</p></div>';
+        } else if (!d.signature) {
+          // 服务端没给签名时的兜底：显示占位并留在轮询循环里，
+          // 插件恢复后由签名分支接管。
+          var placeholder = '<div class="block block-text"><p>无可用扩展</p></div>';
           if (frameEl.innerHTML !== placeholder) frameEl.innerHTML = placeholder;
           lastSig = null;
         }

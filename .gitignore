@@ -15,3 +15,6 @@
 .vscode/
 *.swp
 ._*
+
+# WorkBuddy 工作区本地数据（工作日志等，不属于项目源码）
+.workbuddy/

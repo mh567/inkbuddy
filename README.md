@@ -58,9 +58,9 @@ http://<ip>:9012/?plugins=clock             # 只显示时钟
 http://<ip>:9012/?plugins=lyrics,clock      # 组合，歌词在上、时钟在下
 ```
 
-不带参数时显示所有 `default_on = true` 的插件（默认只有歌词）。选择放在 URL 里，浏览器无需保存状态。
+不带参数时显示所有 `default_on = true` 的插件（默认只有歌词）。显示内容优先跟随当前视图（见下文「视图」）；没有选中视图时退到 URL 参数，再退到 `default_on`。选择放在 URL 里，浏览器无需保存状态。
 
-插件目录在运行时会被重新扫描，新放进目录的插件不用重启主程序就能生效。
+扩展目录在运行时会被重新扫描，新放进目录的扩展不用重启主程序就能生效。
 
 ## 配置
 
@@ -76,18 +76,45 @@ title = "InkBuddy"
 refresh_ms = 500
 ```
 
-插件放在 `~/.inkbuddy/plugins/<目录>/plugin.toml`，启动时自动扫描。也可以：
+扩展放在 `~/.inkbuddy/plugins/<目录>/plugin.toml`，启动时自动扫描。也可以：
 
 ```bash
 inkbuddy --plugins-dir ./my-plugins --port 8080
 inkbuddy --list-plugins
 ```
 
-`INKBUDDY_HOME` 可改掉整个运行时目录（配置、插件、歌词缓存都跟着走）。
+`INKBUDDY_HOME` 可改掉整个运行时目录（配置、扩展、歌词缓存都跟着走）。
+
+### 视图
+
+视图是一份具名的**区域布局**，保存在 `INKBUDDY_HOME/views.json`。每个视图由若干区域组成，每个区域把一个扩展放到屏幕的一个矩形里：
+
+```json
+{"id": "split", "name": "左右分屏",
+ "regions": [
+   {"plugin": "lyrics", "x": 0,   "y": 0,   "w": 60,  "h": 100},
+   {"plugin": "clock",  "x": 60,  "y": 0,   "w": 40,  "h": 100}
+ ]}
+```
+
+- 坐标全部是屏幕**百分比**（0–100，浮点）：任意位置、任意大小、任意分辨率自适应。
+- 显示始终跟随当前视图的布局；没有选中视图时墨水屏按流式竖排渲染（URL 参数 / `default_on`）。
+- 旧格式（`plugins` 列表）加载时自动迁移为竖排等分区域。
+- 接口：`GET/POST /api/views`（读写整个列表）、`POST /api/views/current`（应用视图，`id` 传 `null` 只清指针）。
+- `/api/frame` 同时返回结构化区域数据（每区域的几何与文本行），墨水屏页面与控制端的预览、编辑器画布共用同一份渲染结果。
+
+macOS 菜单栏 app：下拉菜单顶部是墨水屏内容的原生预览（不跑 WebKit），左右箭头在已保存视图间循环应用；视图的创建与编辑在独立的编辑窗口完成——左侧从已安装扩展添加区域，画布上拖拽移动、右下角缩放，右侧可输入精确的百分比数值。
+
+### 扩展安装与卸载
+
+- 扩展目录里被扫描到的扩展就是「已安装」。
+- 「卸载」只是本地标记（`INKBUDDY_HOME/uninstalled.json`）：渲染时跳过、视图里引用它的区域不显示、子进程停掉；扩展文件仍保留在磁盘上。
+- 「安装」即移除卸载标记，下次渲染恢复。
+- 接口：`POST /api/plugins/<id>/installed`，body `{"installed": true|false}`。
 
 ### macOS app
 
-`./scripts/build-app.sh` 会生成 `dist/InkBuddy.app`。它是后台运行、没有 Dock 图标的 app 包，双击即启动服务；墨水屏仍然只需打开浏览器地址。插件选择通过 `/manage` 页面完成。
+`./scripts/build-macos-app.sh` 会生成 `build-app/InkBuddy.app`。菜单栏 app 内嵌 Rust host，启动即服务；墨水屏仍然只需打开浏览器地址。
 
 从 Finder 双击启动时，进程拿到的 `PATH` 通常不含 Homebrew 的 `/opt/homebrew/bin`，app 包在 `Info.plist` 里通过 `LSEnvironment` 显式补上。各插件的运行依赖见各自的说明文件。
 
