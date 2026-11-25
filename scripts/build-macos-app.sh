@@ -33,6 +33,11 @@ cat > "$APP/Contents/Info.plist" <<EOF
 	<key>CFBundleShortVersionString</key><string>$VERSION</string>
 	<key>LSMinimumSystemVersion</key><string>13.0</string>
 	<key>LSUIElement</key><false/>
+	<key>LSEnvironment</key>
+	<dict>
+		<key>INKBUDDY_LATENCY_MS</key><string>300</string>
+		<key>INKBUDDY_LATENCY_OTHER_MS</key><string>300</string>
+	</dict>
 </dict>
 </plist>
 EOF
