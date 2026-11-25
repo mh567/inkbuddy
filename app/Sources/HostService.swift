@@ -193,11 +193,24 @@ final class HostService: ObservableObject {
             let src = bundlePlugins.appendingPathComponent(name, isDirectory: true)
             let dst = plugins.appendingPathComponent(name, isDirectory: true)
             try? fileManager.createDirectory(at: dst, withIntermediateDirectories: true)
-            if let files = try? fileManager.contentsOfDirectory(at: src, includingPropertiesForKeys: nil) {
-                for file in files {
-                    let target = dst.appendingPathComponent(file.lastPathComponent)
-                    try? fileManager.removeItem(at: target)
-                    try? fileManager.copyItem(at: file, to: target)
+            guard let files = try? fileManager.contentsOfDirectory(at: src, includingPropertiesForKeys: nil) else {
+                NSLog("InkBuddy: 读取 bundle 插件目录失败 \(src.path)")
+                continue
+            }
+            for file in files {
+                let target = dst.appendingPathComponent(file.lastPathComponent)
+                try? fileManager.removeItem(at: target)
+                do {
+                    try fileManager.copyItem(at: file, to: target)
+                } catch {
+                    NSLog("InkBuddy: 复制插件文件失败 \(file.lastPathComponent): \(error.localizedDescription)")
+                }
+            }
+            if name == "lyrics" {
+                for helper in ["MediaRemoteMini.dylib", "mediaremote-mini.pl"] {
+                    if !fileManager.fileExists(atPath: dst.appendingPathComponent(helper).path) {
+                        NSLog("InkBuddy: 歌词插件缺少 \(helper)")
+                    }
                 }
             }
         }

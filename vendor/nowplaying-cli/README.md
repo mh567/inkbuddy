@@ -74,3 +74,19 @@ sudo make install
 ## Acknowledgments
 
 Thank you [@ungive](https://github.com/ungive) for their [mediaremote-adapter](https://github.com/ungive/mediaremote-adapter) project, which restores support for macOS 15, 26. The files under `src/mediaremote-mini/` are derived from that project and are licensed under the BSD 3-Clause License.
+
+---
+
+## InkBuddy 随附说明
+
+InkBuddy 的 macOS app 随包分发本项目的两个文件，供歌词插件读取 Now Playing 信息：
+
+| 文件 | SHA-256 |
+| --- | --- |
+| `MediaRemoteMini.dylib` | `5c0ca30f89af625f13c0315723be9535831197e4f74e7ab39889446def748ea2` |
+| `mediaremote-mini.pl` | `0a3276dcbf2bddbbca669be0ef00d0dc8365aca745abc273f2bea63f5af03843` |
+
+- 组件版本：nowplaying-cli 2.1.0（Homebrew `homebrew/core` stable）。两个文件与该版本安装包中的原文件一致。
+- 上游源码：https://github.com/kirtan-shah/nowplaying-cli 。`src/mediaremote-mini/` 下的实现源自 https://github.com/ungive/mediaremote-adapter 。对应源码可从上游仓库按该版本取得。
+- 许可证：GNU GPL-3.0，全文见同目录 `LICENSE`；其中 `src/mediaremote-mini/` 派生部分按 BSD 3-Clause，许可文本附在 `LICENSE` 末尾。
+- app 包内的位置：两个文件在 `Contents/Resources/plugins/lyrics/`，许可证与本文档在 `Contents/Resources/licenses/nowplaying-cli/`。仓库副本在 `vendor/nowplaying-cli/`。

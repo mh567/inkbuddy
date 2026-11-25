@@ -2,7 +2,7 @@
 id = "lyrics"
 name = "歌词"
 version = "0.1.0"
-description = "正在播放的同步歌词，粤语歌带逐字粤拼"
+description = "正在播放的同步歌词"
 # Resolved relative to this manifest's directory. Overwritten by
 # scripts/install.sh with the absolute path of the installed binary.
 command = "../../target/release/inkbuddy-plugin-lyrics"

@@ -115,6 +115,27 @@ fn parse_helper_env(text: &str) -> Option<HelperEnv> {
     })
 }
 
+/// helper 一次读取的结果。`adapter_get_env` 在当前没有播放信息时输出 `null`。
+enum HelperRead {
+    Data(HelperEnv),
+    Idle,
+    Unavailable,
+}
+
+fn parse_helper_read(text: &str) -> HelperRead {
+    let text = text.trim();
+    if text.is_empty() {
+        return HelperRead::Unavailable;
+    }
+    if text == "null" {
+        return HelperRead::Idle;
+    }
+    match parse_helper_env(text) {
+        Some(env) => HelperRead::Data(env),
+        None => HelperRead::Unavailable,
+    }
+}
+
 /// Accept bool / number / string forms of the flag.
 fn parse_playing(v: &serde_json::Value) -> Option<bool> {
     match v {
@@ -190,7 +211,7 @@ impl CliBackend {
             }
             None => {
                 let sticky = self.last_playing.load(Ordering::Relaxed);
-                warn!(
+                debug!(
                     playing = sticky,
                     "helper gave no playing state, keeping last known value"
                 );
@@ -200,53 +221,62 @@ impl CliBackend {
     }
 
     /// One process, one instant: the helper returns the whole field set.
-    fn read_helper(&self) -> Option<HelperEnv> {
-        let (dylib, pl) = self.helper.as_ref()?;
-        let out = run_command(
+    fn read_helper(&self) -> HelperRead {
+        let Some((dylib, pl)) = self.helper.as_ref() else {
+            return HelperRead::Unavailable;
+        };
+        let Some(out) = run_command(
             &perl_program(),
             &[pl.as_str(), dylib.as_str(), "adapter_get_env"],
             Duration::from_secs(2),
-        )?;
-        if out.trim().is_empty() {
-            debug!("helper returned no data");
-            return None;
+        ) else {
+            return HelperRead::Unavailable;
+        };
+        match parse_helper_read(&out) {
+            HelperRead::Unavailable => {
+                debug!("helper returned no usable data");
+                HelperRead::Unavailable
+            }
+            other => other,
         }
-        let env = parse_helper_env(&out);
-        if env.is_none() {
-            debug!("parsing helper env output failed");
-        }
-        env
     }
 }
 
 impl NowPlayingBackend for CliBackend {
     fn read(&self) -> Option<Playback> {
-        if let Some(env) = self.read_helper() {
-            let title = env.title.trim().to_string();
-            let artist = env.artist.trim().to_string();
-            if title.is_empty() && artist.is_empty() {
-                return None;
+        match self.read_helper() {
+            HelperRead::Data(env) => {
+                let title = env.title.trim().to_string();
+                let artist = env.artist.trim().to_string();
+                if title.is_empty() && artist.is_empty() {
+                    return None;
+                }
+                debug!(
+                    playback_rate = env.playback_rate,
+                    elapsed = env.elapsed,
+                    "helper env (full field set)"
+                );
+                let playing = self.resolve_playing(Some(env.playing));
+                Some(Playback {
+                    title,
+                    artist,
+                    album: env.album,
+                    bundle_id: env.bundle_id,
+                    duration: env.duration,
+                    elapsed: env.elapsed,
+                    playing,
+                    reported_at: env.reported_at,
+                })
             }
-            debug!(
-                playback_rate = env.playback_rate,
-                elapsed = env.elapsed,
-                "helper env (full field set)"
-            );
-            let playing = self.resolve_playing(Some(env.playing));
-            return Some(Playback {
-                title,
-                artist,
-                album: env.album,
-                bundle_id: env.bundle_id,
-                duration: env.duration,
-                elapsed: env.elapsed,
-                playing,
-                reported_at: env.reported_at,
-            });
+            HelperRead::Idle => None,
+            HelperRead::Unavailable => self.read_get_raw(),
         }
+    }
+}
 
-        // helper 不可用或解析失败时，用 `get-raw` 读取曲目信息；播放状态沿用
-        // 上一次的值。
+impl CliBackend {
+    /// helper 不可用时用 `get-raw` 读取曲目信息；播放状态沿用上一次的值。
+    fn read_get_raw(&self) -> Option<Playback> {
         let playing = self.resolve_playing(None);
         let out = run_command(
             &nowplaying_cli_program(),
@@ -304,28 +334,41 @@ fn resolve_program(abs_candidates: &[&str], path_name: &str) -> String {
     path_name.to_string()
 }
 
-fn find_helper() -> Option<(String, String)> {
-    // 优先用插件自身目录里的副本：app 构建时把 dylib 和脚本放进插件目录，
-    // 随 app 一起分发，用户无需通过 Homebrew 安装 nowplaying-cli。
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let dylib = dir.join("MediaRemoteMini.dylib");
-            let pl = dir.join("mediaremote-mini.pl");
-            if dylib.exists() && pl.exists() {
-                return Some((
-                    dylib.to_string_lossy().to_string(),
-                    pl.to_string_lossy().to_string(),
-                ));
-            }
+/// dylib 与脚本必须在同一个目录里，脚本按该目录加载配套资源。
+fn helper_in_dir(dir: &std::path::Path) -> Option<(String, String)> {
+    let dylib = dir.join("MediaRemoteMini.dylib");
+    let pl = dir.join("mediaremote-mini.pl");
+    if !dylib.is_file() || !pl.is_file() {
+        return None;
+    }
+    Some((
+        dylib.to_string_lossy().to_string(),
+        pl.to_string_lossy().to_string(),
+    ))
+}
+
+fn helper_candidates() -> Vec<(String, String)> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    helper_candidates_with(exe_dir.as_deref())
+}
+
+/// 候选顺序：插件自身目录（app 构建时放进插件目录、随 app 分发）在前，
+/// Homebrew Cellar 里按安装时间从新到旧在后（开发机直接跑插件二进制的场景）。
+fn helper_candidates_with(exe_dir: Option<&std::path::Path>) -> Vec<(String, String)> {
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    if let Some(dir) = exe_dir {
+        if let Some(pair) = helper_in_dir(dir) {
+            candidates.push(pair);
         }
     }
 
-    // 回退：从 Homebrew 的已知位置找（开发机上直接跑插件二进制的场景）。
     let roots = [
         "/opt/homebrew/Cellar/nowplaying-cli",
         "/usr/local/Cellar/nowplaying-cli",
     ];
-    let mut candidates: Vec<(SystemTime, String)> = Vec::new();
+    let mut found: Vec<(SystemTime, String)> = Vec::new();
     for root in roots {
         let pattern = format!("{root}/*/lib/nowplaying-cli/MediaRemoteMini.dylib");
         // One bad root (or a bad glob entry) must not abort the whole search.
@@ -340,17 +383,40 @@ fn find_helper() -> Option<(String, String)> {
             let mtime = std::fs::metadata(&entry)
                 .and_then(|m| m.modified())
                 .unwrap_or(SystemTime::UNIX_EPOCH);
-            candidates.push((mtime, entry.to_string_lossy().to_string()));
+            found.push((mtime, entry.to_string_lossy().to_string()));
         }
     }
     // 按安装时间从新到旧排序；版本号按字典序比较时 1.9 与 1.10 会排反。
-    candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
-    for (_, dylib) in candidates {
+    found.sort_by_key(|a| std::cmp::Reverse(a.0));
+    for (_, dylib) in found {
         let prefix = dylib.split("/lib/nowplaying-cli/").next().unwrap_or("");
         let pl = format!("{prefix}/share/nowplaying-cli/scripts/mediaremote-mini.pl");
-        if std::path::Path::new(&pl).exists() {
-            return Some((dylib, pl));
+        if std::path::Path::new(&pl).is_file() {
+            candidates.push((dylib, pl));
         }
+    }
+    candidates
+}
+
+/// 启动时确认 helper 能跑通。当前没有播放信息时 `adapter_get_env` 输出 `null`，
+/// 属于正常响应；命令失败、超时或输出无法解析时剔除这个候选并试下一个。
+fn helper_responds(dylib: &str, pl: &str) -> bool {
+    let Some(out) = run_command(
+        &perl_program(),
+        &[pl, dylib, "adapter_get_env"],
+        Duration::from_secs(2),
+    ) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(out.trim()).is_ok()
+}
+
+fn find_helper() -> Option<(String, String)> {
+    for pair in helper_candidates() {
+        if helper_responds(&pair.0, &pair.1) {
+            return Some(pair);
+        }
+        warn!(dylib = %pair.0, "now playing helper failed to respond, trying next candidate");
     }
     None
 }
@@ -562,5 +628,61 @@ mod tests {
         );
         assert_eq!(parse_iso8601_utc("not a date"), None);
         assert_eq!(parse_iso8601_utc("2026-13-01T00:00:00Z"), None);
+    }
+
+    fn temp_helper_dir(label: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "inkbuddy-helper-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn helper_in_dir_requires_both_files() {
+        let dir = temp_helper_dir("pair");
+        assert!(helper_in_dir(&dir).is_none());
+        std::fs::write(dir.join("MediaRemoteMini.dylib"), b"").unwrap();
+        assert!(
+            helper_in_dir(&dir).is_none(),
+            "one file alone is not a usable pair"
+        );
+        std::fs::write(dir.join("mediaremote-mini.pl"), b"").unwrap();
+        let (dylib, pl) = helper_in_dir(&dir).expect("both files present");
+        assert_eq!(std::path::Path::new(&dylib).parent(), Some(dir.as_path()));
+        assert_eq!(std::path::Path::new(&pl).parent(), Some(dir.as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn own_directory_is_first_helper_candidate() {
+        let dir = temp_helper_dir("order");
+        std::fs::write(dir.join("MediaRemoteMini.dylib"), b"").unwrap();
+        std::fs::write(dir.join("mediaremote-mini.pl"), b"").unwrap();
+        let candidates = helper_candidates_with(Some(&dir));
+        assert!(!candidates.is_empty());
+        assert!(candidates[0]
+            .0
+            .starts_with(dir.to_string_lossy().as_ref()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn idle_helper_output_is_distinct_from_failure() {
+        assert!(matches!(parse_helper_read("null\n"), HelperRead::Idle));
+        assert!(matches!(parse_helper_read(""), HelperRead::Unavailable));
+        assert!(matches!(
+            parse_helper_read("not json"),
+            HelperRead::Unavailable
+        ));
+        assert!(matches!(
+            parse_helper_read(r#"{"title":"x","playing":true}"#),
+            HelperRead::Data(_)
+        ));
     }
 }

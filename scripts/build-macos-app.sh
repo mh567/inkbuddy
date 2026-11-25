@@ -1,11 +1,11 @@
 #!/bin/sh
 # 构建 macOS 菜单栏 app（InkBuddy.app）
-# 用法：./scripts/build-macos-app.sh [版本号，默认 0.3.3]
+# 用法：./scripts/build-macos-app.sh [版本号，默认 0.3.4]
 # 依赖：Rust 工具链、Swift 编译器（Xcode CLT）、可选 rsvg-convert（重新渲染菜单栏图标）
 set -e
 cd "$(dirname "$0")/.."
 
-VERSION="${1:-0.3.3}"
+VERSION="${1:-0.3.4}"
 APP_NAME=InkBuddy
 BUILD_DIR=build-app
 APP="$BUILD_DIR/$APP_NAME.app"
@@ -13,7 +13,7 @@ RESDIR="$APP/Contents/Resources"
 
 echo "==> 编译 Rust host"
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo build --release -p inkbuddy
+cargo build --release --workspace
 
 echo "==> 组装 bundle"
 rm -rf "$APP"
@@ -53,16 +53,21 @@ cp target/release/inkbuddy "$RESDIR/inkbuddy-host"
 cp target/release/inkbuddy-plugin-lyrics "$RESDIR/plugins/lyrics/inkbuddy-plugin-lyrics"
 cp target/release/inkbuddy-plugin-clock "$RESDIR/plugins/clock/inkbuddy-plugin-clock"
 
-# 歌词插件读取 Now Playing 用的 MediaRemote 组件随 app 分发，用户无需 brew install
+# 歌词插件读取 Now Playing 用的 MediaRemote 组件随 app 分发
 cp vendor/nowplaying-cli/MediaRemoteMini.dylib "$RESDIR/plugins/lyrics/MediaRemoteMini.dylib"
 cp vendor/nowplaying-cli/mediaremote-mini.pl "$RESDIR/plugins/lyrics/mediaremote-mini.pl"
+
+# 随 app 分发 GPL 组件的许可证与来源说明
+mkdir -p "$RESDIR/licenses/nowplaying-cli"
+cp vendor/nowplaying-cli/LICENSE "$RESDIR/licenses/nowplaying-cli/LICENSE"
+cp vendor/nowplaying-cli/README.md "$RESDIR/licenses/nowplaying-cli/README.md"
 
 cat > "$RESDIR/plugins/lyrics/plugin.toml" <<'EOF'
 [plugin]
 id = "lyrics"
 name = "歌词"
 version = "0.1.0"
-description = "正在播放的同步歌词，粤语歌带逐字粤拼"
+description = "正在播放的同步歌词"
 command = "./inkbuddy-plugin-lyrics"
 
 [runtime]

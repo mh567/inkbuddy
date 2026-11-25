@@ -45,7 +45,7 @@ QQ 的逐字粤拼来自 QRC 接口，返回的是 hex + 自定义 3DES + zlib �
 
 ## 播放信息读取
 
-播放信息通过 `nowplaying-cli` 的 helper 读取。构建 app 时把 `MediaRemoteMini.dylib` 和 `mediaremote-mini.pl` 放进插件目录（`vendor/nowplaying-cli/` 是随仓库保存的副本，含 GPL-3.0 许可证），随 app 一起分发，用户无需安装 Homebrew 或任何外部软件。
+播放信息通过 `nowplaying-cli` 的 helper 读取。构建 app 时把 `MediaRemoteMini.dylib` 和 `mediaremote-mini.pl` 放进插件目录，随 app 一起分发。`vendor/nowplaying-cli/` 保存仓库副本与 GPL-3.0 许可证全文。
 
 - 优先用插件自身目录里的 helper：`mediaremote-mini.pl adapter_get_env` 一次取全量字段（标题、歌手、专辑、时长、进度、`playing`、`playbackRate`、`timestamp`、`bundleIdentifier`）。QQ 音乐暂停时 `PlaybackRate` 仍可能是 1，播放状态取 helper 给的 `playing`；helper 偶发取不到时沿用上一次的值。
 - 开发机上直接跑插件二进制时，若自身目录没有 helper，会回退到 Homebrew 的 `/opt/homebrew/Cellar/nowplaying-cli`、`/usr/local/Cellar/nowplaying-cli`，再回退到 `nowplaying-cli get-raw` 读原始字段 `kMRMediaRemoteNowPlayingInfoElapsedTime`。`get-raw` 没有 `timestamp`，这条路径直接从上报值开始本地计时。
