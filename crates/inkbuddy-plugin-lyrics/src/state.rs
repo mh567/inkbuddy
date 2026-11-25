@@ -37,6 +37,9 @@ pub struct PluginState {
 
     cached_track: Option<String>,
     cached_song: Option<CachedSong>,
+    /// 已确认三家曲库都取不到歌词的曲目。命中时显示「暂无歌词」，避免纯音乐
+    /// 或冷门歌永远停在「歌词加载中…」。
+    no_lyrics_track: Option<String>,
     /// Set when a fetch failed, to avoid hammering the network every 500ms.
     fetch_deadline: Option<Instant>,
 }
@@ -63,6 +66,7 @@ impl PluginState {
             other_latency: latency_from_env("INKBUDDY_LATENCY_OTHER_MS"),
             cached_track: None,
             cached_song: None,
+            no_lyrics_track: None,
             fetch_deadline: None,
         }
     }
@@ -161,6 +165,14 @@ impl PluginState {
         self.last_track_id = Some(track_id);
         self.last_reported = pb.elapsed;
 
+        // 切歌时清掉上一首的歌词与「无歌词」标记：退避窗口内取词会被跳过，
+        // 留着旧 cached_song 会把上一首歌词串到这一首上。
+        if new_track {
+            self.cached_song = None;
+            self.cached_track = None;
+            self.no_lyrics_track = None;
+        }
+
         // 其它播放器直接用上报进度，本地时钟不参与。
         if Self::player(pb).clock_mode() == ClockMode::ReportElapsed {
             self.last_playing = pb.playing;
@@ -229,6 +241,7 @@ impl PluginState {
                     }
                     None => {
                         debug!(title = %pb.title, "no lyrics found, backing off");
+                        self.no_lyrics_track = Some(track_id.clone());
                         self.fetch_deadline = Some(Instant::now() + Duration::from_secs(10));
                     }
                 }
@@ -236,7 +249,14 @@ impl PluginState {
         }
 
         let Some(song) = self.cached_song.as_ref() else {
-            return one_line_frame(&pb.title, "歌词加载中…");
+            // 已确认三家都没有歌词时给出明确提示，纯音乐/冷门歌不会永远停在
+            // 「歌词加载中…」。退避窗口内不再请求网络。
+            let message = if self.no_lyrics_track.as_deref() == Some(track_id.as_str()) {
+                "暂无歌词"
+            } else {
+                "歌词加载中…"
+            };
+            return one_line_frame(&pb.title, message);
         };
 
         let t = self.position(&pb);
@@ -445,6 +465,54 @@ mod tests {
             s.position_base.abs() < 1e-6,
             "still frozen after 20 seconds"
         );
+    }
+
+    #[tokio::test]
+    async fn confirmed_no_lyrics_shows_unavailable_not_loading() {
+        // 已确认三家都没有歌词时，退避窗口内直接显示「暂无歌词」，
+        // 不再永远停在「歌词加载中…」。
+        let pb = make_pb(5.0, true);
+        let mut s = primed(&pb, 5.0, 5.0, true);
+        s.no_lyrics_track = Some(pb.track_id());
+        s.fetch_deadline = Some(Instant::now() + Duration::from_secs(10));
+        s.backend = Box::new(FakeBackend(Some(pb)));
+
+        let frame = s.render().await;
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(json.contains("暂无歌词"), "show explicit no-lyrics hint: {json}");
+        assert!(!json.contains("加载中"), "must not stay 'loading' forever: {json}");
+    }
+
+    #[tokio::test]
+    async fn loading_lyrics_shows_loading_hint() {
+        // 还没确认无歌词、也没有缓存时显示「歌词加载中…」。
+        let pb = make_pb(5.0, true);
+        let mut s = primed(&pb, 5.0, 5.0, true);
+        s.fetch_deadline = Some(Instant::now() + Duration::from_secs(10));
+        s.backend = Box::new(FakeBackend(Some(pb)));
+
+        let frame = s.render().await;
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(json.contains("歌词加载中"), "show loading hint: {json}");
+    }
+
+    #[tokio::test]
+    async fn track_switch_clears_stale_lyrics_and_no_lyrics_flag() {
+        // 切歌清掉上一首的歌词与「无歌词」标记，避免串台。
+        let pb = make_pb(5.0, true);
+        let mut s = primed(&pb, 5.0, 5.0, true);
+        s.cached_song = Some(CachedSong {
+            lines: vec![(0.0, "上一首歌词".into())],
+            ..Default::default()
+        });
+        s.no_lyrics_track = Some("previous-track".into());
+
+        let mut next = pb.clone();
+        next.title = "Another Song".into();
+        s.update_clock(&next);
+
+        assert!(s.cached_song.is_none(), "stale lyrics must be cleared on switch");
+        assert!(s.no_lyrics_track.is_none(), "no-lyrics flag must be cleared on switch");
     }
 
     #[tokio::test]
