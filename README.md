@@ -4,7 +4,7 @@
 
 墨水屏保持原样：在自带浏览器里输入一个局域网地址，就进入展示页面。内容由 macOS 上的 InkBuddy 主程序生成。
 
-核心功能插件是**同步歌词**（粤语歌带粤拼）。「视图」系统把插件摆到屏幕的任意区域，所见即所得地编辑。
+核心功能插件是**同步歌词**。「视图」系统把插件摆到屏幕的任意区域，所见即所得地编辑。
 
 ## 工作方式
 
@@ -134,7 +134,7 @@ macOS 菜单栏 app 的视图编辑窗口：左侧从已安装扩展添加区域
 
 | 插件 | 用途 | 说明 |
 | --- | --- | --- |
-| `lyrics` | 正在播放的同步歌词，粤语歌带粤拼 | [crates/inkbuddy-plugin-lyrics/README.md](crates/inkbuddy-plugin-lyrics/README.md) |
+| `lyrics` | 正在播放的同步歌词 | [crates/inkbuddy-plugin-lyrics/README.md](crates/inkbuddy-plugin-lyrics/README.md) |
 | `clock` | 当前日期与时间 | [crates/inkbuddy-plugin-clock/README.md](crates/inkbuddy-plugin-clock/README.md) |
 
 ## 写自己的插件
