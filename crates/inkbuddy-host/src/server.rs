@@ -183,6 +183,8 @@ struct PluginSummary {
     version: String,
     description: String,
     installed: bool,
+    /// manifest 里的运行时开关。默认布局要用它过滤，和 default_ids 一致。
+    enabled: bool,
     default_on: bool,
     running: bool,
 }
@@ -254,7 +256,9 @@ async fn preview_frame(State(state): State<Shared>, Json(req): Json<PreviewReque
             .filter(|id| seen.insert((*id).clone()))
             .filter(|id| is_installed(&guard, &uninstalled, id))
             .filter_map(|id| guard.get(id).map(|p| (id.clone(), Arc::clone(&p))))
-            .take(8)
+            // 与 MAX_REGIONS_PER_VIEW / /api/frame 一致：一个视图最多 64 个区域，
+            // 编辑器预览要能看到全部区域，不能在这里截成 8 个。
+            .take(MAX_PLUGIN_IDS)
             .collect()
     };
     let mut futures = Vec::new();
@@ -489,6 +493,7 @@ async fn get_plugins(State(state): State<Shared>) -> impl IntoResponse {
         out.push(PluginSummary {
             id,
             installed,
+            enabled: m.runtime.enabled,
             name: i
                 .as_ref()
                 .map(|v| v.name.clone())
@@ -510,6 +515,7 @@ async fn get_plugins(State(state): State<Shared>) -> impl IntoResponse {
         out.push(PluginSummary {
             id,
             installed: false,
+            enabled: m.runtime.enabled,
             name: m.plugin.name.clone(),
             version: m.plugin.version.clone(),
             description: m.plugin.description.clone(),

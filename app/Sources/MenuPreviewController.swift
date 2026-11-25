@@ -1,21 +1,49 @@
 import AppKit
+import SwiftUI
 
-/// 菜单下拉里的预览头部：上一行是 ◀ / 当前视图名 / ▶，下方显示墨水屏内容。
+/// 菜单侧的预览布局来源：当前视图的区域几何 + 设备实测宽高比。
+/// 编辑器的 ViewEditorModel 带一堆编辑态（选中、手势），菜单不需要，单独一个轻量模型。
+final class MenuPreviewModel: ObservableObject {
+    @Published var regions: [ViewRegion] = []
+    @Published var aspect: Double = 16.0 / 9.0
+}
+
+/// 菜单栏预览的 SwiftUI 壳：把共享画布接到菜单侧的取数对象上。
+/// store 的 contents 是 @Published，时钟/歌词变化时画布会自己重绘，
+/// 不用控制器去比对内容差异。
+private struct MenuPreviewRoot: View {
+    @ObservedObject var model: MenuPreviewModel
+    @ObservedObject var store: EditorPreviewStore
+
+    var body: some View {
+        InkPreviewCanvas(
+            regions: model.regions,
+            contents: store.contents,
+            aspect: model.aspect,
+            showChrome: false
+        )
+    }
+}
+
+/// 菜单栏下拉里的预览头部：上一行是 ◀ / 当前视图名 / ▶，下方显示墨水屏内容。
 ///
-/// 不用 WebKit：WKWebView 放进 NSMenu 后渲染层会被系统回收，显示几秒就变白。
-/// 直接拉 /api/frame 的结构化区域数据（与墨水屏同一份渲染结果），按百分比
-/// 原生排版——和视图编辑器画布同一套几何模型。
+/// 预览画布与设置里的编辑器预览共用 InkPreviewCanvas，同一套排版、同一份
+/// /api/preview 数据。菜单这里只负责视图切换头部和轮询生命周期：菜单打开时
+/// 拉当前视图的区域布局并定时取内容，关闭时停掉轮询。
 final class MenuPreviewController: NSObject {
     let containerView: NSView
 
     private let prevButton: NSButton
     private let nextButton: NSButton
     private let nameLabel: NSTextField
-    private let canvasView: NSView
+
+    private let store = EditorPreviewStore(port: HostService.shared.port)
+    private let model = MenuPreviewModel()
+    private let hostingView: NSHostingView<MenuPreviewRoot>
 
     private var pollTimer: Timer?
-    private var baseURL = ""
-    private var lastSignature: String?
+    /// 菜单是否正处于预览周期：异步响应回来时据此判断是否已过期。
+    private var isActive = false
 
     var onPrev: (() -> Void)?
     var onNext: (() -> Void)?
@@ -39,27 +67,30 @@ final class MenuPreviewController: NSObject {
         nameLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
         nameLabel.lineBreakMode = .byTruncatingMiddle
 
-        canvasView = NSView(frame: .zero)
-
-        super.init()
-
         let barHeight: CGFloat = 26
         let top = height
         prevButton.frame = NSRect(x: 8, y: top - barHeight - 2, width: 32, height: barHeight)
         nextButton.frame = NSRect(x: width - 40, y: top - barHeight - 2, width: 32, height: barHeight)
         nameLabel.frame = NSRect(x: 44, y: top - barHeight, width: width - 88, height: barHeight - 4)
         let inset: CGFloat = 8
-        canvasView.frame = NSRect(
+        let canvasRect = NSRect(
             x: inset,
             y: 6,
             width: width - inset * 2,
             height: height - barHeight - 14
         )
 
+        // SwiftUI 画布嵌进菜单项：和编辑器预览是同一个视图，只关掉区域边框与
+        // 扩展名标签，让菜单里看到的更接近墨水屏本身。
+        hostingView = NSHostingView(rootView: MenuPreviewRoot(model: model, store: store))
+        hostingView.frame = canvasRect
+
+        super.init()
+
         containerView.addSubview(prevButton)
         containerView.addSubview(nameLabel)
         containerView.addSubview(nextButton)
-        containerView.addSubview(canvasView)
+        containerView.addSubview(hostingView)
 
         prevButton.target = self
         prevButton.action = #selector(prevClicked)
@@ -70,144 +101,77 @@ final class MenuPreviewController: NSObject {
     @objc private func prevClicked() { onPrev?() }
     @objc private func nextClicked() { onNext?() }
 
-    /// 菜单打开时调用：记录地址，立即拉一帧，之后每 500ms 刷新。
-    func startPreview(address: String) {
-        baseURL = address.hasSuffix("/") ? address : address + "/"
-        lastSignature = nil
-        poll()
+    /// 菜单打开时调用：同步当前视图布局，立即取一帧，之后每秒刷新。
+    func startPreview() {
+        isActive = true
+        refreshLayout()
         pollTimer?.invalidate()
-        pollTimer = Timer.scheduledTimer(
-            timeInterval: 0.5,
-            target: self,
-            selector: #selector(poll),
-            userInfo: nil,
-            repeats: true
-        )
+        let timer = Timer(timeInterval: 1, target: self, selector: #selector(poll), userInfo: nil, repeats: true)
+        // NSMenu 展开时主线程跑在 eventTracking 模式，scheduledTimer 默认只注册
+        // 在 default 模式，菜单打开期间不会触发。放进 common 才能持续刷新。
+        RunLoop.main.add(timer, forMode: .common)
+        pollTimer = timer
+        // 与编辑器一致：用设备实测比例算字号缩放，预览所见即墨水屏所见。
+        HostService.shared.refreshDeviceAspect { [weak self] deviceAspect in
+            guard let self = self, self.isActive, let deviceAspect = deviceAspect else { return }
+            // 菜单可能在这次请求返回前就关了，别再改写下一个打开周期的画布比例。
+            self.model.aspect = deviceAspect
+        }
     }
 
-    /// 菜单关闭时调用：停掉轮询。
+    /// 菜单关闭时调用：停掉轮询并清空缓存，避免下次打开闪现旧视图内容。
     func stopPreview() {
+        isActive = false
         pollTimer?.invalidate()
         pollTimer = nil
+        store.reset()
+    }
+
+    /// 视图切换后立刻同步布局与新视图内容，不必等下一次轮询。
+    func refreshLayout() {
+        syncLayout()
+        poll()
+    }
+
+    /// 重读 host 当前的视图与插件状态。每次轮询都跑一遍：菜单刚打开时插件
+    /// 列表可能还没拉回来，下一秒补上即可；箭头切换后也会读到最新的当前视图。
+    private func syncLayout() {
+        let host = HostService.shared
+        let current = host.viewsState.views.first { $0.id == host.viewsState.current }
+        // 有视图时用视图的区域布局；没视图时墨水屏按 default_on 竖排显示，
+        // 菜单要跟着显示同样的内容，不能空着。
+        let regions: [ViewRegion] = current?.regions ?? stackedRegions(from: host)
+        if model.regions != regions {
+            model.regions = regions
+        }
+        if let deviceAspect = host.deviceAspect, model.aspect != deviceAspect {
+            model.aspect = deviceAspect
+        }
+    }
+
+    /// 无视图时的竖排等分布局，与 host 的 Region::stacked 同规则。
+    private func stackedRegions(from host: HostService) -> [ViewRegion] {
+        // 与 host 的 default_ids() 同条件：enabled && default_on && 已安装。
+        let plugins = host.plugins.filter { $0.installed && $0.enabled && $0.defaultOn }
+        let total = max(plugins.count, 1)
+        let height = 100.0 / Double(total)
+        return plugins.enumerated().map { index, plugin in
+            ViewRegion(
+                plugin: plugin.id,
+                x: 0,
+                y: height * Double(index),
+                w: 100,
+                h: height
+            )
+        }
     }
 
     @objc private func poll() {
-        guard let url = URL(string: baseURL + "api/frame") else { return }
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 2
-        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
-            guard let data = data,
-                  let payload = try? JSONDecoder().decode(FramePayload.self, from: data) else { return }
-            DispatchQueue.main.async {
-                guard let self = self,
-                      payload.signature != self.lastSignature else { return }
-                self.lastSignature = payload.signature
-                self.render(payload.regions)
-            }
-        }.resume()
-    }
-
-    // MARK: - 渲染
-
-    private struct FrameRegion: Decodable {
-        struct Line: Decodable {
-            let text: String
-            let role: String
-        }
-        let plugin: String
-        let x: Double
-        let y: Double
-        let w: Double
-        let h: Double
-        /// 服务端算好的字号缩放系数；老版本 host 没有这个字段，回退到启发式。
-        let scale: Double?
-        let lines: [Line]
-    }
-
-    private struct FramePayload: Decodable {
-        let regions: [FrameRegion]
-        let signature: String?
-    }
-
-    /// 按百分比把每个区域画到画布上：一个区域一个文本视图，
-    /// 字号按区域高度缩放，保证小区域也能读。
-    private func render(_ regions: [FrameRegion]) {
-        for sub in canvasView.subviews {
-            sub.removeFromSuperview()
-        }
-        if regions.isEmpty {
-            let placeholder = NSTextField(labelWithString: "无可用扩展")
-            placeholder.font = NSFont.systemFont(ofSize: 13)
-            placeholder.textColor = .secondaryLabelColor
-            placeholder.frame = canvasView.bounds
-            placeholder.alignment = .center
-            canvasView.addSubview(placeholder)
-            return
-        }
-        let bounds = canvasView.bounds
-        for region in regions {
-            let regionRect = CGRect(
-                x: bounds.minX + CGFloat(region.x / 100) * bounds.width,
-                y: bounds.minY + (1 - CGFloat(region.y / 100) - CGFloat(region.h / 100)) * bounds.height,
-                width: CGFloat(region.w / 100) * bounds.width,
-                height: CGFloat(region.h / 100) * bounds.height
-            )
-            let label = NSTextField(labelWithString: "")
-            label.isEditable = false
-            label.attributedStringValue = attributedText(for: region, in: regionRect)
-            label.frame = regionRect.insetBy(dx: 4, dy: 2)
-            label.lineBreakMode = .byWordWrapping
-            label.maximumNumberOfLines = 8
-            label.alignment = .center
-            canvasView.addSubview(label)
-        }
-    }
-
-    /// 一个区域的富文本。优先用服务端算好的缩放系数（与墨水屏同源），
-    /// 老版本 host 没带 scale 时回退到按区域高度的启发式。
-    private func attributedText(for region: FrameRegion, in rect: CGRect) -> NSAttributedString {
-        let scale = region.scale.map { max(0.3, min(1.0, $0)) }
-            ?? max(0.45, min(1.0, Double(rect.height) / 140))
-        let result = NSMutableAttributedString()
-        for (index, line) in region.lines.enumerated() {
-            let font: NSFont
-            let color: NSColor
-            switch line.role {
-            case "primary":
-                font = NSFont.systemFont(ofSize: 20 * scale, weight: .bold)
-                color = .black
-            case "normal", "text":
-                font = NSFont.systemFont(ofSize: 15 * scale, weight: .regular)
-                color = .black
-            case "muted", "reading":
-                font = NSFont.systemFont(ofSize: 13 * scale, weight: .regular)
-                color = .darkGray
-            default:
-                font = NSFont.systemFont(ofSize: 15 * scale, weight: .regular)
-                color = .black
-            }
-            result.append(NSAttributedString(
-                string: line.text,
-                attributes: [.font: font, .foregroundColor: color]
-            ))
-            if index < region.lines.count - 1 {
-                result.append(NSAttributedString(string: "\n"))
-            }
-        }
-        if result.length == 0 {
-            result.append(NSAttributedString(
-                string: "…",
-                attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.lightGray]
-            ))
-        }
-        return result
+        syncLayout()
+        store.fetch(plugins: model.regions.map { $0.plugin })
     }
 
     func setName(_ text: String) {
         nameLabel.stringValue = text
-    }
-
-    deinit {
-        pollTimer?.invalidate()
     }
 }

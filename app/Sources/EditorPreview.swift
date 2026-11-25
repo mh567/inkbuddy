@@ -74,15 +74,15 @@ final class EditorPreviewStore: ObservableObject {
     }
 }
 
-/// 编辑器的实时预览画布：与编辑画布同一套百分比几何模型，
-/// 内容用与墨水屏同源的结构化文本行原生排版。
-/// 字号按区域面积占比缩放（与 host 的 ink_scale 同公式）。
-/// 内嵌在编辑窗口右侧数值面板下方使用，不再单独开窗。
-struct EditorPreviewView: View {
-    @ObservedObject var model: ViewEditorModel
-    @ObservedObject var store: EditorPreviewStore
+/// 墨水屏预览画布。只依赖「区域布局 + 内容缓存 + 画布比例」，不含取数逻辑，
+/// 因此既能嵌在编辑器里，也能放进菜单栏下拉。两处共用这一份排版，显示结果一致。
+struct InkPreviewCanvas: View {
+    let regions: [ViewRegion]
+    let contents: [String: PreviewContent]
+    let aspect: Double
 
-    private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    /// 是否画出区域边框与扩展名标签。编辑器里用来对照编辑画布，菜单栏里关掉。
+    var showChrome: Bool = true
 
     var body: some View {
         GeometryReader { geo in
@@ -91,26 +91,16 @@ struct EditorPreviewView: View {
                 .frame(width: size.width, height: size.height)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .padding(10)
-        .onAppear(perform: fetchNow)
-        .onReceive(model.$regions.debounce(for: .milliseconds(250), scheduler: DispatchQueue.main)) { _ in
-            fetchNow()
-        }
-        .onReceive(timer) { _ in fetchNow() }
     }
 
-    private func fetchNow() {
-        store.fetch(plugins: model.regions.map { $0.plugin })
-    }
-
-    /// 画布按编辑器选定的宽高比适配窗口（与编辑画布一致）。
+    /// 画布按给定的宽高比适配可用空间（与编辑画布一致）。
     private func fittedCanvasSize(in available: CGSize) -> CGSize {
-        let aspect = CGFloat(max(model.canvasAspect, 0.1))
+        let a = CGFloat(max(aspect, 0.1))
         var w = available.width
-        var h = w / aspect
+        var h = w / a
         if h > available.height {
             h = available.height
-            w = h * aspect
+            w = h * a
         }
         return CGSize(width: max(w, 120), height: max(h, 68))
     }
@@ -120,12 +110,12 @@ struct EditorPreviewView: View {
             Rectangle()
                 .fill(Color.white)
                 .overlay(Rectangle().strokeBorder(Color.black.opacity(0.25), lineWidth: 1))
-            if model.regions.isEmpty {
+            if regions.isEmpty {
                 Text("画布上还没有扩展")
                     .font(.system(size: 12))
                     .foregroundColor(.secondary)
             }
-            ForEach(Array(model.regions.enumerated()), id: \.offset) { _, region in
+            ForEach(Array(regions.enumerated()), id: \.offset) { _, region in
                 previewRegion(region: region, canvas: size)
             }
         }
@@ -136,12 +126,12 @@ struct EditorPreviewView: View {
         let height = region.h / 100 * Double(canvas.height)
         // 与 host region_scale 同公式：宽度占比与高度装得下内容两个约束取小。
         // 画布宽高比就是设备实测比例，与墨水屏一致时预览即所见即所得。
-        let content = store.contents[region.plugin]
+        let content = contents[region.plugin]
         let textMode = content?.textMode ?? false
         let widthScale = max(0.1, min(1.0, region.w / 100))
         let fitScale: Double = {
             guard let units = content?.contentUnits, units > 0.01, region.h > 0.01 else { return 1.0 }
-            return max(0.1, min(1.0, region.h / (units * model.canvasAspect)))
+            return max(0.1, min(1.0, region.h / (units * aspect)))
         }()
         let scale = min(widthScale, fitScale)
         // 块结构：老 host 没有 blocks 时退化为把摊平行当一块。
@@ -158,8 +148,10 @@ struct EditorPreviewView: View {
             return []
         }()
         ZStack {
-            Rectangle()
-                .strokeBorder(Color.blue.opacity(0.30), lineWidth: 1)
+            if showChrome {
+                Rectangle()
+                    .strokeBorder(Color.blue.opacity(0.30), lineWidth: 1)
+            }
             // 块间距复刻页面 .block + .block margin-top: 2vh（乘 scale）。
             VStack(spacing: max(1, 2 * scale * Double(canvas.height) / 100)) {
                 if blocks.isEmpty {
@@ -177,20 +169,22 @@ struct EditorPreviewView: View {
                 }
             }
             .padding(4)
-            // 扩展名标签，与编辑画布一致
-            VStack {
-                HStack {
+            if showChrome {
+                // 扩展名标签，与编辑画布一致
+                VStack {
+                    HStack {
+                        Spacer()
+                        Text(region.plugin)
+                            .font(.system(size: 8, weight: .medium))
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Capsule().fill(Color.white.opacity(0.85)))
+                    }
                     Spacer()
-                    Text(region.plugin)
-                        .font(.system(size: 8, weight: .medium))
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 1)
-                        .background(Capsule().fill(Color.white.opacity(0.85)))
                 }
-                Spacer()
+                .padding(2)
+                .allowsHitTesting(false)
             }
-            .padding(2)
-            .allowsHitTesting(false)
         }
         .frame(width: width, height: height)
         .position(
@@ -253,5 +247,28 @@ struct EditorPreviewView: View {
             .lineLimit(3)
             .minimumScaleFactor(0.5)
             .frame(maxWidth: .infinity)
+    }
+}
+
+/// 编辑器的实时预览：负责取数节奏（编辑去抖 + 定时轮询），
+/// 渲染交给 InkPreviewCanvas，与菜单栏共用同一套排版。
+struct EditorPreviewView: View {
+    @ObservedObject var model: ViewEditorModel
+    @ObservedObject var store: EditorPreviewStore
+
+    private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        InkPreviewCanvas(regions: model.regions, contents: store.contents, aspect: model.canvasAspect)
+            .padding(10)
+            .onAppear(perform: fetchNow)
+            .onReceive(model.$regions.debounce(for: .milliseconds(250), scheduler: DispatchQueue.main)) { _ in
+                fetchNow()
+            }
+            .onReceive(timer) { _ in fetchNow() }
+    }
+
+    private func fetchNow() {
+        store.fetch(plugins: model.regions.map { $0.plugin })
     }
 }

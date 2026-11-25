@@ -3,18 +3,20 @@ import Combine
 import AppKit
 
 /// 一个扩展。installed 来自 host 的卸载黑名单：目录扫描到 = 安装来源，
-/// 卸载只是本地标记。
+/// 卸载只是本地标记。enabled 是 manifest 的运行时开关，host 的默认布局
+/// 用它过滤，菜单无视图时也要按同样规则回退。
 struct PluginInfo: Identifiable, Codable {
     let id: String
     let name: String
     let version: String
     let description: String
     var installed: Bool
+    let enabled: Bool
     let defaultOn: Bool
     let running: Bool
 
     enum CodingKeys: String, CodingKey {
-        case id, name, version, description, installed, running
+        case id, name, version, description, installed, enabled, running
         case defaultOn = "default_on"
     }
 }
@@ -44,20 +46,6 @@ struct ViewsState: Codable {
     var views: [SavedView]
 }
 
-/// /api/frame 的区域负载：几何 + 该扩展摊平后的文本行。
-struct FrameRegionPayload: Decodable {
-    struct Line: Decodable {
-        let text: String
-        let role: String
-    }
-    let plugin: String
-    let x: Double
-    let y: Double
-    let w: Double
-    let h: Double
-    let lines: [Line]
-}
-
 /// /api/health 的负载：设备实测宽高比，设备未轮询过时为 null。
 private struct HealthInfo: Decodable {
     let aspect: Double?
@@ -81,6 +69,8 @@ final class HostService: ObservableObject {
             refreshAddress()
         }
     }
+    /// 设备比例请求序号，旧响应到达时丢弃。
+    private var aspectSeq = 0
     private var process: Process?
     private var lanHost = "127.0.0.1"
     private let fileManager = FileManager.default
@@ -259,12 +249,16 @@ final class HostService: ObservableObject {
     /// 保证预览的字号缩放行为与墨水屏完全一致（同一 aspect 参与 fit 计算）。
     func refreshDeviceAspect(completion: ((Double?) -> Void)? = nil) {
         guard let url = URL(string: "http://127.0.0.1:\(port)/api/health") else { return }
+        aspectSeq += 1
+        let seq = aspectSeq
         var request = URLRequest(url: url)
         request.timeoutInterval = 2
         URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
             let aspect = data.flatMap { try? JSONDecoder().decode(HealthInfo.self, from: $0).aspect }
             DispatchQueue.main.async {
-                self?.deviceAspect = aspect
+                // 设备比例是全局共享状态，旧响应晚到会把新值覆盖回去。
+                guard let self = self, seq == self.aspectSeq else { return }
+                self.deviceAspect = aspect
                 completion?(aspect)
             }
         }.resume()
@@ -340,6 +334,7 @@ final class HostService: ObservableObject {
                         version: self.plugins[index].version,
                         description: self.plugins[index].description,
                         installed: installed,
+                        enabled: self.plugins[index].enabled,
                         defaultOn: self.plugins[index].defaultOn,
                         running: installed ? self.plugins[index].running : false
                     )

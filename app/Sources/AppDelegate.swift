@@ -5,6 +5,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var statusItem: NSStatusItem?
     private var mainWindow: NSWindow?
     private let preview = MenuPreviewController()
+    private var menuIsOpen = false
+    /// 每次打开菜单/切换视图都递增，异步回调据此丢弃上一周期的响应。
+    private var menuGeneration = 0
+    private var switchGeneration = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildStatusBar()
@@ -71,16 +75,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     // MARK: - 菜单打开/关闭
 
     func menuWillOpen(_ menu: NSMenu) {
+        menuIsOpen = true
+        menuGeneration += 1
+        let generation = menuGeneration
         preview.setName(viewName())
-        // 预览由 app 自己拉本机 host，始终走 loopback，不受局域网可达性影响。
-        preview.startPreview(address: "http://127.0.0.1:\(HostService.shared.port)/")
-        // 拉最新视图状态，箭头切换和标题都用它
+        // 画布要画当前视图的区域布局，先拉最新视图状态再启动预览，
+        // 否则首次打开菜单会用旧布局。回调里再确认菜单仍开着，避免
+        // 超时慢响应在菜单关闭后才把轮询启动起来。
+        HostService.shared.fetchPlugins()
         HostService.shared.fetchViews { [weak self] in
-            self?.preview.setName(self?.viewName() ?? "未选择视图")
+            guard let self = self, self.menuIsOpen, generation == self.menuGeneration else { return }
+            self.preview.setName(self.viewName())
+            self.preview.startPreview()
         }
     }
 
     func menuDidClose(_ menu: NSMenu) {
+        menuIsOpen = false
         // 关闭后停掉预览页面的轮询
         preview.stopPreview()
     }
@@ -92,6 +103,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let host = HostService.shared
         let views = host.viewsState.views
         guard !views.isEmpty else { return }
+        switchGeneration += 1
+        let generation = switchGeneration
         let next: Int
         if let index = views.firstIndex(where: { $0.id == host.viewsState.current }) {
             next = (index + direction + views.count) % views.count
@@ -99,7 +112,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             next = direction > 0 ? 0 : views.count - 1
         }
         host.switchView(to: views[next].id) { [weak self] in
-            self?.preview.setName(self?.viewName() ?? "未选择视图")
+            guard let self = self, self.menuIsOpen, generation == self.switchGeneration else { return }
+            self.preview.setName(self.viewName())
+            // 视图已切换，画布立刻换成新布局和它的内容
+            self.preview.refreshLayout()
         }
     }
 
