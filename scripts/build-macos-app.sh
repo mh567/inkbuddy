@@ -53,6 +53,10 @@ cp target/release/inkbuddy "$RESDIR/inkbuddy-host"
 cp target/release/inkbuddy-plugin-lyrics "$RESDIR/plugins/lyrics/inkbuddy-plugin-lyrics"
 cp target/release/inkbuddy-plugin-clock "$RESDIR/plugins/clock/inkbuddy-plugin-clock"
 
+# 歌词插件读取 Now Playing 用的 MediaRemote 组件随 app 分发，用户无需 brew install
+cp vendor/nowplaying-cli/MediaRemoteMini.dylib "$RESDIR/plugins/lyrics/MediaRemoteMini.dylib"
+cp vendor/nowplaying-cli/mediaremote-mini.pl "$RESDIR/plugins/lyrics/mediaremote-mini.pl"
+
 cat > "$RESDIR/plugins/lyrics/plugin.toml" <<'EOF'
 [plugin]
 id = "lyrics"

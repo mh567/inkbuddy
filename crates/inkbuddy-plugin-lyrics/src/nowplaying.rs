@@ -9,7 +9,7 @@ use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Playback {
@@ -169,8 +169,13 @@ pub struct CliBackend {
 
 impl CliBackend {
     pub fn detect() -> Self {
+        let helper = find_helper();
+        match &helper {
+            Some((dylib, _)) => info!(dylib = %dylib, "now playing helper resolved"),
+            None => warn!("no now playing helper found; get-raw fallback will be used"),
+        }
         Self {
-            helper: find_helper(),
+            helper,
             last_playing: AtomicBool::new(false),
         }
     }
@@ -300,6 +305,22 @@ fn resolve_program(abs_candidates: &[&str], path_name: &str) -> String {
 }
 
 fn find_helper() -> Option<(String, String)> {
+    // 优先用插件自身目录里的副本：app 构建时把 dylib 和脚本放进插件目录，
+    // 随 app 一起分发，用户无需通过 Homebrew 安装 nowplaying-cli。
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let dylib = dir.join("MediaRemoteMini.dylib");
+            let pl = dir.join("mediaremote-mini.pl");
+            if dylib.exists() && pl.exists() {
+                return Some((
+                    dylib.to_string_lossy().to_string(),
+                    pl.to_string_lossy().to_string(),
+                ));
+            }
+        }
+    }
+
+    // 回退：从 Homebrew 的已知位置找（开发机上直接跑插件二进制的场景）。
     let roots = [
         "/opt/homebrew/Cellar/nowplaying-cli",
         "/usr/local/Cellar/nowplaying-cli",
