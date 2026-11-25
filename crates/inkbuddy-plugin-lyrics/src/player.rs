@@ -17,6 +17,8 @@ pub enum PlayerKind {
 pub enum LyricStrategy {
     /// QQ 曲库优先，取不到再用 LRCLIB。QQ 音乐专用。
     QqFirst,
+    /// 网易云官方曲库优先，取不到依次用 QQ 曲库、LRCLIB。网易云专用。
+    NeteaseFirst,
     /// QQ 曲库与 LRCLIB 同时发请求，先用先返回的有效结果。
     Race,
 }
@@ -52,13 +54,16 @@ impl PlayerKind {
     pub fn lyric_strategy(self) -> LyricStrategy {
         match self {
             Self::QqMusic => LyricStrategy::QqFirst,
+            Self::Netease => LyricStrategy::NeteaseFirst,
             _ => LyricStrategy::Race,
         }
     }
 
     pub fn clock_mode(self) -> ClockMode {
         match self {
-            Self::QqMusic => ClockMode::FrozenLocal,
+            // QQ 音乐与网易云都把 ElapsedTime 冻结在切歌时刻；用 timestamp 对齐
+            // 起点后本地推进，进度才会跟着走。
+            Self::QqMusic | Self::Netease => ClockMode::FrozenLocal,
             _ => ClockMode::ReportElapsed,
         }
     }
@@ -88,6 +93,10 @@ mod tests {
             PlayerKind::Netease
         );
         assert_eq!(
+            PlayerKind::from_bundle_id(Some("com.netease.163music")),
+            PlayerKind::Netease
+        );
+        assert_eq!(
             PlayerKind::from_bundle_id(Some("com.spotify.client")),
             PlayerKind::Spotify
         );
@@ -104,13 +113,25 @@ mod tests {
     }
 
     #[test]
-    fn qq_keeps_current_strategies_others_use_race() {
-        let qq = PlayerKind::QqMusic;
-        assert_eq!(qq.lyric_strategy(), LyricStrategy::QqFirst);
-        assert_eq!(qq.clock_mode(), ClockMode::FrozenLocal);
+    fn frozen_clock_players_use_local_clock() {
+        // QQ 音乐与网易云都冻结上报进度，必须走本地时钟。
+        for kind in [PlayerKind::QqMusic, PlayerKind::Netease] {
+            assert_eq!(kind.clock_mode(), ClockMode::FrozenLocal);
+        }
+    }
 
-        for kind in [PlayerKind::Netease, PlayerKind::Spotify, PlayerKind::Other] {
+    #[test]
+    fn each_player_picks_its_own_lyric_strategy() {
+        assert_eq!(PlayerKind::QqMusic.lyric_strategy(), LyricStrategy::QqFirst);
+        assert_eq!(
+            PlayerKind::Netease.lyric_strategy(),
+            LyricStrategy::NeteaseFirst
+        );
+        for kind in [PlayerKind::Spotify, PlayerKind::Other] {
             assert_eq!(kind.lyric_strategy(), LyricStrategy::Race);
+        }
+        // Spotify 与其它播放器上报进度可用，直接取上报值。
+        for kind in [PlayerKind::Spotify, PlayerKind::Other] {
             assert_eq!(kind.clock_mode(), ClockMode::ReportElapsed);
         }
     }

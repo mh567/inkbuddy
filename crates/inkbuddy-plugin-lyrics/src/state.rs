@@ -1,8 +1,8 @@
 //! 播放时钟与歌词窗口状态。
 //!
-//! QQ 音乐在 macOS 上把 `ElapsedTime` 全程冻结在 0（helper 和 get-raw 都是如此）。
-//! 上报值发生变化时重设锚点，其余时间本地时钟自行推进；值保持不变视为没有跳转，
-//! 拖到 0 属于变化，需要重设锚点。
+//! QQ 音乐与网易云在 macOS 上把 `ElapsedTime` 冻结在切歌时刻，不再随播放推进
+//! （helper 和 get-raw 都是如此）。上报值发生变化时重设锚点，其余时间本地时钟
+//! 自行推进；值保持不变视为没有跳转，拖到 0 属于变化，需要重设锚点。
 
 use crate::nowplaying::{NowPlayingBackend, Playback};
 use crate::player::{ClockMode, PlayerKind};
@@ -89,7 +89,7 @@ impl PluginState {
             _ => self.other_latency,
         };
         let base = match player.clock_mode() {
-            // QQ 冻结上报值：用本地时钟推进。
+            // 冻结上报值（QQ、网易云）：用本地时钟推进。
             ClockMode::FrozenLocal => {
                 if pb.playing {
                     self.position_base + self.position_base_at.elapsed().as_secs_f64()
@@ -167,7 +167,7 @@ impl PluginState {
             return;
         }
 
-        // QQ 音乐：上报值长期冻结，用快照时间对齐起点并本地推进。
+        // 冻结时钟播放器（QQ、网易云）：用快照时间对齐起点并本地推进。
         if new_track {
             self.position_base = Self::aligned_position(pb);
             self.position_base_at = now;
@@ -445,6 +445,23 @@ mod tests {
             s.position_base.abs() < 1e-6,
             "still frozen after 20 seconds"
         );
+    }
+
+    #[tokio::test]
+    async fn netease_frozen_report_advances_local_clock() {
+        // 网易云实测：ElapsedTime 冻结在切歌后的某值（如 61.05），timestamp 也
+        // 不更新。本地时钟必须继续推进，歌词才会跟着走。
+        let mut pb = make_pb(61.05, true);
+        pb.bundle_id = Some("com.netease.163music".into());
+        let mut s = primed(&pb, 61.05, 61.05, true);
+        s.position_base_at = Instant::now() - Duration::from_secs(30);
+        s.update_clock(&pb);
+        assert!(
+            (s.position_base - 61.05).abs() < 1e-6,
+            "a frozen Netease report is not a seek"
+        );
+        let pos = s.position(&pb);
+        assert!(pos >= 90.0, "local clock must advance past frozen 61s: {pos}");
     }
 
     #[tokio::test]

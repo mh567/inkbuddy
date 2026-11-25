@@ -24,6 +24,7 @@ const CACHE_KEY_FIELD_LIMIT: usize = 256;
 fn strategy_name(strategy: LyricStrategy) -> &'static str {
     match strategy {
         LyricStrategy::QqFirst => "qq",
+        LyricStrategy::NeteaseFirst => "netease",
         LyricStrategy::Race => "race",
     }
 }
@@ -251,6 +252,75 @@ fn qq_score(
     score
 }
 
+/// 给网易云搜索结果打分。字段与 QQ 不同：歌手在 `ar` 数组，时长 `dt` 是毫秒。
+fn netease_score(
+    song: &serde_json::Value,
+    artist: &str,
+    title: &str,
+    album: &str,
+    duration: f64,
+) -> i32 {
+    let song_name = song
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(norm_lower)
+        .unwrap_or_default();
+    let t_title = norm_lower(title);
+    let mut score = 0;
+
+    if !song_name.is_empty() && !t_title.is_empty() {
+        if song_name == t_title {
+            score += 55;
+        } else if t_title.contains(song_name.as_str()) || song_name.contains(t_title.as_str()) {
+            score += 45;
+        }
+    }
+
+    let t_artist = norm_lower(artist);
+    let artist_match = song
+        .get("ar")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter().any(|a| {
+                let name = a
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(norm_lower)
+                    .unwrap_or_default();
+                !name.is_empty()
+                    && !t_artist.is_empty()
+                    && (t_artist.contains(name.as_str()) || name.contains(t_artist.as_str()))
+            })
+        })
+        .unwrap_or(false);
+    if artist_match {
+        score += 40;
+    }
+
+    let t_album = norm_lower(album);
+    if !t_album.is_empty() {
+        let song_album = song
+            .pointer("/al/name")
+            .and_then(|v| v.as_str())
+            .map(norm_lower)
+            .unwrap_or_default();
+        if !song_album.is_empty()
+            && (t_album.contains(song_album.as_str()) || song_album.contains(t_album.as_str()))
+        {
+            score += 20;
+        }
+    }
+
+    // 网易云时长是毫秒。
+    if duration > 0.0 {
+        let song_dur = song.get("dt").and_then(|v| v.as_f64()).unwrap_or(0.0) / 1000.0;
+        if song_dur > 0.0 && (song_dur - duration).abs() <= 3.0 {
+            score += 20;
+        }
+    }
+    score
+}
+
 impl LyricsSource {
     pub fn new(cache_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&cache_dir)?;
@@ -371,6 +441,24 @@ impl LyricsSource {
                     .await
                     .filter(|s| !s.lines.is_empty())
             }
+            // 网易云优先：与桌面客户端同一曲库，取不到依次退到 QQ、LRCLIB。
+            LyricStrategy::NeteaseFirst => {
+                if let Some(s) = self.fetch_netease(artist, title, album, duration).await {
+                    if !s.lines.is_empty() {
+                        debug!(artist = %artist, title = %title, "using Netease lyrics");
+                        return Some(s);
+                    }
+                }
+                if let Some(s) = self.fetch_qq(artist, title, album, duration, false).await {
+                    if !s.lines.is_empty() {
+                        debug!(artist = %artist, title = %title, "using QQ lyrics (Netease fallback)");
+                        return Some(s);
+                    }
+                }
+                self.fetch_lrclib(artist, title)
+                    .await
+                    .filter(|s| !s.lines.is_empty())
+            }
             // 两个来源同时发请求，先用先返回的有效歌词。
             LyricStrategy::Race => {
                 self.fetch_race(artist, title, album, duration).await
@@ -438,6 +526,100 @@ impl LyricsSource {
                 None
             }
         }
+    }
+
+    // -- Netease Cloud Music ------------------------------------------------
+
+    /// 搜索网易云曲库，返回分数最高的歌曲 id。分数过低时返回 None，避免伴奏、
+    /// 翻唱、现场版盖过正确版本。`dt` 是毫秒。
+    async fn netease_search(
+        &self,
+        artist: &str,
+        title: &str,
+        album: &str,
+        duration: f64,
+    ) -> Option<i64> {
+        let keyword = format!("{artist} {title}");
+        let builder = self
+            .http
+            .get("https://music.163.com/api/cloudsearch/pc")
+            .query(&[
+                ("s", keyword.as_str()),
+                ("type", "1"),
+                ("offset", "0"),
+                ("limit", "10"),
+            ])
+            .header("Referer", "https://music.163.com/");
+        let v = self.fetch_json(builder, "netease.search").await?;
+        let list = match v.pointer("/result/songs").and_then(|x| x.as_array()) {
+            Some(l) if !l.is_empty() => l,
+            _ => {
+                debug!(artist = %artist, title = %title, "Netease search returned no songs");
+                return None;
+            }
+        };
+
+        let mut best: Option<(usize, i32)> = None;
+        for (i, song) in list.iter().enumerate() {
+            let s = netease_score(song, artist, title, album, duration);
+            if best.map(|(_, bs)| s > bs).unwrap_or(true) {
+                best = Some((i, s));
+            }
+        }
+        let (idx, score) = best?;
+        if score < QQ_MIN_SCORE {
+            debug!(artist = %artist, title = %title, score = %score, "Netease best match below threshold");
+            return None;
+        }
+        let id = list[idx].get("id")?.as_i64()?;
+        if id == 0 {
+            return None;
+        }
+        debug!(artist = %artist, title = %title, score = %score, id = %id, "Netease best match selected");
+        Some(id)
+    }
+
+    /// 取网易云歌词。返回的 `lrc.lyric` 是 LRC 文本，直接复用 `parse_lrc`；
+    /// 网易云没有粤拼，roma_lines 留空。
+    async fn fetch_netease(
+        &self,
+        artist: &str,
+        title: &str,
+        album: &str,
+        duration: f64,
+    ) -> Option<CachedSong> {
+        let id = self.netease_search(artist, title, album, duration).await?;
+        let id_str = id.to_string();
+        let builder = self
+            .http
+            .get("https://music.163.com/api/song/lyric")
+            .query(&[
+                ("id", id_str.as_str()),
+                ("lv", "1"),
+                ("kv", "1"),
+                ("tv", "-1"),
+            ])
+            .header("Referer", "https://music.163.com/");
+        let v = self.fetch_json(builder, "netease.lyric").await?;
+        let lrc = match v.pointer("/lrc/lyric").and_then(|x| x.as_str()) {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                debug!(id = %id, "netease.lyric: response has no 'lrc.lyric' field");
+                return None;
+            }
+        };
+        let lines = parse_lrc(lrc);
+        if lines.is_empty() {
+            return None;
+        }
+        Some(CachedSong {
+            artist: artist.to_string(),
+            title: title.to_string(),
+            source: "netease".to_string(),
+            lines,
+            roma_lines: Vec::new(),
+            roma_checked: true,
+        })
     }
 
     // -- QQ Music -----------------------------------------------------------
@@ -923,8 +1105,54 @@ mod tests {
         assert_ne!(p1, p3, "different songs must not overwrite each other");
         assert_eq!(p1, source.cache_path(LyricStrategy::QqFirst, "Artist", "Song"));
         let race = source.cache_path(LyricStrategy::Race, "Artist", "Song");
+        let netease = source.cache_path(LyricStrategy::NeteaseFirst, "Artist", "Song");
         assert_ne!(p1, race, "strategies must not share a cache entry");
+        assert_ne!(p1, netease, "Netease strategy needs its own cache entry");
+        assert_ne!(race, netease, "Netease and race must not share a cache entry");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn netease_score_picks_exact_version_and_rejects_accompaniment() {
+        // 字段结构与实测一致：ar 数组是歌手，dt 是毫秒。
+        let parse = |json: &str| -> serde_json::Value { serde_json::from_str(json).unwrap() };
+        let exact = parse(
+            r#"{"id":3461001565,"name":"慌啥子嘛","ar":[{"name":"赵本山"}],
+                "al":{"name":"慌啥子嘛 (赵本山版)"},"dt":189767}"#,
+        );
+        let accompaniment = parse(
+            r#"{"id":3461001566,"name":"慌啥子嘛 (赵本山版)(伴奏)","ar":[{"name":"赵本山"}],
+                "al":{"name":"慌啥子嘛 (赵本山版)"},"dt":189767}"#,
+        );
+        let s_exact = netease_score(&exact, "赵本山", "慌啥子嘛", "慌啥子嘛 (赵本山版)", 189.8);
+        let s_acc = netease_score(&accompaniment, "赵本山", "慌啥子嘛", "慌啥子嘛 (赵本山版)", 189.8);
+        assert!(s_exact > s_acc, "exact title must outscore accompaniment: {s_exact} vs {s_acc}");
+        assert!(s_exact >= QQ_MIN_SCORE, "exact match passes threshold: {s_exact}");
+    }
+
+    #[test]
+    fn netease_score_uses_millisecond_duration() {
+        // dt 是毫秒，换算后与播放器上报的秒对得上才加分。
+        let song: serde_json::Value = serde_json::from_str(
+            r#"{"name":"慌啥子嘛","ar":[{"name":"赵本山"}],"dt":189767}"#,
+        )
+        .unwrap();
+        let with_match = netease_score(&song, "赵本山", "慌啥子嘛", "", 189.8);
+        let with_mismatch = netease_score(&song, "赵本山", "慌啥子嘛", "", 100.0);
+        assert!(
+            with_match - with_mismatch >= 20,
+            "duration within 3s must add 20 points: {with_match} vs {with_mismatch}"
+        );
+    }
+
+    #[test]
+    fn netease_lrc_parses_into_synced_lines() {
+        // 网易云 lrc.lyric 带制作人信息行，parse_lrc 把它们当作带时间戳的行保留。
+        let lrc = "[00:00.00] 演唱 : 赵本山\n[00:10.50] 第一句歌词\n[00:13.00] 第二句歌词";
+        let lines = parse_lrc(lrc);
+        assert_eq!(lines.len(), 3);
+        assert!((lines[1].0 - 10.5).abs() < 1e-6);
+        assert_eq!(lines[1].1, "第一句歌词");
     }
 
     #[test]
