@@ -1,11 +1,11 @@
 #!/bin/sh
 # 构建 macOS 菜单栏 app（InkBuddy.app）
-# 用法：./scripts/build-macos-app.sh [版本号，默认 0.3.4]
+# 用法：./scripts/build-macos-app.sh [版本号，默认 0.3.5]
 # 依赖：Rust 工具链、Swift 编译器（Xcode CLT）、可选 rsvg-convert（重新渲染菜单栏图标）
 set -e
 cd "$(dirname "$0")/.."
 
-VERSION="${1:-0.3.4}"
+VERSION="${1:-0.3.5}"
 APP_NAME=InkBuddy
 BUILD_DIR=build-app
 APP="$BUILD_DIR/$APP_NAME.app"
