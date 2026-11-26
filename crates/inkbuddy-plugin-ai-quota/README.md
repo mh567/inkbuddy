@@ -1,6 +1,6 @@
 # AI 额度插件（inkbuddy-plugin-ai-quota）
 
-在墨水屏上显示本机 Codex CLI 账号的套餐和额度用量。插件 id 为 `ai-quota`，安装后的清单在 `plugins/ai-quota/plugin.toml`。默认为关闭，用 `?plugins=ai-quota` 参数、视图（在 macOS app 里把 AI 额度加进视图）或 `default_on = true` 启用。
+在墨水屏上显示本机 Codex CLI 账号的套餐和额度用量。插件 id 为 `ai-quota`，安装后的清单在 `plugins/ai-quota/plugin.toml`。`scripts/install.sh` 与 `scripts/build-macos-app.sh` 会检测本机有没有 `codex`：检测到就写 `default_on = true`，随展示页一起显示；没检测到就写 `false`。两种情况下都可以用 `?plugins=ai-quota` 参数，或把 `default_on` 改成 `true` 来启用。
 
 ## 显示内容
 
@@ -35,12 +35,12 @@
 ```toml
 [runtime]
 enabled = true
-default_on = false
+default_on = true
 timeout_ms = 8000
 args = []
 ```
 
-`timeout_ms` 建议 8000：首次启动 app-server 并读取约需 2 秒，留出余量。`args` 保持为空。令牌和登录状态由 Codex CLI 自己管理，插件只读 app-server 返回的账号与额度字段。
+`default_on` 决定不带 `?plugins=` 参数时这块出不出现，仓库里的清单写 `true`，安装与打包脚本按本机有没有 `codex` 覆盖它。`timeout_ms` 建议 8000：首次启动 app-server 并读取约需 2 秒，留出余量。`args` 保持为空。令牌和登录状态由 Codex CLI 自己管理，插件只读 app-server 返回的账号与额度字段。
 
 ## 失败提示
 

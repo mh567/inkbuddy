@@ -7,6 +7,6 @@ command = "../../target/release/inkbuddy-plugin-ai-quota"
 
 [runtime]
 enabled = true
-default_on = false
+default_on = true
 timeout_ms = 8000
 args = []

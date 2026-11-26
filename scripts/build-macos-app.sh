@@ -93,7 +93,15 @@ timeout_ms = 2000
 args = []
 EOF
 
-cat > "$RESDIR/plugins/ai-quota/plugin.toml" <<'EOF'
+# ai-quota 读的是本机 Codex CLI。没装 Codex 时开着它，裸页面会一直挂着
+# 一行「未找到 Codex CLI」，所以打包时按有没有 codex 决定默认值。
+if command -v codex >/dev/null 2>&1 || [ -x "$HOME/.local/bin/codex" ]; then
+  AI_QUOTA_DEFAULT_ON=true
+else
+  AI_QUOTA_DEFAULT_ON=false
+fi
+
+cat > "$RESDIR/plugins/ai-quota/plugin.toml" <<EOF
 [plugin]
 id = "ai-quota"
 name = "AI 额度"
@@ -103,7 +111,7 @@ command = "./inkbuddy-plugin-ai-quota"
 
 [runtime]
 enabled = true
-default_on = false
+default_on = $AI_QUOTA_DEFAULT_ON
 timeout_ms = 8000
 args = []
 EOF
