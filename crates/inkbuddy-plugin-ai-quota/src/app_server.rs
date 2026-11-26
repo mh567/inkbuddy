@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -15,7 +15,9 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::model::QuotaSnapshot;
-use crate::rpc::{apply_account, apply_rate_limits, parse_message, RpcMessage};
+use crate::rpc::{
+    apply_account, apply_rate_limits, is_auth_error, parse_message, RpcMessage, LOGIN_REQUIRED,
+};
 
 /// 单次 JSON-RPC 请求的等待上限。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -23,6 +25,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// 连接存活超过这个时长后，下次重连从最短退避重新开始。
+const STABLE_SESSION: Duration = Duration::from_secs(30);
+/// 轮询间隔下限，避免 0 或过小的值造成忙循环。
+const MIN_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 const CLIENT_NAME: &str = "inkbuddy-ai-quota";
 const CLIENT_TITLE: &str = "InkBuddy AI Quota";
@@ -40,6 +46,11 @@ pub fn next_backoff(current: Duration) -> Duration {
     current.saturating_mul(2).min(MAX_BACKOFF)
 }
 
+/// 把轮询间隔钳到下限之上。
+fn clamp_poll_interval(interval: Duration) -> Duration {
+    interval.max(MIN_POLL_INTERVAL)
+}
+
 /// 长驻额度服务；调用方只持有 `watch` 接收端。
 pub struct QuotaService {
     rx: watch::Receiver<QuotaSnapshot>,
@@ -50,6 +61,7 @@ pub struct QuotaService {
 impl QuotaService {
     /// 立刻启动后台任务，不阻塞调用方。
     pub fn start(codex_bin: PathBuf, poll_interval: Duration) -> Self {
+        let poll_interval = clamp_poll_interval(poll_interval);
         let (tx, rx) = watch::channel(QuotaSnapshot::default());
         let (stop, stop_rx) = oneshot::channel();
         let handle = tokio::spawn(run(codex_bin, poll_interval, tx, stop_rx));
@@ -115,6 +127,15 @@ fn publish_failure(tx: &watch::Sender<QuotaSnapshot>, message: &str) {
     let mut snapshot = tx.borrow().clone();
     snapshot.failure = Some(message.to_string());
     let _ = tx.send_replace(snapshot);
+}
+
+/// `account/read` 失败时按错误文本选择给用户看的文案。
+fn account_failure(message: &str) -> &'static str {
+    if is_auth_error(message) {
+        LOGIN_REQUIRED
+    } else {
+        FAILURE_READ
+    }
 }
 
 /// 单次请求的结局。
@@ -188,19 +209,20 @@ async fn run_session(
             };
         }
     };
+    let started = Instant::now();
 
     let Some(stdin) = child.stdin.take() else {
         eprintln!("ai-quota: app-server 缺少 stdin 管道");
         publish_failure(tx, FAILURE_READ);
         return SessionEnd::Ended {
-            reset_backoff: false,
+            reset_backoff: started.elapsed() >= STABLE_SESSION,
         };
     };
     let Some(stdout) = child.stdout.take() else {
         eprintln!("ai-quota: app-server 缺少 stdout 管道");
         publish_failure(tx, FAILURE_READ);
         return SessionEnd::Ended {
-            reset_backoff: false,
+            reset_backoff: started.elapsed() >= STABLE_SESSION,
         };
     };
 
@@ -226,21 +248,21 @@ async fn run_session(
             eprintln!("ai-quota: initialize 失败: {message}");
             publish_failure(tx, FAILURE_READ);
             return SessionEnd::Ended {
-                reset_backoff: false,
+                reset_backoff: started.elapsed() >= STABLE_SESSION,
             };
         }
         RequestOutcome::Stopped => return SessionEnd::Stopped,
         RequestOutcome::Failed => {
             publish_failure(tx, FAILURE_READ);
             return SessionEnd::Ended {
-                reset_backoff: false,
+                reset_backoff: started.elapsed() >= STABLE_SESSION,
             };
         }
     }
     if !session.send(&json!({"method": "initialized"})).await {
         publish_failure(tx, FAILURE_READ);
         return SessionEnd::Ended {
-            reset_backoff: false,
+            reset_backoff: started.elapsed() >= STABLE_SESSION,
         };
     }
 
@@ -251,22 +273,22 @@ async fn run_session(
                 // 未登录时不必再读额度；发布失败快照后等用户登录再重连。
                 session.publish();
                 return SessionEnd::Ended {
-                    reset_backoff: false,
+                    reset_backoff: started.elapsed() >= STABLE_SESSION,
                 };
             }
         }
         RequestOutcome::Result(Err(message)) => {
             eprintln!("ai-quota: account/read 失败: {message}");
-            publish_failure(tx, FAILURE_READ);
+            publish_failure(tx, account_failure(&message));
             return SessionEnd::Ended {
-                reset_backoff: false,
+                reset_backoff: started.elapsed() >= STABLE_SESSION,
             };
         }
         RequestOutcome::Stopped => return SessionEnd::Stopped,
         RequestOutcome::Failed => {
             publish_failure(tx, FAILURE_READ);
             return SessionEnd::Ended {
-                reset_backoff: false,
+                reset_backoff: started.elapsed() >= STABLE_SESSION,
             };
         }
     }
@@ -285,14 +307,14 @@ async fn run_session(
             eprintln!("ai-quota: account/rateLimits/read 失败: {message}");
             publish_failure(tx, FAILURE_READ);
             return SessionEnd::Ended {
-                reset_backoff: false,
+                reset_backoff: started.elapsed() >= STABLE_SESSION,
             };
         }
         RequestOutcome::Stopped => return SessionEnd::Stopped,
         RequestOutcome::Failed => {
             publish_failure(tx, FAILURE_READ);
             return SessionEnd::Ended {
-                reset_backoff: false,
+                reset_backoff: started.elapsed() >= STABLE_SESSION,
             };
         }
     }
@@ -306,22 +328,55 @@ async fn run_session(
         tokio::select! {
             _ = &mut *stop => return SessionEnd::Stopped,
             _ = ticker.tick() => {
-                match session.request(next_id, "account/rateLimits/read", json!({}), stop).await {
+                // 先确认账号，再读额度；账号消失说明运行中登出。
+                match session.request(next_id, "account/read", json!({}), stop).await {
                     RequestOutcome::Result(Ok(value)) => {
-                        apply_rate_limits(&mut session.snapshot, &value, unix_now());
-                        session.publish();
                         next_id += 1;
+                        apply_account(&mut session.snapshot, &value, unix_now());
+                        if matches!(value.get("account"), Some(Value::Null)) {
+                            session.publish();
+                            return SessionEnd::Ended {
+                                reset_backoff: started.elapsed() >= STABLE_SESSION,
+                            };
+                        }
+                        match session
+                            .request(next_id, "account/rateLimits/read", json!({}), stop)
+                            .await
+                        {
+                            RequestOutcome::Result(Ok(value)) => {
+                                next_id += 1;
+                                apply_rate_limits(&mut session.snapshot, &value, unix_now());
+                                session.publish();
+                            }
+                            RequestOutcome::Result(Err(message)) => {
+                                eprintln!("ai-quota: 轮询额度失败: {message}");
+                                publish_failure(tx, FAILURE_READ);
+                                return SessionEnd::Ended {
+                                    reset_backoff: started.elapsed() >= STABLE_SESSION,
+                                };
+                            }
+                            RequestOutcome::Stopped => return SessionEnd::Stopped,
+                            RequestOutcome::Failed => {
+                                publish_failure(tx, FAILURE_READ);
+                                return SessionEnd::Ended {
+                                    reset_backoff: started.elapsed() >= STABLE_SESSION,
+                                };
+                            }
+                        }
                     }
                     RequestOutcome::Result(Err(message)) => {
-                        eprintln!("ai-quota: 轮询额度失败: {message}");
-                        publish_failure(tx, FAILURE_READ);
-                        // 首轮已成功过，重连退避回到 1 秒。
-                        return SessionEnd::Ended { reset_backoff: true };
+                        eprintln!("ai-quota: 轮询账号失败: {message}");
+                        publish_failure(tx, account_failure(&message));
+                        return SessionEnd::Ended {
+                            reset_backoff: started.elapsed() >= STABLE_SESSION,
+                        };
                     }
                     RequestOutcome::Stopped => return SessionEnd::Stopped,
                     RequestOutcome::Failed => {
                         publish_failure(tx, FAILURE_READ);
-                        return SessionEnd::Ended { reset_backoff: true };
+                        return SessionEnd::Ended {
+                            reset_backoff: started.elapsed() >= STABLE_SESSION,
+                        };
                     }
                 }
             }
@@ -331,17 +386,20 @@ async fn run_session(
                         RpcMessage::Notification { method, params } => {
                             session.apply_notification(&method, &params);
                         }
+                        RpcMessage::Request { id, method } => {
+                            session.reject_request(id, &method).await;
+                        }
                         RpcMessage::Response { .. } | RpcMessage::Unknown => {}
                     },
                     Ok(None) => {
                         eprintln!("ai-quota: app-server 已退出");
                         publish_failure(tx, FAILURE_READ);
-                        return SessionEnd::Ended { reset_backoff: true };
+                        return SessionEnd::Ended { reset_backoff: started.elapsed() >= STABLE_SESSION };
                     }
                     Err(err) => {
                         eprintln!("ai-quota: 读取 app-server 输出失败: {err}");
                         publish_failure(tx, FAILURE_READ);
-                        return SessionEnd::Ended { reset_backoff: true };
+                        return SessionEnd::Ended { reset_backoff: started.elapsed() >= STABLE_SESSION };
                     }
                 }
             }
@@ -382,6 +440,18 @@ impl Session<'_> {
 
     fn publish(&self) {
         let _ = self.tx.send_replace(self.snapshot.clone());
+    }
+
+    /// 对 app-server 主动发来的请求回「方法不支持」，避免对方一直等待。
+    async fn reject_request(&mut self, id: u64, method: &str) {
+        let response = json!({
+            "id": id,
+            "error": {
+                "code": -32601,
+                "message": format!("method not supported: {method}"),
+            }
+        });
+        let _ = self.send(&response).await;
     }
 
     fn apply_notification(&mut self, method: &str, params: &Value) {
@@ -438,6 +508,9 @@ impl Session<'_> {
                     result,
                 } if response_id == id => return RequestOutcome::Result(result),
                 RpcMessage::Response { .. } | RpcMessage::Unknown => {}
+                RpcMessage::Request { id, method } => {
+                    self.reject_request(id, &method).await;
+                }
                 RpcMessage::Notification { method, params } => {
                     self.apply_notification(&method, &params);
                 }
@@ -462,5 +535,22 @@ mod tests {
     #[test]
     fn next_backoff_starts_at_one_second() {
         assert_eq!(next_backoff(Duration::ZERO), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn clamp_poll_interval_enforces_minimum() {
+        assert_eq!(clamp_poll_interval(Duration::ZERO), Duration::from_secs(5));
+        assert_eq!(
+            clamp_poll_interval(Duration::from_millis(500)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            clamp_poll_interval(Duration::from_secs(1)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            clamp_poll_interval(Duration::from_secs(60)),
+            Duration::from_secs(60)
+        );
     }
 }

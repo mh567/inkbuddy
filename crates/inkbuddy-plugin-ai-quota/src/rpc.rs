@@ -17,6 +17,8 @@ pub enum RpcMessage {
     },
     /// 不带 id 的通知。
     Notification { method: String, params: Value },
+    /// app-server 主动发来的请求，需要按协议回错误或结果。
+    Request { id: u64, method: String },
     /// 非法 JSON、缺字段或无法识别的消息。
     Unknown,
 }
@@ -38,7 +40,13 @@ pub fn parse_message(line: &str) -> RpcMessage {
                 result: Err(error_text(error)),
             };
         }
-        return RpcMessage::Unknown;
+        return match value.get("method").and_then(Value::as_str) {
+            Some(method) => RpcMessage::Request {
+                id,
+                method: method.to_string(),
+            },
+            None => RpcMessage::Unknown,
+        };
     }
     match value.get("method").and_then(Value::as_str) {
         Some(method) => RpcMessage::Notification {
@@ -47,6 +55,14 @@ pub fn parse_message(line: &str) -> RpcMessage {
         },
         None => RpcMessage::Unknown,
     }
+}
+
+/// 判断错误文本是否属于鉴权/登录问题，用于区分「未登录」与普通读取失败。
+pub fn is_auth_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    ["auth", "login", "unauthor", "401", "token"]
+        .iter()
+        .any(|needle| lower.contains(needle))
 }
 
 /// `error` 可能是字符串或 `{message: "..."}` 对象，取其中的可读文本。
@@ -105,9 +121,23 @@ fn classify_window(duration_mins: i64) -> Option<WindowKind> {
     }
 }
 
+/// 解析百分比：兼容整数、浮点与数字字符串。
+fn percent(value: &Value) -> Option<i64> {
+    if let Some(value) = value.as_i64() {
+        return Some(value);
+    }
+    if let Some(value) = value.as_f64() {
+        return Some(value.round() as i64);
+    }
+    value
+        .as_str()
+        .and_then(|text| text.trim().parse::<f64>().ok())
+        .map(|value| value.round() as i64)
+}
+
 fn window_from_value(value: &Value) -> Option<QuotaWindow> {
     // 没有 usedPercent 的窗口视为无效，不覆盖已有数据。
-    let used_percent = value.get("usedPercent")?.as_i64()?;
+    let used_percent = percent(value.get("usedPercent")?)?;
     Some(QuotaWindow {
         used_percent: used_percent.clamp(0, 100) as u32,
         resets_at: value.get("resetsAt").and_then(Value::as_i64),
@@ -132,6 +162,10 @@ pub fn apply_rate_limits(snapshot: &mut QuotaSnapshot, value: &Value, now: i64) 
     };
     let primary = limits.get("primary").and_then(window_from_value);
     let secondary = limits.get("secondary").and_then(window_from_value);
+    // 空的 rateLimits 不构成一次成功读取，避免清掉失败原因或刷新时间。
+    if primary.is_none() && secondary.is_none() {
+        return;
+    }
 
     let primary_kind = primary
         .as_ref()
@@ -219,6 +253,79 @@ mod tests {
             }
             other => panic!("expected response, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_message_reads_server_request() {
+        match parse_message(r#"{"id":900,"method":"item/approval/request"}"#) {
+            RpcMessage::Request { id, method } => {
+                assert_eq!(id, 900);
+                assert_eq!(method, "item/approval/request");
+            }
+            other => panic!("expected request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_auth_error_matches_auth_related_messages() {
+        for message in [
+            "unauthorized",
+            "Please login first",
+            "AUTH failed",
+            "HTTP 401",
+            "invalid token",
+        ] {
+            assert!(is_auth_error(message), "should match: {message}");
+        }
+        assert!(!is_auth_error("bad params"));
+        assert!(!is_auth_error("internal error"));
+    }
+
+    #[test]
+    fn percent_accepts_int_float_and_string() {
+        assert_eq!(percent(&json!(37)), Some(37));
+        assert_eq!(percent(&json!(37.0)), Some(37));
+        assert_eq!(percent(&json!("37")), Some(37));
+        assert_eq!(percent(&json!(37.5)), Some(38));
+        assert_eq!(percent(&json!("37.5")), Some(38));
+        assert_eq!(percent(&json!(null)), None);
+        assert_eq!(percent(&json!("not a number")), None);
+    }
+
+    #[test]
+    fn apply_rate_limits_accepts_float_and_string_used_percent() {
+        let mut snapshot = QuotaSnapshot::default();
+        let value = json!({
+            "rateLimits": {
+                "primary": {"usedPercent": 37.5, "windowDurationMins": 300},
+                "secondary": {"usedPercent": "51", "windowDurationMins": 10080}
+            }
+        });
+
+        apply_rate_limits(&mut snapshot, &value, 1);
+
+        assert_eq!(snapshot.five_hour.map(|w| w.used_percent), Some(38));
+        assert_eq!(snapshot.weekly.map(|w| w.used_percent), Some(51));
+    }
+
+    #[test]
+    fn apply_rate_limits_empty_keeps_previous_snapshot() {
+        let before = QuotaSnapshot {
+            plan: Some("plus".to_string()),
+            five_hour: Some(QuotaWindow {
+                used_percent: 10,
+                ..QuotaWindow::default()
+            }),
+            reset_credits: Some(3),
+            updated_at: Some(10),
+            failure: Some("旧错误".to_string()),
+            ..QuotaSnapshot::default()
+        };
+        let mut snapshot = before.clone();
+
+        apply_rate_limits(&mut snapshot, &json!({"rateLimits": {}}), 20);
+
+        assert_eq!(snapshot, before);
     }
 
     #[test]

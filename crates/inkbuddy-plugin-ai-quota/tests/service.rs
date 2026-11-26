@@ -6,21 +6,29 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use inkbuddy_plugin_ai_quota::app_server::QuotaService;
+use inkbuddy_plugin_ai_quota::rpc::LOGIN_REQUIRED;
 
 /// 假 app-server 脚本；`@MODE@` 控制 account/read 与是否推送额度通知。
 const SCRIPT: &str = r#"#!/usr/bin/env python3
 import json
+import os
 import sys
 
 MODE = "@MODE@"
 updated_sent = False
+MARKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saw_account")
 
 
 def send(message):
     sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+
+def write_noise():
+    sys.stdout.write("not json\n")
     sys.stdout.flush()
 
 
@@ -39,6 +47,13 @@ def rate_limits(primary, secondary):
     }
 
 
+def account_result():
+    return {
+        "account": {"type": "chatgpt", "email": "user@example.com", "planType": "plus"},
+        "requiresOpenaiAuth": False,
+    }
+
+
 for raw in sys.stdin:
     raw = raw.strip()
     if not raw:
@@ -51,16 +66,23 @@ for raw in sys.stdin:
     request_id = message.get("id")
     if method == "initialize":
         send({"id": request_id, "result": {}})
+        if MODE == "noise":
+            write_noise()
     elif method == "initialized":
-        continue
+        if MODE == "server_request":
+            send({"id": 900, "method": "item/approval/request", "params": {}})
     elif method == "account/read":
-        if MODE == "unauthenticated":
+        if MODE == "auth_error":
+            send({"id": request_id, "error": {"message": "unauthorized"}})
+        elif MODE == "unauthenticated":
+            send({"id": request_id, "result": {"account": None, "requiresOpenaiAuth": True}})
+        elif MODE == "logout" and os.path.exists(MARKER):
             send({"id": request_id, "result": {"account": None, "requiresOpenaiAuth": True}})
         else:
-            send({"id": request_id, "result": {
-                "account": {"type": "chatgpt", "email": "user@example.com", "planType": "plus"},
-                "requiresOpenaiAuth": False,
-            }})
+            if MODE == "logout":
+                with open(MARKER, "w") as marker:
+                    marker.write("1")
+            send({"id": request_id, "result": account_result()})
     elif method == "account/rateLimits/read":
         send({"id": request_id, "result": rate_limits(window(0, 300), window(51, 10080))})
         if MODE == "notify" and not updated_sent:
@@ -107,6 +129,17 @@ fn fake_codex(mode: &str) -> FakeCodex {
     FakeCodex { dir, bin }
 }
 
+/// 关闭服务并断言 2 秒内收尾。
+async fn shutdown_quickly(service: QuotaService) {
+    let started = Instant::now();
+    service.shutdown().await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "shutdown 耗时 {elapsed:?}"
+    );
+}
+
 #[tokio::test]
 async fn service_reads_plan_windows_and_credits() {
     let fake = fake_codex("normal");
@@ -125,7 +158,7 @@ async fn service_reads_plan_windows_and_credits() {
     assert!(snapshot.updated_at.unwrap_or(0) > 0, "updated_at 应被填充");
     assert_eq!(snapshot.failure, None);
 
-    service.shutdown().await;
+    shutdown_quickly(service).await;
 }
 
 #[tokio::test]
@@ -151,7 +184,7 @@ async fn service_applies_rate_limit_notification_without_polling() {
     .expect("3 秒内应通过通知看到周用量 77%");
 
     assert_eq!(updated.weekly.map(|w| w.used_percent), Some(77));
-    service.shutdown().await;
+    shutdown_quickly(service).await;
 }
 
 #[tokio::test]
@@ -160,10 +193,76 @@ async fn service_reports_unauthenticated_account() {
     let service = QuotaService::start(fake.bin.clone(), Duration::from_secs(30));
 
     let snapshot = service.wait_first(Duration::from_secs(3)).await;
-    let failure = snapshot.failure.unwrap_or_default();
-    assert!(failure.contains("未登录"), "unexpected failure: {failure}");
+    assert_eq!(snapshot.failure.as_deref(), Some(LOGIN_REQUIRED));
 
-    service.shutdown().await;
+    shutdown_quickly(service).await;
+}
+
+#[tokio::test]
+async fn service_reports_auth_error_as_login_required() {
+    let fake = fake_codex("auth_error");
+    let service = QuotaService::start(fake.bin.clone(), Duration::from_secs(30));
+
+    let snapshot = service.wait_first(Duration::from_secs(3)).await;
+    assert_eq!(snapshot.failure.as_deref(), Some(LOGIN_REQUIRED));
+
+    shutdown_quickly(service).await;
+}
+
+#[tokio::test]
+async fn service_ignores_noise_lines() {
+    let fake = fake_codex("noise");
+    let service = QuotaService::start(fake.bin.clone(), Duration::from_secs(30));
+
+    let snapshot = service.wait_first(Duration::from_secs(5)).await;
+
+    assert_eq!(snapshot.plan.as_deref(), Some("plus"));
+    assert_eq!(snapshot.five_hour.map(|w| w.used_percent), Some(0));
+    assert_eq!(snapshot.weekly.map(|w| w.used_percent), Some(51));
+    assert_eq!(snapshot.failure, None);
+
+    shutdown_quickly(service).await;
+}
+
+#[tokio::test]
+async fn service_rejects_server_request_and_keeps_reading() {
+    let fake = fake_codex("server_request");
+    let service = QuotaService::start(fake.bin.clone(), Duration::from_secs(30));
+
+    let snapshot = service.wait_first(Duration::from_secs(5)).await;
+
+    assert_eq!(snapshot.plan.as_deref(), Some("plus"));
+    assert_eq!(snapshot.weekly.map(|w| w.used_percent), Some(51));
+    assert_eq!(snapshot.failure, None);
+
+    shutdown_quickly(service).await;
+}
+
+#[tokio::test]
+async fn service_notices_logout_while_running() {
+    let fake = fake_codex("logout");
+    let service = QuotaService::start(fake.bin.clone(), Duration::from_secs(5));
+
+    let first = service.wait_first(Duration::from_secs(5)).await;
+    assert_eq!(first.plan.as_deref(), Some("plus"));
+    assert_eq!(first.failure, None);
+
+    let mut rx = service.snapshot();
+    let failed = tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            if rx.borrow().failure.as_deref() == Some(LOGIN_REQUIRED) {
+                return rx.borrow().clone();
+            }
+            if rx.changed().await.is_err() {
+                return rx.borrow().clone();
+            }
+        }
+    })
+    .await
+    .expect("12 秒内应发现运行中登出");
+
+    assert_eq!(failed.failure.as_deref(), Some(LOGIN_REQUIRED));
+    shutdown_quickly(service).await;
 }
 
 #[tokio::test]
@@ -181,11 +280,7 @@ async fn service_reports_missing_binary() {
     let service = QuotaService::start(missing, Duration::from_secs(30));
     let snapshot = service.wait_first(Duration::from_secs(3)).await;
 
-    let failure = snapshot.failure.unwrap_or_default();
-    assert!(
-        failure.contains("Codex") || failure.contains("额度读取失败"),
-        "unexpected failure: {failure}"
-    );
+    assert_eq!(snapshot.failure.as_deref(), Some("未找到 Codex CLI"));
 
-    service.shutdown().await;
+    shutdown_quickly(service).await;
 }
