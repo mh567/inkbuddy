@@ -1,14 +1,44 @@
 //! 端到端验证协议循环：describe、未知方法回失败响应、shutdown 后退出。
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread;
 use std::time::{Duration, Instant};
 
-/// 读一行响应并解析成 JSON。
-fn read_reply(reader: &mut BufReader<ChildStdout>) -> serde_json::Value {
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("read response line");
-    serde_json::from_str(line.trim()).expect("response is valid JSON")
+const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 起一个线程逐行读 stdout，用 channel 把行交回主线程。
+///
+/// 主线程据此可以用 `recv_timeout` 等待；插件"活着但不回"时测试会失败，
+/// 而不是像直接阻塞 `read_line` 那样把 CI 挂住。
+fn spawn_line_reader(stdout: ChildStdout) -> Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    rx
+}
+
+/// 在超时内读一条响应并解析成 JSON；超时或提前 EOF 都直接让测试失败。
+fn recv_reply(replies: &Receiver<String>) -> serde_json::Value {
+    match replies.recv_timeout(REPLY_TIMEOUT) {
+        Ok(line) => serde_json::from_str(line.trim()).expect("response is valid JSON"),
+        Err(RecvTimeoutError::Timeout) => panic!("等待响应超时：插件可能不回响应"),
+        Err(RecvTimeoutError::Disconnected) => panic!("插件在回响应前关闭了 stdout"),
+    }
 }
 
 #[test]
@@ -21,13 +51,12 @@ fn answers_unknown_method_and_exits_on_shutdown() {
         .expect("spawn plugin");
 
     let mut stdin = child.stdin.take().expect("stdin pipe");
-    let stdout = child.stdout.take().expect("stdout pipe");
-    let mut reader = BufReader::new(stdout);
+    let replies = spawn_line_reader(child.stdout.take().expect("stdout pipe"));
 
     // describe：带回 id，并返回插件 id 与名称。
     writeln!(stdin, r#"{{"id":1,"method":"describe"}}"#).expect("write describe");
     stdin.flush().expect("flush");
-    let reply = read_reply(&mut reader);
+    let reply = recv_reply(&replies);
     assert_eq!(reply["id"].as_u64(), Some(1));
     assert_eq!(reply["ok"].as_bool(), Some(true));
     assert_eq!(reply["result"]["id"].as_str(), Some("ai-quota"));
@@ -36,7 +65,7 @@ fn answers_unknown_method_and_exits_on_shutdown() {
     // 未知方法：id 原样带回、ok=false，且进程不退出。
     writeln!(stdin, r#"{{"id":9,"method":"future_method"}}"#).expect("write unknown");
     stdin.flush().expect("flush");
-    let reply = read_reply(&mut reader);
+    let reply = recv_reply(&replies);
     assert_eq!(reply["id"].as_u64(), Some(9));
     assert_eq!(reply["ok"].as_bool(), Some(false));
     assert!(
@@ -47,7 +76,7 @@ fn answers_unknown_method_and_exits_on_shutdown() {
     // shutdown：回 ok 后进程退出。
     writeln!(stdin, r#"{{"id":2,"method":"shutdown"}}"#).expect("write shutdown");
     stdin.flush().expect("flush");
-    let reply = read_reply(&mut reader);
+    let reply = recv_reply(&replies);
     assert_eq!(reply["id"].as_u64(), Some(2));
     assert_eq!(reply["ok"].as_bool(), Some(true));
 
@@ -62,11 +91,13 @@ fn answers_unknown_method_and_exits_on_shutdown() {
             let _ = child.kill();
             panic!("shutdown 后插件未退出");
         }
-        std::thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(20));
     }
 
-    // shutdown 之后 stdout 应到达 EOF，没有多余输出。
-    let mut rest = String::new();
-    reader.read_to_string(&mut rest).expect("read to EOF");
-    assert!(rest.is_empty(), "shutdown 后不应再有输出: {rest:?}");
+    // shutdown 之后 stdout 应到 EOF：读取线程结束、channel 断开，不再有数据。
+    match replies.recv_timeout(REPLY_TIMEOUT) {
+        Err(RecvTimeoutError::Disconnected) => {}
+        Ok(extra) => panic!("shutdown 后不应再有输出: {extra:?}"),
+        Err(RecvTimeoutError::Timeout) => panic!("shutdown 后 stdout 未关闭"),
+    }
 }
