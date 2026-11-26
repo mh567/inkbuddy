@@ -165,12 +165,13 @@
     color: #000000;
   }
 
-  /* 反色：图标翻白，进度条黑白互换，辅助文字推到白灰。 */
+  /* 反色：图标翻白，进度条黑白互换，辅助文字推到白灰，提示文字翻白。 */
   body.invert .quota-mark { filter: invert(1); }
   body.invert .quota-bar { border-color: #ffffff; background: #000000; }
   body.invert .quota-fill { background: #ffffff; }
   body.invert .quota-meta, body.invert .quota-reset,
   body.invert .quota-stale { color: #b0b0b0; }
+  body.invert .quota-notice-text { color: #ffffff; }
   /* 纯黑白：辅助文字推到纯黑；反色时推到纯白。 */
   body.mode-bw .quota-meta, body.mode-bw .quota-reset,
   body.mode-bw .quota-stale { color: #000000; }

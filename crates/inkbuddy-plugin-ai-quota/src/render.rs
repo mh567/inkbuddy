@@ -205,4 +205,88 @@ mod tests {
             assert!(css.contains(&class), "missing {class}");
         }
     }
+
+    /// 从选择器文本里挑出 `.quota-xxx` 形式的类名，去掉开头的点。
+    fn quota_class_names(selector: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let bytes = selector.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'.' {
+                let start = i + 1;
+                let mut end = start;
+                while end < bytes.len()
+                    && (bytes[end].is_ascii_alphanumeric()
+                        || bytes[end] == b'-'
+                        || bytes[end] == b'_')
+                {
+                    end += 1;
+                }
+                let name = &selector[start..end];
+                if name.starts_with("quota-") {
+                    names.push(name.to_string());
+                }
+                i = end.max(i + 1);
+            } else {
+                i += 1;
+            }
+        }
+        names
+    }
+
+    /// 扫描样式表，收集声明体里硬编码了任一给定颜色的额度类名。
+    ///
+    /// 按 `}` 切块，取每块 `{` 前的选择器；选择器含 `.quota` 且声明体含
+    /// `color: <颜色>` 时，把选择器里的额度类名收进来。只用字符串扫描，
+    /// 够处理 `body.invert .a, body.invert .b,` 这样的逗号分组。
+    fn quota_classes_with_colour(css: &str, colours: &[&str]) -> Vec<String> {
+        let mut classes = Vec::new();
+        for block in css.split('}') {
+            let Some((selector, body)) = block.split_once('{') else {
+                continue;
+            };
+            if !selector.contains(".quota") {
+                continue;
+            }
+            if !colours
+                .iter()
+                .any(|colour| body.contains(&format!("color: {colour}")))
+            {
+                continue;
+            }
+            for name in quota_class_names(selector) {
+                if !classes.contains(&name) {
+                    classes.push(name);
+                }
+            }
+        }
+        classes
+    }
+
+    /// 防护契约：额度样式里凡硬编码了黑色的类，反色段必须有同名覆盖；
+    /// 凡硬编码灰阶的类，纯黑白段必须有同名覆盖。漏一个黑字落黑底就看不见。
+    #[test]
+    fn invert_and_bw_styles_cover_every_hardcoded_quota_colour() {
+        let css = include_str!("../../../web/ink.html");
+
+        let black = quota_classes_with_colour(css, &["#000000"]);
+        assert!(
+            !black.is_empty(),
+            "no quota class with color: #000000 found; parser likely broken"
+        );
+        for class in &black {
+            let rule = format!("body.invert .{class}");
+            assert!(css.contains(&rule), "missing {rule}");
+        }
+
+        let grey = quota_classes_with_colour(css, &["#8a8a8a", "#5e5b54"]);
+        assert!(
+            !grey.is_empty(),
+            "no quota class with a grey colour found; parser likely broken"
+        );
+        for class in &grey {
+            let rule = format!("body.mode-bw .{class}");
+            assert!(css.contains(&rule), "missing {rule}");
+        }
+    }
 }
