@@ -58,9 +58,11 @@ pub fn parse_message(line: &str) -> RpcMessage {
 }
 
 /// 判断错误文本是否属于鉴权/登录问题，用于区分「未登录」与普通读取失败。
+///
+/// 只匹配足够具体的措辞，避免把普通错误里的 "auth"、"token" 误判成未登录。
 pub fn is_auth_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    ["auth", "login", "unauthor", "401", "token"]
+    ["unauthor", "login", "401", "authentication"]
         .iter()
         .any(|needle| lower.contains(needle))
 }
@@ -121,17 +123,18 @@ fn classify_window(duration_mins: i64) -> Option<WindowKind> {
     }
 }
 
-/// 解析百分比：兼容整数、浮点与数字字符串。
+/// 解析百分比：兼容整数、浮点与数字字符串；非有限浮点视为无效。
 fn percent(value: &Value) -> Option<i64> {
     if let Some(value) = value.as_i64() {
         return Some(value);
     }
-    if let Some(value) = value.as_f64() {
+    if let Some(value) = value.as_f64().filter(|value| value.is_finite()) {
         return Some(value.round() as i64);
     }
     value
         .as_str()
         .and_then(|text| text.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
         .map(|value| value.round() as i64)
 }
 
@@ -271,14 +274,23 @@ mod tests {
         for message in [
             "unauthorized",
             "Please login first",
-            "AUTH failed",
+            "AUTHENTICATION failed",
             "HTTP 401",
-            "invalid token",
         ] {
             assert!(is_auth_error(message), "should match: {message}");
         }
-        assert!(!is_auth_error("bad params"));
-        assert!(!is_auth_error("internal error"));
+    }
+
+    #[test]
+    fn is_auth_error_ignores_generic_auth_and_token_words() {
+        for message in [
+            "bad params",
+            "internal error",
+            "unexpected token at line 1",
+            "authority check failed",
+        ] {
+            assert!(!is_auth_error(message), "should not match: {message}");
+        }
     }
 
     #[test]
@@ -290,6 +302,13 @@ mod tests {
         assert_eq!(percent(&json!("37.5")), Some(38));
         assert_eq!(percent(&json!(null)), None);
         assert_eq!(percent(&json!("not a number")), None);
+    }
+
+    #[test]
+    fn percent_rejects_non_finite_values() {
+        for value in ["NaN", "inf", "-inf", "Infinity", "-Infinity"] {
+            assert_eq!(percent(&json!(value)), None, "value: {value}");
+        }
     }
 
     #[test]

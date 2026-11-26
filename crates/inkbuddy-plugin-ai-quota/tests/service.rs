@@ -20,6 +20,9 @@ import sys
 MODE = "@MODE@"
 updated_sent = False
 MARKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saw_account")
+SPAWN_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spawns")
+with open(SPAWN_LOG, "a") as spawn_log:
+    spawn_log.write("x\n")
 
 
 def send(message):
@@ -94,6 +97,12 @@ for raw in sys.stdin:
                     "secondary": window(77, 10080),
                 }},
             })
+    # 服务对我们发出的 900 号请求的回应必须带上 -32601；
+    # 用通知回报判定结果，让测试能确认回包内容而不只是「没崩」。
+    if MODE == "server_request" and request_id == 900:
+        error = message.get("error") or {}
+        plan = "reject-ok" if error.get("code") == -32601 else "reject-bad"
+        send({"method": "account/updated", "params": {"planType": plan}})
 "#;
 
 /// 临时目录里的假可执行文件，测试结束删除。
@@ -225,13 +234,28 @@ async fn service_ignores_noise_lines() {
 }
 
 #[tokio::test]
-async fn service_rejects_server_request_and_keeps_reading() {
+async fn service_rejects_server_request_with_method_not_found() {
     let fake = fake_codex("server_request");
     let service = QuotaService::start(fake.bin.clone(), Duration::from_secs(30));
 
-    let snapshot = service.wait_first(Duration::from_secs(5)).await;
+    // 假服务只有在收到 -32601 时才会把 plan 改成 reject-ok；
+    // 看到 reject-ok 才能证明服务确实回了「方法不支持」而不是只没崩。
+    let mut rx = service.snapshot();
+    let snapshot = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let current = rx.borrow().clone();
+            if current.plan.as_deref() == Some("reject-ok") && current.weekly.is_some() {
+                return current;
+            }
+            if rx.changed().await.is_err() {
+                return rx.borrow().clone();
+            }
+        }
+    })
+    .await
+    .expect("5 秒内应收到 reject-ok 与额度数据");
 
-    assert_eq!(snapshot.plan.as_deref(), Some("plus"));
+    assert_eq!(snapshot.plan.as_deref(), Some("reject-ok"));
     assert_eq!(snapshot.weekly.map(|w| w.used_percent), Some(51));
     assert_eq!(snapshot.failure, None);
 
@@ -262,6 +286,17 @@ async fn service_notices_logout_while_running() {
     .expect("12 秒内应发现运行中登出");
 
     assert_eq!(failed.failure.as_deref(), Some(LOGIN_REQUIRED));
+
+    // 运行中登出只发布状态、不结束连接；再多等一个轮询周期，
+    // 假服务进程仍应只启动过这一次。
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let spawns = fs::read_to_string(fake.dir.join("spawns")).expect("读取 spawn 日志");
+    assert_eq!(
+        spawns.lines().count(),
+        1,
+        "登出后不应反复重启 app-server"
+    );
+
     shutdown_quickly(service).await;
 }
 

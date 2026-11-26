@@ -51,6 +51,11 @@ fn clamp_poll_interval(interval: Duration) -> Duration {
     interval.max(MIN_POLL_INTERVAL)
 }
 
+/// 连接是否已稳定存活到足以重置退避。
+fn is_stable(elapsed: Duration) -> bool {
+    elapsed >= STABLE_SESSION
+}
+
 /// 长驻额度服务；调用方只持有 `watch` 接收端。
 pub struct QuotaService {
     rx: watch::Receiver<QuotaSnapshot>,
@@ -152,7 +157,7 @@ enum RequestOutcome {
 enum SessionEnd {
     /// 收到 stop 信号。
     Stopped,
-    /// 连接结束；`reset_backoff` 表示结束前读到过完整数据，用于重置退避。
+    /// 连接结束；`reset_backoff` 表示连接存活 ≥30 秒，用于重置退避。
     Ended { reset_backoff: bool },
 }
 
@@ -215,14 +220,14 @@ async fn run_session(
         eprintln!("ai-quota: app-server 缺少 stdin 管道");
         publish_failure(tx, FAILURE_READ);
         return SessionEnd::Ended {
-            reset_backoff: started.elapsed() >= STABLE_SESSION,
+            reset_backoff: is_stable(started.elapsed()),
         };
     };
     let Some(stdout) = child.stdout.take() else {
         eprintln!("ai-quota: app-server 缺少 stdout 管道");
         publish_failure(tx, FAILURE_READ);
         return SessionEnd::Ended {
-            reset_backoff: started.elapsed() >= STABLE_SESSION,
+            reset_backoff: is_stable(started.elapsed()),
         };
     };
 
@@ -248,21 +253,21 @@ async fn run_session(
             eprintln!("ai-quota: initialize 失败: {message}");
             publish_failure(tx, FAILURE_READ);
             return SessionEnd::Ended {
-                reset_backoff: started.elapsed() >= STABLE_SESSION,
+                reset_backoff: is_stable(started.elapsed()),
             };
         }
         RequestOutcome::Stopped => return SessionEnd::Stopped,
         RequestOutcome::Failed => {
             publish_failure(tx, FAILURE_READ);
             return SessionEnd::Ended {
-                reset_backoff: started.elapsed() >= STABLE_SESSION,
+                reset_backoff: is_stable(started.elapsed()),
             };
         }
     }
     if !session.send(&json!({"method": "initialized"})).await {
         publish_failure(tx, FAILURE_READ);
         return SessionEnd::Ended {
-            reset_backoff: started.elapsed() >= STABLE_SESSION,
+            reset_backoff: is_stable(started.elapsed()),
         };
     }
 
@@ -273,7 +278,7 @@ async fn run_session(
                 // 未登录时不必再读额度；发布失败快照后等用户登录再重连。
                 session.publish();
                 return SessionEnd::Ended {
-                    reset_backoff: started.elapsed() >= STABLE_SESSION,
+                    reset_backoff: is_stable(started.elapsed()),
                 };
             }
         }
@@ -281,14 +286,14 @@ async fn run_session(
             eprintln!("ai-quota: account/read 失败: {message}");
             publish_failure(tx, account_failure(&message));
             return SessionEnd::Ended {
-                reset_backoff: started.elapsed() >= STABLE_SESSION,
+                reset_backoff: is_stable(started.elapsed()),
             };
         }
         RequestOutcome::Stopped => return SessionEnd::Stopped,
         RequestOutcome::Failed => {
             publish_failure(tx, FAILURE_READ);
             return SessionEnd::Ended {
-                reset_backoff: started.elapsed() >= STABLE_SESSION,
+                reset_backoff: is_stable(started.elapsed()),
             };
         }
     }
@@ -307,14 +312,14 @@ async fn run_session(
             eprintln!("ai-quota: account/rateLimits/read 失败: {message}");
             publish_failure(tx, FAILURE_READ);
             return SessionEnd::Ended {
-                reset_backoff: started.elapsed() >= STABLE_SESSION,
+                reset_backoff: is_stable(started.elapsed()),
             };
         }
         RequestOutcome::Stopped => return SessionEnd::Stopped,
         RequestOutcome::Failed => {
             publish_failure(tx, FAILURE_READ);
             return SessionEnd::Ended {
-                reset_backoff: started.elapsed() >= STABLE_SESSION,
+                reset_backoff: is_stable(started.elapsed()),
             };
         }
     }
@@ -328,16 +333,15 @@ async fn run_session(
         tokio::select! {
             _ = &mut *stop => return SessionEnd::Stopped,
             _ = ticker.tick() => {
-                // 先确认账号，再读额度；账号消失说明运行中登出。
+                // 先确认账号，再读额度。运行中登出只发布未登录状态，
+                // 复用同一条连接继续探测，避免每次重连都 spawn 子进程。
                 match session.request(next_id, "account/read", json!({}), stop).await {
                     RequestOutcome::Result(Ok(value)) => {
                         next_id += 1;
                         apply_account(&mut session.snapshot, &value, unix_now());
                         if matches!(value.get("account"), Some(Value::Null)) {
                             session.publish();
-                            return SessionEnd::Ended {
-                                reset_backoff: started.elapsed() >= STABLE_SESSION,
-                            };
+                            continue;
                         }
                         match session
                             .request(next_id, "account/rateLimits/read", json!({}), stop)
@@ -352,14 +356,14 @@ async fn run_session(
                                 eprintln!("ai-quota: 轮询额度失败: {message}");
                                 publish_failure(tx, FAILURE_READ);
                                 return SessionEnd::Ended {
-                                    reset_backoff: started.elapsed() >= STABLE_SESSION,
+                                    reset_backoff: is_stable(started.elapsed()),
                                 };
                             }
                             RequestOutcome::Stopped => return SessionEnd::Stopped,
                             RequestOutcome::Failed => {
                                 publish_failure(tx, FAILURE_READ);
                                 return SessionEnd::Ended {
-                                    reset_backoff: started.elapsed() >= STABLE_SESSION,
+                                    reset_backoff: is_stable(started.elapsed()),
                                 };
                             }
                         }
@@ -368,14 +372,14 @@ async fn run_session(
                         eprintln!("ai-quota: 轮询账号失败: {message}");
                         publish_failure(tx, account_failure(&message));
                         return SessionEnd::Ended {
-                            reset_backoff: started.elapsed() >= STABLE_SESSION,
+                            reset_backoff: is_stable(started.elapsed()),
                         };
                     }
                     RequestOutcome::Stopped => return SessionEnd::Stopped,
                     RequestOutcome::Failed => {
                         publish_failure(tx, FAILURE_READ);
                         return SessionEnd::Ended {
-                            reset_backoff: started.elapsed() >= STABLE_SESSION,
+                            reset_backoff: is_stable(started.elapsed()),
                         };
                     }
                 }
@@ -394,12 +398,12 @@ async fn run_session(
                     Ok(None) => {
                         eprintln!("ai-quota: app-server 已退出");
                         publish_failure(tx, FAILURE_READ);
-                        return SessionEnd::Ended { reset_backoff: started.elapsed() >= STABLE_SESSION };
+                        return SessionEnd::Ended { reset_backoff: is_stable(started.elapsed()) };
                     }
                     Err(err) => {
                         eprintln!("ai-quota: 读取 app-server 输出失败: {err}");
                         publish_failure(tx, FAILURE_READ);
-                        return SessionEnd::Ended { reset_backoff: started.elapsed() >= STABLE_SESSION };
+                        return SessionEnd::Ended { reset_backoff: is_stable(started.elapsed()) };
                     }
                 }
             }
@@ -451,7 +455,8 @@ impl Session<'_> {
                 "message": format!("method not supported: {method}"),
             }
         });
-        let _ = self.send(&response).await;
+        // stdin 管道写满时不能无界等待，按单次请求超时收口。
+        let _ = tokio::time::timeout(REQUEST_TIMEOUT, self.send(&response)).await;
     }
 
     fn apply_notification(&mut self, method: &str, params: &Value) {
@@ -535,6 +540,13 @@ mod tests {
     #[test]
     fn next_backoff_starts_at_one_second() {
         assert_eq!(next_backoff(Duration::ZERO), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn is_stable_requires_thirty_seconds() {
+        assert!(!is_stable(Duration::from_secs(29)));
+        assert!(is_stable(Duration::from_secs(30)));
+        assert!(is_stable(Duration::from_secs(31)));
     }
 
     #[test]
