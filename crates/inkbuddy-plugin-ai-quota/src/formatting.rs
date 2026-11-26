@@ -84,6 +84,28 @@ mod tests {
     }
 
     #[test]
+    fn width_class_covers_all_21_buckets() {
+        // 锁死 q-0..q-100 共 21 个 class 名这个契约，样式表据此定义宽度。
+        let expected = [
+            "q-0", "q-5", "q-10", "q-15", "q-20", "q-25", "q-30", "q-35", "q-40", "q-45", "q-50",
+            "q-55", "q-60", "q-65", "q-70", "q-75", "q-80", "q-85", "q-90", "q-95", "q-100",
+        ];
+        for (i, name) in expected.iter().enumerate() {
+            assert_eq!(width_class((i * 5) as u32), *name);
+        }
+
+        // 穷举 0..=100，输出必须落在既定 21 档内，不得出现意外命名。
+        let allowed: std::collections::BTreeSet<&str> = expected.into_iter().collect();
+        for p in 0..=100u32 {
+            assert!(
+                allowed.contains(width_class(p)),
+                "unexpected width class for {p}: {}",
+                width_class(p)
+            );
+        }
+    }
+
+    #[test]
     fn plan_label_maps_known_plans_and_falls_back() {
         let cases = [
             ("plus", "Plus"),
