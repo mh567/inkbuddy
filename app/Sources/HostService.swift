@@ -244,9 +244,17 @@ final class HostService: ObservableObject {
         let bundlePlugins = Bundle.main.bundleURL
             .appendingPathComponent("Contents/Resources/plugins", isDirectory: true)
 
-        // 每次启动都用 bundle 里的版本覆盖，保证 app 升级后插件同步更新
-        for name in ["lyrics", "clock"] {
-            let src = bundlePlugins.appendingPathComponent(name, isDirectory: true)
+        // 每次启动都用 bundle 里的版本覆盖，保证 app 升级后插件同步更新。
+        // 按目录枚举，bundle 里加了插件不用改这段。
+        let bundled = (try? fileManager.contentsOfDirectory(
+            at: bundlePlugins,
+            includingPropertiesForKeys: [.isDirectoryKey]
+        )) ?? []
+        for src in bundled.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            guard (try? src.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else {
+                continue
+            }
+            let name = src.lastPathComponent
             let dst = plugins.appendingPathComponent(name, isDirectory: true)
             try? fileManager.createDirectory(at: dst, withIntermediateDirectories: true)
             guard let files = try? fileManager.contentsOfDirectory(at: src, includingPropertiesForKeys: nil) else {
