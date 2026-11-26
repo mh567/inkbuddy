@@ -5,13 +5,24 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>__TITLE__</title>
 <style>
+  /* 点阵时钟的像素字体。内嵌字库，设备浏览器无外网时也能保持字形。 */
+  @font-face {
+    font-family: 'Silkscreen';
+    font-style: normal;
+    font-weight: 700;
+    font-display: swap;
+    src: url(data:font/woff2;base64,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) format('woff2');
+  }
+  :root { --bar-h: 56px; --canvas-h: calc(100vh - var(--bar-h)); }
   html, body {
     margin: 0; padding: 0; min-height: 100%;
     background: #ffffff; color: #000000;
     font-family: "Noto Sans CJK SC", "PingFang SC", "Microsoft YaHei", sans-serif;
   }
+  body { display: flex; flex-direction: column; }
+  body.reader-full { --canvas-h: 100vh; }
   #wrap {
-    box-sizing: border-box; min-height: 100vh;
+    box-sizing: border-box; flex: 1 0 auto; min-height: var(--canvas-h);
     display: flex; flex-direction: column;
     align-items: center; justify-content: center;
     padding: 6vw 5vw; text-align: center;
@@ -27,7 +38,7 @@
      每个扩展按视图里保存的百分比区域绝对定位。body.layout-region 由
      页面脚本根据 frame 响应的 layout 字段切换，容器去掉留白。 */
   body.layout-region #wrap { padding: 0; }
-  .frame-canvas { position: relative; width: 100vw; height: 100vh; }
+  .frame-canvas { position: relative; width: 100%; height: var(--canvas-h); }
   .frame-canvas .plugin-section {
     position: absolute; overflow: hidden;
     display: flex; flex-direction: column;
@@ -63,8 +74,64 @@
                   letter-spacing: 0.1em;
                   font-family: "Kaiti SC", "STKaiti", "KaiTi", "Noto Serif CJK SC", "Songti SC", serif; }
 
-  #status { position: fixed; right: 8px; bottom: 6px; font-size: 10px;
-            color: #c8c8c8; }
+  #status { position: fixed; right: 8px; bottom: calc(var(--bar-h) + 6px);
+            font-size: 10px; color: #c8c8c8; }
+
+  /* 底部条：56px 适合手指点按；上边一条实线勾出轮廓，
+     中间的字用细线胶囊框起来，两侧各一条短横线，白底保持墨水屏观感。 */
+  #reader-bar {
+    box-sizing: border-box;
+    flex: 0 0 var(--bar-h); height: var(--bar-h);
+    display: flex; align-items: center; justify-content: center;
+    background: #ffffff; color: #000000;
+    border-top: 2px solid #bcbcbc;
+    user-select: none; -webkit-user-select: none;
+    touch-action: manipulation; cursor: pointer;
+  }
+  #reader-bar::before, #reader-bar::after {
+    content: ''; width: 32px; height: 1px; background: #c8c8c8;
+  }
+  #reader-bar::before { margin-right: 14px; }
+  #reader-bar::after  { margin-left: 14px; }
+  #reader-bar .wordmark {
+    border: 1px solid #9a9a9a; border-radius: 16px;
+    padding: 7px 22px 6px; line-height: 1;
+    font-size: 15px; font-weight: 600; letter-spacing: 0.16em;
+  }
+  /* 全屏模式：底部条与状态行退出，内容铺满整个视口。
+     同时尝试浏览器原生全屏；不支持时这套 class 仍让页面占满屏幕。 */
+  body.reader-full #reader-bar, body.reader-full #status { display: none; }
+  :fullscreen, :-webkit-full-screen { width: 100%; height: 100%; background: #ffffff; }
+
+  /* 全屏下的三块触摸区：左 30% 上一视图，中间显示/隐藏顶部按钮，右 30% 下一视图。 */
+  #reader-zones { display: none; position: fixed;
+                  top: 0; right: 0; bottom: 0; left: 0; z-index: 5;
+                  touch-action: manipulation; }
+  body.reader-full #reader-zones { display: flex; }
+  .reader-zone { height: 100%; user-select: none; -webkit-user-select: none; }
+  .reader-zone-left  { width: 30%; }
+  .reader-zone-center { flex: 1 1 auto; }
+  .reader-zone-right { width: 30%; }
+
+  #reader-top { display: none; position: fixed; top: 0; left: 0; right: 0;
+                z-index: 10; justify-content: center; align-items: flex-start;
+                pointer-events: none; }
+  body.reader-full.reader-controls #reader-top { display: flex; }
+  /* 退出按钮像吊牌一样从屏幕顶边挂下来：顶端一个小圆环，细绳连到按钮。 */
+  .hanger { display: flex; flex-direction: column; align-items: center; }
+  .rope { position: relative; width: 2px; height: 64px; background: #9a9a9a; }
+  .rope::before {
+    content: ''; position: absolute; top: -4px; left: -3px;
+    width: 8px; height: 8px; box-sizing: border-box;
+    background: #ffffff; border: 1px solid #9a9a9a; border-radius: 50%;
+  }
+  #reader-exit {
+    pointer-events: auto; touch-action: manipulation;
+    background: #ffffff; color: #000000;
+    border: 1px solid #868686; border-radius: 8px;
+    padding: 15px 38px; font-size: 19px; font-family: inherit;
+    letter-spacing: 0.06em;
+  }
 
   /* 黑白：把所有灰阶推到纯黑，去掉拼音行的浅色 */
   body.mode-bw .line-muted, body.mode-bw .line-reading,
@@ -89,6 +156,81 @@
   body.invert.mode-bw .line-muted, body.invert.mode-bw .line-reading,
   body.invert.mode-bw .kv-k, body.invert.mode-bw #status { color: #ffffff; }
   body.invert.mode-bw .plugin-section + .plugin-section { border-top-color: #ffffff; }
+
+  /* 时钟插件的点阵与台历样式。
+     两条约束，兼顾墨水屏和任意大小的视图区域：
+       1. 所有元素都在正常文档流里，靠 flex 排布，不用相对视口的绝对定位。
+          绝对位置的 right/bottom 按整块屏幕算，区域一缩小就会被裁掉。
+       2. 所有尺寸乘 --ink-scale，宿主按区域大小算好下发。 */
+  .clock-dot {
+    box-sizing: border-box; width: 100%;
+    display: flex; flex-direction: column; align-items: center;
+    gap: calc(3vw * var(--ink-scale, 1));
+    padding: calc(4vw * var(--ink-scale, 1)) calc(3vw * var(--ink-scale, 1));
+  }
+  .clock-dot-time {
+    font-family: "Silkscreen", "Courier New", monospace;
+    font-weight: 700;
+    font-size: calc(16vw * var(--ink-scale, 1));
+    line-height: 1.05; letter-spacing: .02em;
+    text-align: center; font-variant-numeric: tabular-nums;
+  }
+  .clock-dot-foot {
+    display: flex; justify-content: center; gap: calc(2vw * var(--ink-scale, 1));
+    font-size: calc(3.4vw * var(--ink-scale, 1)); color: #5e5b54;
+  }
+  .clock-dot-sep { color: #8a8a8a; }
+
+  .clock-cal {
+    box-sizing: border-box; width: 100%;
+    display: flex; flex-direction: column; align-items: center;
+    gap: calc(3.5vw * var(--ink-scale, 1));
+    padding: calc(3vw * var(--ink-scale, 1)) calc(5vw * var(--ink-scale, 1));
+  }
+  .clock-cal-head, .clock-cal-foot {
+    box-sizing: border-box; width: 100%;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: calc(2vw * var(--ink-scale, 1));
+  }
+  .clock-cal-head { align-items: flex-start; }
+  .clock-cal-ym {
+    font-family: "Songti SC", "STSong", "SimSun", serif;
+    font-size: calc(4vw * var(--ink-scale, 1)); font-weight: 700; letter-spacing: .12em;
+    line-height: 1.2;
+  }
+  .clock-cal-seal {
+    flex: 0 0 auto;
+    box-sizing: border-box;
+    width: calc(8vw * var(--ink-scale, 1)); height: calc(8vw * var(--ink-scale, 1));
+    border: 2px solid #000000; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: calc(2.2vw * var(--ink-scale, 1));
+    transform: rotate(-9deg);
+  }
+  .clock-cal-day {
+    font-family: "Songti SC", "STSong", "SimSun", serif;
+    font-weight: 900; font-size: calc(26vw * var(--ink-scale, 1)); line-height: .9;
+    text-align: center;
+  }
+  .clock-cal-week {
+    font-size: calc(3.4vw * var(--ink-scale, 1)); color: #5e5b54; letter-spacing: .1em;
+  }
+  .clock-cal-hm {
+    font-family: "IBM Plex Mono", Menlo, monospace; font-weight: 600;
+    font-size: calc(5vw * var(--ink-scale, 1)); font-variant-numeric: tabular-nums;
+  }
+
+  /* 纯黑白：辅助文字推到纯黑；反色：推到白灰，印章边框一起翻。 */
+  body.mode-bw .clock-dot-foot, body.mode-bw .clock-cal-ym,
+  body.mode-bw .clock-cal-week { color: #000000; }
+  body.invert .clock-dot-foot, body.invert .clock-cal-ym,
+  body.invert .clock-cal-week { color: #b0b0b0; }
+  body.invert .clock-cal-seal { border-color: #ffffff; }
+  body.invert.mode-bw .clock-dot-foot, body.invert.mode-bw .clock-cal-ym,
+  body.invert.mode-bw .clock-cal-week { color: #ffffff; }
+  /* 纯文本模式收掉装饰性的圆形印记 */
+  body.mode-text .clock-cal-seal { display: none; }
+
   /* AI 额度看板：三行结构，尺寸跟随 --ink-scale。 */
   .quota {
     box-sizing: border-box; width: 100%;
@@ -184,6 +326,13 @@
 <body>
 <div id="wrap"><div id="frame">载入中…</div></div>
 <div id="status"></div>
+<div id="reader-bar" role="button" aria-label="进入全屏"><span class="wordmark">inkbuddy</span></div>
+<div id="reader-zones">
+  <div class="reader-zone reader-zone-left" data-nav="-1"></div>
+  <div class="reader-zone reader-zone-center" id="reader-center"></div>
+  <div class="reader-zone reader-zone-right" data-nav="1"></div>
+</div>
+<div id="reader-top"><div class="hanger"><span class="rope"></span><button id="reader-exit" type="button">退出全屏</button></div></div>
 <script>
 (function () {
   var frameEl = document.getElementById('frame');
@@ -278,7 +427,8 @@
           if (frameEl.innerHTML !== placeholder) frameEl.innerHTML = placeholder;
           lastSig = null;
         }
-        setStatus(d.active && d.active.length ? d.active.join(' + ') : '无插件');
+        // 墨水屏上不显示插件名；这一行只在连接异常时留状态提示。
+        setStatus('');
         // 轮询间隔与墨水屏重绘解耦：refresh_ms 是插件内容的变化节奏（时钟 15 秒），
         // 但控制端改插件开关后设备要尽快感知，所以轮询固定走短间隔。
         // 内容没变时签名相同，不会碰 DOM，因此不会增加墨水屏刷新次数。
@@ -290,6 +440,111 @@
         setStatus('连接失败');
         schedule(2000);
       });
+  }
+
+  // 阅读式全屏：底部条进入，左/中/右三块触摸区翻视图，
+  // 中间点按切换顶部退出按钮。原生全屏能用就用，不能用时靠 class 铺满视口。
+  var readerFull = false;
+  var switching = false;
+
+  function nativeFullscreen(on) {
+    try {
+      var el = document.documentElement;
+      if (on) {
+        var req = el.requestFullscreen || el.webkitRequestFullscreen;
+        if (req) {
+          var entered = req.call(el);
+          if (entered && entered.catch) entered.catch(function () {});
+        }
+      } else {
+        var exit = document.exitFullscreen || document.webkitExitFullscreen;
+        if (exit && (document.fullscreenElement || document.webkitFullscreenElement)) {
+          var left = exit.call(document);
+          if (left && left.catch) left.catch(function () {});
+        }
+      }
+    } catch (e) {
+      // 嵌入式浏览器没有原生全屏时，CSS 模式已经让内容铺满屏幕。
+    }
+  }
+
+  function enterReader() {
+    if (readerFull) return;
+    readerFull = true;
+    body.classList.add('reader-full');
+    body.classList.remove('reader-controls');
+    nativeFullscreen(true);
+  }
+
+  function exitReader() {
+    if (!readerFull) return;
+    readerFull = false;
+    body.classList.remove('reader-full', 'reader-controls');
+    nativeFullscreen(false);
+  }
+
+  function syncNativeFullscreen() {
+    // 原生全屏被系统手势退掉时，跟着退出阅读模式，别留下半截界面。
+    if (!document.fullscreenElement && !document.webkitFullscreenElement && readerFull) {
+      body.classList.remove('reader-full', 'reader-controls');
+      readerFull = false;
+    }
+  }
+  document.addEventListener('fullscreenchange', syncNativeFullscreen);
+  document.addEventListener('webkitfullscreenchange', syncNativeFullscreen);
+
+  // 视图切换和控制端走同一套接口：读视图列表与当前指针，算出相邻 id 写回。
+  // 下一次取帧自然带上新布局，不需要页面自己拼区域 HTML。
+  function switchView(direction) {
+    if (switching) return;
+    switching = true;
+    body.classList.remove('reader-controls');
+    fetch('/api/views', { cache: 'no-store' })
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function (state) {
+        var views = state.views || [];
+        if (!views.length) return null;
+        var index = -1;
+        for (var i = 0; i < views.length; i++) {
+          if (views[i].id === state.current) { index = i; break; }
+        }
+        var target = index < 0
+          ? (direction > 0 ? 0 : views.length - 1)
+          : (index + direction + views.length) % views.length;
+        return views[target].id;
+      })
+      .then(function (id) {
+        if (!id) return null;
+        return fetch('/api/views/current', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: id }),
+          cache: 'no-store'
+        });
+      })
+      .then(function () {
+        // 不同视图可能渲染出相同的 HTML 签名（同一个插件摆在同样的区域），
+        // 清掉签名让下一帧强制重画，避免切了视图却看不到变化。
+        lastSig = null;
+        schedule(0);
+      })
+      .catch(function () { setStatus('切换视图失败'); })
+      .then(function () { switching = false; });
+  }
+
+  document.getElementById('reader-bar').addEventListener('click', enterReader);
+  document.getElementById('reader-exit').addEventListener('click', function (e) {
+    e.stopPropagation();
+    exitReader();
+  });
+  document.getElementById('reader-center').addEventListener('click', function () {
+    body.classList.toggle('reader-controls');
+  });
+  var navZones = document.querySelectorAll('.reader-zone[data-nav]');
+  for (var zi = 0; zi < navZones.length; zi++) {
+    navZones[zi].addEventListener('click', function () {
+      switchView(parseInt(this.getAttribute('data-nav'), 10));
+    });
   }
 
   poll();

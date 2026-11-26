@@ -194,6 +194,77 @@ fn preview_role(e: Emphasis) -> &'static str {
     }
 }
 
+/// 去掉 HTML 标签，留下可见文本。只用于插件自家输出的简单标记。
+fn strip_tags(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find('<') {
+        out.push_str(&rest[..i]);
+        let Some(j) = rest[i..].find('>') else { break };
+        rest = &rest[i + j + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 读插件在标记里声明的属性值。属性只出现在 `<...>` 内部，值用双引号，
+/// 内容限制在安全字符内，取不到就返回 None。宿主不解析插件的 class 名。
+fn html_attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let at = tag.find(name)?;
+    let after = tag[at + name.len()..].trim_start();
+    let value = after.strip_prefix("=")?.trim_start().strip_prefix('"')?;
+    let end = value.find('"')?;
+    Some(&value[..end])
+}
+
+/// 结构化文本预览里允许的行角色。未知值按 muted 处理，避免插件写入
+/// 任意字符串后影响控制端排版。
+fn declared_role(tag: &str) -> &'static str {
+    match html_attr(tag, "data-ink-role") {
+        Some("primary") => "primary",
+        Some("normal") => "normal",
+        Some("muted") => "muted",
+        Some("reading") => "reading",
+        _ => "muted",
+    }
+}
+
+/// HTML 块声明的内容高度，单位是「正方形屏幕下的 vh」。
+/// 插件按自己的 CSS 尺寸给一个数，宿主不认识具体样式名。
+fn declared_height(html: &str) -> f32 {
+    html_attr(html, "data-ink-height")
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0 && *v <= 200.0)
+        .unwrap_or(0.0)
+}
+
+/// HTML 块的控制端预览：取每个不含子 div 的叶子 div 的文字。
+/// 外层容器整段跳过，避免把头、正文、脚注拼成一行。
+fn html_preview_lines(html: &str) -> Vec<PreviewLine> {
+    let mut lines = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = html[from..].find("<div") {
+        let start = from + rel;
+        let Some(gt_rel) = html[start..].find('>') else { break };
+        let gt = start + gt_rel;
+        let Some(end_rel) = html[gt + 1..].find("</div>") else { break };
+        let end = gt + 1 + end_rel;
+        let tag = &html[start..=gt];
+        let inner = &html[gt + 1..end];
+        if !inner.contains("<div") {
+            let text = strip_tags(inner).trim().to_string();
+            if !text.is_empty() {
+                lines.push(PreviewLine {
+                    text,
+                    role: declared_role(tag).to_string(),
+                });
+            }
+        }
+        from = start + 4;
+    }
+    lines
+}
+
 /// 把插件的结构化内容按块分组，供控制端复刻页面排版（块间距、块内行距）。
 /// kv 行的 role 标为 "kv"（页面上 .kv 字号 4vw、行高 1.8，与普通行不同）。
 fn collect_preview_blocks(blocks: &mut Vec<PreviewBlock>, result: &RenderResult) {
@@ -222,7 +293,10 @@ fn collect_preview_blocks(blocks: &mut Vec<PreviewBlock>, result: &RenderResult)
                     role: "text".to_string(),
                 });
             }
-            Block::Html { .. } | Block::Unknown => {}
+            Block::Html { html } => {
+                lines.extend(html_preview_lines(html));
+            }
+            Block::Unknown => {}
         }
         if !lines.is_empty() {
             blocks.push(PreviewBlock { lines });
@@ -256,7 +330,10 @@ fn collect_preview_lines(lines: &mut Vec<PreviewLine>, result: &RenderResult) {
                     role: "text".to_string(),
                 });
             }
-            Block::Html { .. } | Block::Unknown => {}
+            Block::Html { html } => {
+                lines.extend(html_preview_lines(html));
+            }
+            Block::Unknown => {}
         }
     }
 }
@@ -321,7 +398,12 @@ fn content_height_units(result: &RenderResult, text_mode: bool) -> f32 {
                 let title = if text_mode { 5.0 } else { 3.8 };
                 total += title * 1.6;
             }
-            Block::Html { .. } | Block::Unknown => {}
+            // HTML 块也要参与高度估算，否则短区域不会缩小，内容会被裁掉。
+            // 高度由插件在标记里声明，宿主按同一公式换算，不认识具体样式。
+            Block::Html { html } => {
+                total += declared_height(html);
+            }
+            Block::Unknown => {}
         }
     }
     total
@@ -368,6 +450,8 @@ fn section_overrides(plugin: &str, scale: f32, text_mode: bool) -> String {
     let m = |v: f32| fmt_pct(v * scale);
     let sel = format!(".frame-canvas section[data-plugin=\"{}\"]", esc(plugin));
     let mut css = String::new();
+    // HTML 块里的自定义样式用这个变量跟着区域一起缩放。
+    css.push_str(&format!("{sel} {{ --ink-scale: {}; }}", fmt_pct(scale)));
     css.push_str(&format!(
         "{sel} .line-primary {{ font-size: {}vw; margin: {}vh 0; }}",
         m(6.2),
@@ -658,9 +742,33 @@ mod tests {
     }
 
     #[test]
+    fn html_block_height_comes_from_plugin_declaration() {
+        let mk = |html: &str| RenderResult {
+            blocks: vec![Block::Html {
+                html: html.to_string(),
+            }],
+            refresh_ms: Some(500),
+        };
+        // class 名可以是任意值：宿主只读 data-ink-height。
+        let dot = mk("<div class=\"block any-name\" data-ink-height=\"31.2\"></div>");
+        let cal = mk("<div class=\"block another-name\" data-ink-height=\"49.4\"></div>");
+        let plain = mk("<div class=\"block other\"></div>");
+        assert_eq!(content_height_units(&dot, false), 31.2);
+        assert_eq!(content_height_units(&cal, false), 49.4);
+        assert_eq!(content_height_units(&plain, false), 0.0);
+        // 短区域必须缩小高内容，否则会被裁掉。
+        assert!(region_scale(100.0, 20.0, 49.4) < 0.5);
+        // 非法声明不能把缩放带偏。
+        for bad in ["-3", "0", "abc", "99999", "NaN"] {
+            let r = mk(&format!("<div data-ink-height=\"{bad}\"></div>"));
+            assert_eq!(content_height_units(&r, false), 0.0, "bad value: {bad}");
+        }
+    }
+
+    #[test]
     fn fullscreen_region_needs_no_override() {
         let parts = vec![("clock".into(), text_block("时间"))];
-        let layout = vec![Region { plugin: "clock".into(), x: 0.0, y: 0.0, w: 100.0, h: 100.0 }];
+        let layout = vec![Region { plugin: "clock".into(), x: 0.0, y: 0.0, w: 100.0, h: 100.0, variant: None }];
         let frame = render_frame(&parts, 500, Some(&layout));
         // scale=1 的区域直接用页面基准样式，不输出覆盖规则
         assert!(!frame.html.contains("<style>"));
@@ -670,7 +778,7 @@ mod tests {
     #[test]
     fn text_mode_uses_larger_title_baseline() {
         let parts = vec![("clock".into(), text_block("时间"))];
-        let layout = vec![Region { plugin: "clock".into(), x: 0.0, y: 0.0, w: 50.0, h: 50.0 }];
+        let layout = vec![Region { plugin: "clock".into(), x: 0.0, y: 0.0, w: 50.0, h: 50.0, variant: None }];
         let normal = render_frame(&parts, 500, Some(&layout));
         let text = render_frame_with_mode(&parts, 500, Some(&layout), true, 1.0);
         // 3.8vw × 0.5 = 1.9vw（常规）；5vw × 0.5 = 2.5vw（纯文本模式）
@@ -761,22 +869,24 @@ mod tests {
     fn layout_render_positions_sections_absolutely() {
         let parts = vec![("lyrics".into(), text_block("歌词")), ("clock".into(), text_block("时间"))];
         let layout = vec![
-            Region { plugin: "lyrics".into(), x: 0.0, y: 0.0, w: 60.0, h: 100.0 },
-            Region { plugin: "clock".into(), x: 60.0, y: 0.0, w: 40.0, h: 100.0 },
+            Region { plugin: "lyrics".into(), x: 0.0, y: 0.0, w: 60.0, h: 100.0, variant: None },
+            Region { plugin: "clock".into(), x: 60.0, y: 0.0, w: 40.0, h: 100.0, variant: None },
         ];
         let frame = render_frame(&parts, 500, Some(&layout));
         assert!(frame.html.contains("frame-canvas"));
         assert!(frame.html.contains("left:0%;top:0%;width:60%;height:100%"));
         assert!(frame.html.contains("left:60%;top:0%;width:40%;height:100%"));
         // 字号覆盖由服务端算好直接输出（60x100 → 0.6，40x100 → 0.4）：
-        // 6.2vw × 0.6 = 3.72vw，6.2vw × 0.4 = 2.48vw。不依赖 CSS 变量。
+        // 6.2vw × 0.6 = 3.72vw，6.2vw × 0.4 = 2.48vw。
         assert!(frame.html.contains(
             ".frame-canvas section[data-plugin=\"lyrics\"] .line-primary { font-size: 3.72vw;"
         ));
         assert!(frame.html.contains(
             ".frame-canvas section[data-plugin=\"clock\"] .line-primary { font-size: 2.48vw;"
         ));
-        assert!(!frame.html.contains("--ink-scale"));
+        // 同一份系数也下发给 HTML 块的自定义样式
+        assert!(frame.html.contains("--ink-scale: 0.6;"));
+        assert!(frame.html.contains("--ink-scale: 0.4;"));
         assert_eq!(frame.regions.len(), 2);
         assert_eq!(frame.regions[0].plugin, "lyrics");
         assert_eq!(frame.regions[0].lines.len(), 1);
@@ -825,5 +935,46 @@ mod tests {
         assert!(frame.html.contains("line-reading\">o wui jyu nei</div>"));
         assert!(!frame.html.contains("ruby-grid"));
         assert!(!frame.html.contains("grid-template-columns"));
+    }
+
+    #[test]
+    fn html_block_preview_uses_declared_roles() {
+        // class 名不带任何插件标识，角色完全由 data-ink-role 决定。
+        let html = "<div class=\"block whatever\" data-ink-height=\"31.2\">\
+                      <div class=\"a\" data-ink-role=\"primary\">21:22</div>\
+                      <div class=\"b\" data-ink-role=\"normal\"><span>11月26日</span></div>\
+                      <div class=\"c\" data-ink-role=\"bogus\">note</div>\
+                      <div class=\"d\">fallback</div>\
+                    </div>";
+        let result = RenderResult {
+            blocks: vec![Block::Html {
+                html: html.to_string(),
+            }],
+            refresh_ms: None,
+        };
+        let preview = preview_content(&result, false);
+        assert_eq!(preview.lines.len(), 4);
+        assert_eq!(preview.lines[0].text, "21:22");
+        assert_eq!(preview.lines[0].role, "primary");
+        assert_eq!(preview.lines[1].text, "11月26日");
+        assert_eq!(preview.lines[1].role, "normal");
+        assert_eq!(preview.lines[2].role, "muted", "unknown role falls back");
+        assert_eq!(preview.lines[3].role, "muted", "missing role falls back");
+        assert_eq!(preview.content_units, 31.2);
+    }
+
+    #[test]
+    fn scaled_region_exposes_ink_scale_variable() {
+        let parts = vec![("clock".into(), text_block("时间"))];
+        let layout = vec![Region {
+            plugin: "clock".into(),
+            x: 0.0,
+            y: 0.0,
+            w: 40.0,
+            h: 100.0,
+            variant: None,
+        }];
+        let frame = render_frame(&parts, 500, Some(&layout));
+        assert!(frame.html.contains("--ink-scale: 0.4;"));
     }
 }

@@ -1,0 +1,784 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>时钟样式 · InkBuddy</title>
+
+<!-- 展示字按需加载；中文走系统字栈，局域网里的墨水屏浏览器无外网时也能正确降级 -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=Playfair+Display:wght@700;900&family=Silkscreen:wght@400;700&display=swap" rel="stylesheet">
+
+<style>
+/* ============================================================
+   设计令牌
+   电子纸没有彩色可用，强调靠字重、字号、反白块和规则线完成。
+   灰阶只分四档：正文黑、次级灰、标签灰、装饰线灰。
+   ============================================================ */
+:root{
+  --paper:#f2f0ea;        /* 纸白：页面底 */
+  --paper-hi:#faf9f5;     /* 亮纸：屏幕内底 */
+  --ink:#14130f;          /* 墨黑：主文字与规则线 */
+  --ink-soft:#5e5b54;     /* 次级灰：辅助文字 */
+  --ink-mute:#6f6b62;     /* 标签灰：小字标签，正文也可用 */
+  --ink-faint:#8c877e;    /* 装饰灰：仅用于大字或线条 */
+  --rule:#c9c5ba;         /* 发丝线 */
+
+  --font-serif:"Playfair Display","Songti SC",Georgia,serif;
+  --font-mono:"IBM Plex Mono","SFMono-Regular",Menlo,Consolas,monospace;
+  --font-black:"Archivo Black","PingFang SC","Heiti SC",sans-serif;
+  --font-pixel:"Silkscreen","Courier New",monospace;
+  --font-cjk:"Songti SC","STSong","SimSun",serif;
+  --font-body:"IBM Plex Sans","PingFang SC","Hiragino Sans GB",sans-serif;
+
+  --space-1:4px;  --space-2:8px;  --space-3:16px; --space-4:24px;
+  --space-5:40px; --space-6:64px; --space-7:96px;
+  --dur:320ms;
+  --ease:cubic-bezier(.16,1,.3,1);
+}
+
+*,*::before,*::after{box-sizing:border-box}
+html{background:var(--paper)}
+body{
+  margin:0;
+  background:var(--paper);
+  color:var(--ink);
+  font-family:var(--font-body);
+  -webkit-font-smoothing:antialiased;
+}
+a{color:inherit}
+button{font:inherit;color:inherit}
+
+/* 纸纤维：极淡的噪点，只在电脑预览里提供纸感，墨水屏模式关掉 */
+body::before{
+  content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
+  opacity:.04;mix-blend-mode:multiply;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+body.ek-mode::before{display:none}
+
+:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+
+/* ============================================================
+   报头
+   ============================================================ */
+.masthead{
+  position:relative;z-index:1;
+  display:grid;
+  grid-template-columns:minmax(90px,1fr) minmax(0,4fr) minmax(90px,1fr);
+  gap:var(--space-4);
+  align-items:end;
+  padding:var(--space-6) clamp(20px,4vw,64px) var(--space-4);
+  border-bottom:5px solid var(--ink);
+}
+.masthead-mark{
+  font-family:var(--font-black);
+  font-size:clamp(20px,2.2vw,32px);
+  line-height:.92;letter-spacing:-.05em;
+}
+.masthead-title h1{
+  margin:0;
+  font-family:var(--font-serif);
+  font-weight:900;
+  font-size:clamp(34px,5.2vw,76px);
+  line-height:.98;letter-spacing:-.045em;
+}
+.masthead-title p{
+  margin:var(--space-2) 0 0;
+  font-size:clamp(12px,1.1vw,15px);
+  color:var(--ink-soft);line-height:1.6;letter-spacing:.02em;
+}
+.masthead-meta{
+  text-align:right;
+  font-family:var(--font-mono);
+  font-size:11px;line-height:1.7;color:var(--ink-mute);
+  letter-spacing:.04em;
+}
+
+/* ============================================================
+   画廊骨架：左侧编号目录 + 右侧舞台，非对称分栏
+   ============================================================ */
+.gallery{
+  position:relative;z-index:1;
+  display:grid;
+  grid-template-columns:minmax(190px,17%) minmax(0,1fr);
+  gap:clamp(24px,4vw,72px);
+  padding:var(--space-5) clamp(20px,4vw,64px) var(--space-7);
+}
+.index{
+  position:sticky;top:var(--space-5);align-self:start;
+  border-top:1px solid var(--ink);
+  padding-top:var(--space-3);
+}
+.index h2{
+  margin:0 0 var(--space-3);
+  font-family:var(--font-mono);font-size:11px;font-weight:600;
+  letter-spacing:.14em;color:var(--ink-mute);
+}
+.index ol{list-style:none;margin:0;padding:0}
+.index li{border-bottom:1px solid var(--rule)}
+.index a{
+  display:flex;align-items:baseline;gap:var(--space-2);
+  padding:var(--space-3) 0;
+  text-decoration:none;
+  transition:padding-left var(--dur) var(--ease);
+}
+.index a:hover{padding-left:8px}
+.index .idx-no{
+  font-family:var(--font-mono);font-size:11px;color:var(--ink-mute);
+}
+.index .idx-name{
+  font-size:clamp(15px,1.4vw,19px);font-weight:600;letter-spacing:-.01em;
+}
+.index .idx-en{
+  display:block;margin-top:2px;
+  font-family:var(--font-mono);font-size:10px;font-weight:400;
+  letter-spacing:.1em;color:var(--ink-mute);
+}
+.index-tools{margin-top:var(--space-5)}
+.tool-btn{
+  width:100%;min-height:44px;
+  background:transparent;
+  border:1px solid var(--ink);
+  padding:10px 14px;
+  font-size:13px;text-align:left;
+  cursor:pointer;
+  display:flex;justify-content:space-between;align-items:center;
+  transition:background var(--dur) var(--ease),color var(--dur) var(--ease);
+}
+.tool-btn:hover{background:var(--ink);color:var(--paper-hi)}
+.tool-btn[aria-pressed="true"]{background:var(--ink);color:var(--paper-hi)}
+.tool-btn span:last-child{font-family:var(--font-mono);font-size:11px}
+.index-hint{
+  margin-top:var(--space-3);
+  font-size:11px;line-height:1.7;color:var(--ink-mute);
+}
+
+.stages{display:flex;flex-direction:column;gap:var(--space-7)}
+.stage{scroll-margin-top:var(--space-4)}
+.stage-bar{
+  display:flex;align-items:baseline;gap:var(--space-3);
+  padding-bottom:var(--space-2);margin-bottom:var(--space-2);
+  border-bottom:1px solid var(--ink);
+}
+.stage-no{font-family:var(--font-mono);font-size:12px;color:var(--ink-mute)}
+.stage-bar h3{
+  margin:0;font-size:clamp(18px,2vw,26px);font-weight:600;letter-spacing:-.02em;
+}
+.stage-tag{
+  font-family:var(--font-mono);font-size:10px;letter-spacing:.12em;
+  color:var(--ink-mute);
+}
+.stage-bar .preview-btn{
+  margin-left:auto;
+  min-height:44px;padding:8px 14px;
+  background:transparent;border:1px solid var(--rule);
+  font-size:12px;cursor:pointer;
+  transition:border-color var(--dur) var(--ease),background var(--dur) var(--ease),color var(--dur) var(--ease);
+}
+.stage-bar .preview-btn:hover{border-color:var(--ink);background:var(--ink);color:var(--paper-hi)}
+
+/* 屏幕容器：模拟电子纸的一块显示区域 */
+.screen{
+  position:relative;overflow:hidden;
+  background:var(--paper-hi);
+  border:1px solid var(--rule);
+  min-height:clamp(320px,40vw,560px);
+  display:flex;flex-direction:column;
+}
+.stage-note{
+  display:grid;grid-template-columns:1fr auto;gap:var(--space-4);
+  margin-top:var(--space-3);
+  font-size:12px;line-height:1.75;color:var(--ink-soft);
+}
+.stage-note p{margin:0;max-width:62ch}
+.stage-note .landing{
+  font-family:var(--font-mono);font-size:10px;letter-spacing:.04em;
+  color:var(--ink-mute);text-align:right;white-space:nowrap;
+}
+.stage-note strong{color:var(--ink);font-weight:600}
+
+/* ============================================================
+   01 报头 —— 报纸头版：巨大衬线数字 + 粗规则线
+   ============================================================ */
+.fp-top{
+  display:flex;justify-content:space-between;align-items:baseline;
+  padding:var(--space-4) var(--space-5) var(--space-2);
+  font-family:var(--font-mono);font-size:clamp(9px,.9vw,12px);
+  letter-spacing:.14em;color:var(--ink-mute);
+}
+.fp-top b{font-weight:600;color:var(--ink)}
+.fp-rule{height:5px;background:var(--ink);margin:0 var(--space-5)}
+.fp-time{
+  padding:clamp(12px,2vw,28px) var(--space-5) clamp(10px,1.5vw,20px);
+  font-family:var(--font-serif);font-weight:900;
+  font-size:clamp(72px,17vw,220px);
+  line-height:.92;letter-spacing:-.065em;
+  font-variant-numeric:lining-nums;
+  white-space:nowrap;
+}
+.fp-double{
+  margin:0 var(--space-5);height:7px;
+  border-top:4px solid var(--ink);border-bottom:1px solid var(--ink);
+}
+.fp-bottom{
+  margin-top:auto;
+  display:grid;grid-template-columns:repeat(3,1fr);
+  padding:var(--space-4) var(--space-5);
+}
+.fp-bottom > div{display:flex;flex-direction:column;gap:4px}
+.fp-bottom > div + div{border-left:1px solid var(--rule);padding-left:var(--space-4)}
+.fp-label{
+  font-family:var(--font-mono);font-size:10px;letter-spacing:.16em;
+  color:var(--ink-mute);
+}
+.fp-bottom strong{
+  font-family:var(--font-cjk);font-weight:700;
+  font-size:clamp(15px,2.1vw,28px);letter-spacing:.02em;
+}
+.fp-bottom .sec{font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+
+/* ============================================================
+   02 仪表 —— 工业读数：等宽数字 + 刻度尺 + 四角标记
+   ============================================================ */
+.screen--instrument{padding:clamp(16px,2.6vw,36px)}
+.ins-frame{
+  position:relative;flex:1;
+  border:1px solid var(--ink);
+  padding:clamp(16px,2.4vw,34px);
+  display:flex;flex-direction:column;
+}
+.ins-corner{
+  position:absolute;width:11px;height:11px;background:var(--ink);
+}
+.ins-corner.tl{top:-1px;left:-1px}
+.ins-corner.tr{top:-1px;right:-1px}
+.ins-corner.bl{bottom:-1px;left:-1px}
+.ins-corner.br{bottom:-1px;right:-1px}
+.ins-head{
+  display:flex;justify-content:space-between;
+  font-family:var(--font-mono);font-size:clamp(9px,.9vw,12px);
+  letter-spacing:.14em;color:var(--ink-mute);
+}
+.ins-ticks{
+  position:relative;height:20px;margin-top:auto;
+  background-image:
+    linear-gradient(90deg,var(--ink) 0 2px,transparent 2px),
+    linear-gradient(90deg,var(--ink-faint) 0 1px,transparent 1px);
+  background-size:16.6667% 100%,2.7778% 100%;
+  background-position:0 100%,0 50%;
+  background-repeat:repeat-x;
+  border-bottom:1px solid var(--ink);
+}
+.ins-time{
+  font-family:var(--font-mono);font-weight:700;
+  font-size:clamp(60px,13.5vw,176px);
+  line-height:1;letter-spacing:-.07em;
+  font-variant-numeric:tabular-nums;
+  margin-top:clamp(6px,1.2vw,16px);
+  white-space:nowrap;
+}
+.ins-grid{
+  margin-top:auto;padding-top:var(--space-4);
+  display:grid;grid-template-columns:repeat(3,1fr);
+  gap:var(--space-3);
+  border-top:1px solid var(--rule);
+}
+.ins-grid > div{display:flex;flex-direction:column;gap:5px}
+.ins-grid span{
+  font-family:var(--font-mono);font-size:10px;letter-spacing:.14em;
+  color:var(--ink-mute);
+}
+.ins-grid b{
+  font-family:var(--font-mono);font-weight:600;
+  font-size:clamp(12px,1.5vw,19px);
+  font-variant-numeric:tabular-nums;
+}
+
+/* ============================================================
+   03 巨字 —— 极简：数字大到冲出边界，辅助信息退到角落
+   ============================================================ */
+.screen--monolith{justify-content:center}
+.mono-wrap{width:100%;overflow:hidden;padding-left:2%}
+.mono-time{
+  display:flex;align-items:baseline;
+  font-family:var(--font-black);
+  font-size:clamp(90px,27vw,360px);
+  line-height:.78;letter-spacing:-.085em;
+  white-space:nowrap;
+  transform:translateX(-2.5%);
+}
+.mono-colon{letter-spacing:-.14em;transform:translateY(-.04em)}
+.mono-meta{
+  display:flex;gap:var(--space-4);
+  padding:var(--space-5) var(--space-5) 0;
+  font-family:var(--font-mono);font-size:10px;
+  letter-spacing:.12em;color:var(--ink-soft);
+}
+.mono-meta::before{
+  content:"";width:clamp(24px,6vw,80px);height:1px;background:var(--ink);
+  align-self:center;
+}
+
+/* ============================================================
+   04 点阵 —— 复古电子纸：像素字形 + 点阵底纹
+   ============================================================ */
+.screen--dotmatrix{
+  background-color:var(--paper-hi);
+  background-image:radial-gradient(var(--rule) .7px,transparent .7px);
+  background-size:7px 7px;
+  padding:clamp(16px,2.6vw,36px);
+  justify-content:space-between;
+}
+.dm-head,.dm-foot{
+  display:flex;justify-content:space-between;align-items:baseline;
+  font-family:var(--font-mono);font-size:clamp(10px,1vw,13px);
+  letter-spacing:.1em;color:var(--ink-soft);
+}
+.dm-time{
+  font-family:var(--font-pixel);font-weight:700;
+  font-size:clamp(52px,12.5vw,168px);
+  line-height:1;letter-spacing:.02em;
+  color:var(--ink);text-align:center;
+  white-space:nowrap;
+}
+.dm-foot{
+  border-top:2px solid var(--ink);padding-top:var(--space-3);
+}
+.dm-foot b{font-weight:700;color:var(--ink);font-variant-numeric:tabular-nums}
+
+/* ============================================================
+   05 台历 —— 东方纸感：竖排日期 + 巨大「日」+ 圆形印记
+   ============================================================ */
+.screen--calendar{
+  flex-direction:row;align-items:stretch;
+  padding:clamp(16px,2.6vw,36px);
+  gap:var(--space-4);
+}
+.cal-side{
+  writing-mode:vertical-rl;text-orientation:upright;
+  border-right:1px solid var(--ink);
+  padding-right:var(--space-4);
+  display:flex;justify-content:space-between;align-items:flex-start;
+  gap:var(--space-4);
+}
+.cal-month{
+  font-family:var(--font-cjk);font-weight:700;
+  font-size:clamp(22px,3.4vw,46px);letter-spacing:.14em;
+}
+.cal-year{
+  font-family:var(--font-mono);font-size:clamp(10px,1vw,13px);
+  letter-spacing:.2em;color:var(--ink-mute);
+}
+.cal-week{
+  font-family:var(--font-cjk);font-size:clamp(14px,1.6vw,22px);
+  letter-spacing:.18em;color:var(--ink-soft);
+}
+.cal-main{
+  flex:1;display:flex;align-items:center;justify-content:center;
+  position:relative;
+}
+.cal-day{
+  font-family:var(--font-cjk);font-weight:900;
+  font-size:clamp(120px,25vw,330px);
+  line-height:.9;letter-spacing:-.08em;
+}
+.cal-seal{
+  position:absolute;right:2%;bottom:8%;
+  width:clamp(58px,8vw,104px);aspect-ratio:1;
+  border:3px solid var(--ink);border-radius:50%;
+  display:grid;place-items:center;
+  transform:rotate(-9deg);
+  font-family:var(--font-cjk);font-weight:700;
+  font-size:clamp(15px,2vw,27px);letter-spacing:.06em;
+}
+.cal-time{
+  align-self:flex-end;
+  display:flex;flex-direction:column;gap:6px;
+  text-align:right;
+  border-left:1px solid var(--rule);
+  padding-left:var(--space-4);
+}
+.cal-time span:first-child{
+  font-family:var(--font-cjk);font-size:clamp(13px,1.4vw,19px);
+  letter-spacing:.2em;color:var(--ink-mute);
+}
+.cal-hm{
+  font-family:var(--font-mono);font-weight:600;
+  font-size:clamp(20px,3vw,42px);
+  font-variant-numeric:tabular-nums;letter-spacing:-.04em;
+}
+
+/* ============================================================
+   页脚
+   ============================================================ */
+.footer{
+  position:relative;z-index:1;
+  border-top:5px solid var(--ink);
+  padding:var(--space-5) clamp(20px,4vw,64px) var(--space-6);
+  display:grid;grid-template-columns:1fr 1fr;gap:var(--space-5);
+}
+.footer h2{
+  margin:0 0 var(--space-2);
+  font-family:var(--font-mono);font-size:11px;font-weight:600;letter-spacing:.14em;
+}
+.footer p{margin:0;font-size:12px;line-height:1.8;color:var(--ink-soft);max-width:60ch}
+.footer code{font-family:var(--font-mono);font-size:11px;color:var(--ink)}
+
+/* ============================================================
+   全屏预览：只留一块屏幕，供真实设备对照
+   ============================================================ */
+body.previewing .masthead,
+body.previewing .index,
+body.previewing .footer,
+body.previewing .stage-note,
+body.previewing .stage-bar{display:none}
+body.previewing .gallery{display:block;padding:0}
+body.previewing .stages{gap:0}
+body.previewing .stage:not(.is-active){display:none}
+body.previewing .screen{border:0;min-height:100vh;height:100vh}
+body.previewing .fp-time{font-size:clamp(96px,19vw,300px)}
+body.previewing .ins-time{font-size:clamp(80px,15vw,220px)}
+body.previewing .mono-time{font-size:clamp(120px,38vw,460px)}
+body.previewing .dm-time{font-size:clamp(70px,14vw,200px)}
+body.previewing .cal-day{font-size:clamp(160px,29vw,400px)}
+
+.exit-preview{
+  display:none;position:fixed;top:12px;right:12px;z-index:10;
+  min-height:44px;padding:8px 14px;
+  background:transparent;border:1px solid var(--rule);
+  color:var(--ink-mute);
+  font-family:var(--font-mono);font-size:10px;cursor:pointer;
+}
+.exit-preview:hover,.exit-preview:focus-visible{
+  border-color:var(--ink);color:var(--ink);background:var(--paper-hi);
+}
+body.previewing .exit-preview{display:block}
+
+/* 墨水屏模式：停秒、去噪点、关入场动效 */
+body.ek-mode .sec{display:none}
+body.ek-mode .reveal{opacity:1;transform:none;transition:none}
+
+/* ============================================================
+   入场序列（电脑预览用；墨水屏模式与减少动效时关闭）
+   ============================================================ */
+.reveal{opacity:0;transform:translateY(18px)}
+.reveal.in{
+  opacity:1;transform:none;
+  transition:opacity var(--dur) var(--ease),transform var(--dur) var(--ease);
+}
+.reveal.in:nth-child(2){transition-delay:80ms}
+.reveal.in:nth-child(3){transition-delay:160ms}
+.reveal.in:nth-child(4){transition-delay:240ms}
+.reveal.in:nth-child(5){transition-delay:320ms}
+@media (prefers-reduced-motion:reduce){
+  .reveal{opacity:1;transform:none;transition:none}
+  *{scroll-behavior:auto!important}
+}
+
+/* ============================================================
+   响应式
+   ============================================================ */
+@media (max-width:900px){
+  .gallery{grid-template-columns:1fr;gap:var(--space-5)}
+  .index{position:static}
+  .index ol{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:0 var(--space-4)}
+  .index-tools{max-width:320px}
+  .stage-note{grid-template-columns:1fr}
+  .stage-note .landing{text-align:left}
+  .footer{grid-template-columns:1fr}
+}
+@media (max-width:600px){
+  .masthead{grid-template-columns:1fr auto;gap:var(--space-3);padding-top:var(--space-5)}
+  .masthead-title{grid-column:1/-1;grid-row:2}
+  .masthead-meta{grid-row:1;grid-column:2}
+  .screen{min-height:340px}
+  .fp-time{font-size:clamp(64px,19vw,120px)}
+  .ins-time{font-size:clamp(52px,15vw,100px)}
+  .mono-time{font-size:clamp(80px,25vw,160px)}
+  .dm-time{font-size:clamp(42px,13vw,88px)}
+  .cal-day{font-size:clamp(100px,30vw,180px)}
+  .cal-side{padding-right:var(--space-2)}
+  .cal-week{display:none}
+}
+</style>
+</head>
+<body>
+
+<header class="masthead">
+  <div class="masthead-mark">INK<br>BUDDY</div>
+  <div class="masthead-title">
+    <h1>时钟样式</h1>
+    <p>五款为电子纸设计的读数界面。只用黑、白与四档灰，靠字号、字重和规则线分层，不靠颜色。</p>
+  </div>
+  <div class="masthead-meta">EDITION 01 / 2026<br>掌阅 iReader Neo2 调试<br>灰度 · 低刷新</div>
+</header>
+
+<main class="gallery">
+  <nav class="index" aria-label="样式目录">
+    <h2>STYLES / 05</h2>
+    <ol>
+      <li><a href="#style-1"><span class="idx-no">01</span><span><span class="idx-name">报头</span><span class="idx-en">THE FRONT PAGE</span></span></a></li>
+      <li><a href="#style-2"><span class="idx-no">02</span><span><span class="idx-name">仪表</span><span class="idx-en">THE INSTRUMENT</span></span></a></li>
+      <li><a href="#style-3"><span class="idx-no">03</span><span><span class="idx-name">巨字</span><span class="idx-en">THE MONOLITH</span></span></a></li>
+      <li><a href="#style-4"><span class="idx-no">04</span><span><span class="idx-name">点阵</span><span class="idx-en">THE DOT MATRIX</span></span></a></li>
+      <li><a href="#style-5"><span class="idx-no">05</span><span><span class="idx-name">台历</span><span class="idx-en">THE CALENDAR</span></span></a></li>
+    </ol>
+    <div class="index-tools">
+      <button class="tool-btn" id="ek-toggle" type="button" aria-pressed="false">
+        <span>墨水屏模式</span><span>关</span>
+      </button>
+      <p class="index-hint">打开后隐藏秒、关闭纸纹和入场动效，按每分钟一次刷新模拟真机。</p>
+    </div>
+  </nav>
+
+  <div class="stages">
+
+    <!-- 01 报头 -->
+    <section class="stage reveal" id="style-1" aria-labelledby="h-style-1">
+      <div class="stage-bar">
+        <span class="stage-no">01</span>
+        <h3 id="h-style-1">报头</h3>
+        <span class="stage-tag">EDITORIAL</span>
+        <button class="preview-btn" type="button" data-preview="style-1" aria-label="全屏预览报头样式">全屏预览 ↗</button>
+      </div>
+      <div class="screen screen--frontpage">
+        <div class="fp-top">
+          <span><b>INK BUDDY</b> · 每日时钟</span>
+          <span data-field="ymd"></span>
+        </div>
+        <div class="fp-rule"></div>
+        <div class="fp-time" data-field="hm">--:--</div>
+        <div class="fp-double"></div>
+        <div class="fp-bottom">
+          <div><span class="fp-label">星期</span><strong data-field="week"></strong></div>
+          <div><span class="fp-label">日期</span><strong data-field="date-cn"></strong></div>
+          <div><span class="fp-label">秒</span><strong class="sec" data-field="ss"></strong></div>
+        </div>
+      </div>
+      <div class="stage-note">
+        <p><strong>方向：</strong>把时间当报纸头条处理。粗黑规则线压住巨大衬线数字，下方三栏用中文衬线收尾。记忆点是那条上下不等宽的双线。<strong>字体：</strong>Playfair Display 900 + 宋体。<strong>落地：</strong>现有「主文本行 + 键值对」协议接近，规则线需排版层加一条上边框。</p>
+        <span class="landing">近似现有协议<br>加一条边框</span>
+      </div>
+    </section>
+
+    <!-- 02 仪表 -->
+    <section class="stage reveal" id="style-2" aria-labelledby="h-style-2">
+      <div class="stage-bar">
+        <span class="stage-no">02</span>
+        <h3 id="h-style-2">仪表</h3>
+        <span class="stage-tag">INDUSTRIAL</span>
+        <button class="preview-btn" type="button" data-preview="style-2" aria-label="全屏预览仪表样式">全屏预览 ↗</button>
+      </div>
+      <div class="screen screen--instrument">
+        <div class="ins-frame">
+          <span class="ins-corner tl"></span><span class="ins-corner tr"></span>
+          <span class="ins-corner bl"></span><span class="ins-corner br"></span>
+          <div class="ins-head"><span>LOCAL TIME</span><span>UTC+08:00</span></div>
+          <div class="ins-ticks" aria-hidden="true"></div>
+          <div class="ins-time" data-field="hm">--:--</div>
+          <div class="ins-grid">
+            <div><span>DATE</span><b data-field="ymd"></b></div>
+            <div><span>DAY</span><b data-field="week-en"></b></div>
+            <div><span>SEC</span><b class="sec" data-field="ss"></b></div>
+          </div>
+        </div>
+      </div>
+      <div class="stage-note">
+        <p><strong>方向：</strong>仪器读数的密度。等宽数字保证每位对齐，刻度尺按 5 分钟一大格、1 分钟一小格，四角实心块像表盘固定点。<strong>字体：</strong>IBM Plex Mono。<strong>落地：</strong>需要新内容类型来承载刻度；如果只是要等宽对齐，改字族即可套用现有协议。</p>
+        <span class="landing">需新增刻度元素<br>等宽字族可先用</span>
+      </div>
+    </section>
+
+    <!-- 03 巨字 -->
+    <section class="stage reveal" id="style-3" aria-labelledby="h-style-3">
+      <div class="stage-bar">
+        <span class="stage-no">03</span>
+        <h3 id="h-style-3">巨字</h3>
+        <span class="stage-tag">BRUTALLY MINIMAL</span>
+        <button class="preview-btn" type="button" data-preview="style-3" aria-label="全屏预览巨字样式">全屏预览 ↗</button>
+      </div>
+      <div class="screen screen--monolith">
+        <div class="mono-wrap">
+          <div class="mono-time">
+            <span data-field="hh">--</span><span class="mono-colon">:</span><span data-field="mm">--</span>
+          </div>
+          <div class="mono-meta"><span data-field="ymd"></span><span data-field="week"></span></div>
+        </div>
+      </div>
+      <div class="stage-note">
+        <p><strong>方向：</strong>只留时间，数字放大到冲出左右边界被裁掉一角。日期缩到角落，前面拉一条短线。留白和下沉的基线是全部设计。<strong>字体：</strong>Archivo Black。<strong>落地：</strong>把主文本行的字号按区域高度放大即可，裁切靠容器溢出隐藏。</p>
+        <span class="landing">现有协议<br>放大字号</span>
+      </div>
+    </section>
+
+    <!-- 04 点阵 -->
+    <section class="stage reveal" id="style-4" aria-labelledby="h-style-4">
+      <div class="stage-bar">
+        <span class="stage-no">04</span>
+        <h3 id="h-style-4">点阵</h3>
+        <span class="stage-tag">DOT MATRIX</span>
+        <button class="preview-btn" type="button" data-preview="style-4" aria-label="全屏预览点阵样式">全屏预览 ↗</button>
+      </div>
+      <div class="screen screen--dotmatrix">
+        <div class="dm-head"><span data-field="ymd"></span></div>
+        <div class="dm-time" data-field="hm">--:--</div>
+        <div class="dm-foot"><span data-field="week"></span><span>SEC <b class="sec" data-field="ss"></b></span></div>
+      </div>
+      <div class="stage-note">
+        <p><strong>方向：</strong>顺着电子纸的像素感走。整屏铺 7px 点阵，数字用像素字族，像设备自己吐出来的字形而不是网页排版。<strong>字体：</strong>Silkscreen，断网时降到等宽字族。<strong>落地：</strong>需要给排版层加一款像素字族；底纹可以只在控制端预览显示。</p>
+        <span class="landing">需新增字族<br>底纹可选</span>
+      </div>
+    </section>
+
+    <!-- 05 台历 -->
+    <section class="stage reveal" id="style-5" aria-labelledby="h-style-5">
+      <div class="stage-bar">
+        <span class="stage-no">05</span>
+        <h3 id="h-style-5">台历</h3>
+        <span class="stage-tag">CALENDAR</span>
+        <button class="preview-btn" type="button" data-preview="style-5" aria-label="全屏预览台历样式">全屏预览 ↗</button>
+      </div>
+      <div class="screen screen--calendar">
+        <div class="cal-side">
+          <span class="cal-month" data-field="month-cn"></span>
+          <span class="cal-year" data-field="year"></span>
+          <span class="cal-week" data-field="week"></span>
+        </div>
+        <div class="cal-main">
+          <span class="cal-day" data-field="day"></span>
+          <span class="cal-seal">今日</span>
+        </div>
+        <div class="cal-time">
+          <span>此刻</span>
+          <span class="cal-hm" data-field="hm">--:--</span>
+        </div>
+      </div>
+      <div class="stage-note">
+        <p><strong>方向：</strong>撕页台历的版面。竖排月份和星期夹住一个巨大的「日」，右下圆形印记压住版面，时间退到最右侧。纵横对比是记忆点。<strong>字体：</strong>宋体 + 等宽数字。<strong>落地：</strong>需要新增「日期主体 + 圆形标记」的内容类型，现有键值对排不出这个结构。</p>
+        <span class="landing">需新增内容类型</span>
+      </div>
+    </section>
+
+  </div>
+</main>
+
+<footer class="footer">
+  <div>
+    <h2>关于预览</h2>
+    <p>这是独立样式页，不参与主程序编译。每款都按真实时间走。点「全屏预览」单独看一款，按 Esc 返回；也可用 <code>?preview=style-3</code> 直达某款，把这一个地址发到设备浏览器。侧栏「墨水屏模式」隐藏秒、去掉纸纹和动效。</p>
+  </div>
+  <div>
+    <h2>落到 InkBuddy</h2>
+    <p>现有 <code>clock</code> 插件输出一行主文本和一组键值对，宿主统一排版。要套用这些样式，改宿主的内容类型与字号映射；要按样式切换，走视图配置或 URL 参数。字体走系统字栈的样式断网也能显示。</p>
+  </div>
+</footer>
+
+<button class="exit-preview" id="exit-preview" type="button">Esc / 点击返回</button>
+
+<script>
+(function () {
+  var body = document.body;
+  var fields = {};
+  var nodes = document.querySelectorAll('[data-field]');
+  var ekToggle = document.getElementById('ek-toggle');
+  var exitBtn = document.getElementById('exit-preview');
+  var stages = Array.prototype.slice.call(document.querySelectorAll('.stage'));
+
+  function pad(n) { return n < 10 ? '0' + n : String(n); }
+
+  // 只在值变化时写 DOM：这一页同样按电子纸的规矩来。
+  function paint() {
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      var key = el.getAttribute('data-field');
+      var next = fields[key];
+      if (next != null && el.textContent !== next) el.textContent = next;
+    }
+  }
+
+  function tick() {
+    var d = new Date();
+    var hour = pad(d.getHours());
+    var minute = pad(d.getMinutes());
+    fields.hm = hour + ':' + minute;
+    fields.hh = hour;
+    fields.mm = minute;
+    fields.ss = body.classList.contains('ek-mode') ? '' : pad(d.getSeconds());
+    fields.ymd = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+    fields.year = String(d.getFullYear());
+    fields.month = String(d.getMonth() + 1);
+    fields['month-cn'] = (d.getMonth() + 1) + '月';
+    fields.day = pad(d.getDate());
+    fields['date-cn'] = (d.getMonth() + 1) + '月' + d.getDate() + '日';
+    fields.week = ['星期日','星期一','星期二','星期三','星期四','星期五','星期六'][d.getDay()];
+    fields['week-en'] = ['SUN','MON','TUE','WED','THU','FRI','SAT'][d.getDay()];
+    paint();
+  }
+
+  tick();
+  // 电脑预览每秒走秒；墨水屏模式下改为每分钟一次，减少无谓刷新。
+  var timer = setInterval(tick, 1000);
+  function setClockRate() {
+    clearInterval(timer);
+    timer = setInterval(tick, body.classList.contains('ek-mode') ? 60000 : 1000);
+  }
+
+  ekToggle.addEventListener('click', function () {
+    var on = !body.classList.contains('ek-mode');
+    body.classList.toggle('ek-mode', on);
+    ekToggle.setAttribute('aria-pressed', String(on));
+    ekToggle.lastElementChild.textContent = on ? '开' : '关';
+    setClockRate();
+    tick();
+  });
+
+  // 全屏预览：只显示选中的舞台，其余从布局里摘掉，避免墨水屏上多屏重绘。
+  function startPreview(id) {
+    body.classList.add('previewing');
+    stages.forEach(function (s) { s.classList.toggle('is-active', s.id === id); });
+    exitBtn.focus();
+  }
+  function stopPreview() {
+    if (!body.classList.contains('previewing')) return;
+    body.classList.remove('previewing');
+    stages.forEach(function (s) { s.classList.remove('is-active'); });
+    if (location.search.indexOf('preview=') >= 0 && history.replaceState) {
+      var u = new URL(location.href);
+      u.searchParams.delete('preview');
+      history.replaceState(null, '', u.href);
+    }
+  }
+  document.querySelectorAll('[data-preview]').forEach(function (btn) {
+    btn.addEventListener('click', function () { startPreview(btn.getAttribute('data-preview')); });
+  });
+  exitBtn.addEventListener('click', stopPreview);
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') stopPreview();
+  });
+
+  // ?preview=style-3 直达单款全屏，把这一个地址发到设备浏览器即可对照真机。
+  if (window.URLSearchParams) {
+    var want = new URLSearchParams(location.search).get('preview');
+    if (want && stages.some(function (s) { return s.id === want; })) startPreview(want);
+  }
+
+  // 一次编排好的入场序列
+  if (window.IntersectionObserver && !body.classList.contains('ek-mode')) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (en) {
+        if (en.isIntersecting) {
+          en.target.classList.add('in');
+          io.unobserve(en.target);
+        }
+      });
+    }, { threshold: 0.08 });
+    stages.forEach(function (s) { io.observe(s); });
+  } else {
+    stages.forEach(function (s) { s.classList.add('in'); });
+  }
+})();
+</script>
+</body>
+</html>

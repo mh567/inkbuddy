@@ -88,6 +88,7 @@ async fn main() -> Result<()> {
                     version: VERSION.to_string(),
                     description: "正在播放的同步歌词，粤语歌带逐字粤拼".to_string(),
                     protocol: PROTOCOL_VERSION,
+                    variants: Vec::new(),
                 },
             ),
             Method::Render => {

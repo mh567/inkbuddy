@@ -43,8 +43,8 @@ private struct GeomRect {
             && y < o.maxY - regionGap && o.y < maxY - regionGap
     }
 
-    func toRegion(plugin: String) -> ViewRegion {
-        ViewRegion(plugin: plugin, x: x, y: y, w: w, h: h).sanitized()
+    func toRegion(plugin: String, variant: String? = nil) -> ViewRegion {
+        ViewRegion(plugin: plugin, x: x, y: y, w: w, h: h, variant: variant).sanitized()
     }
 }
 
@@ -166,7 +166,14 @@ final class ViewEditorModel: ObservableObject {
         if let view = view {
             viewId = view.id
             name = view.name
-            regions = view.regions
+            // 旧视图可能有越界坐标，或同一扩展出现多次（host 按 plugin 去重）。
+            // 打开时先校正，画布就不会出现零尺寸区域和重复 id。
+            var seen = Set<String>()
+            regions = view.regions.compactMap { region in
+                let clean = region.sanitized()
+                guard seen.insert(clean.plugin).inserted else { return nil }
+                return clean
+            }
         } else {
             viewId = "new"
             name = "自定义 \(HostService.shared.viewsState.views.count + 1)"
@@ -175,17 +182,18 @@ final class ViewEditorModel: ObservableObject {
         selected = nil
     }
 
-    /// 把一个已安装扩展加进画布。区域互斥：优先找一块放得下的空白
-    /// （按面积从大到小尝试）；画布已被占满时把面积最大的现有区域
-    /// 对半切开，一半给新扩展，保证新区域有可用尺寸且不与谁重叠。
-    /// 已在视图中的扩展不重复添加，改为选中它。
-    func addPlugin(_ id: String) {
+    /// 把一个已安装扩展（可带子样式）加进画布。区域互斥：优先找一块
+    /// 放得下的空白；画布已被占满时把面积最大的现有区域对半切开。
+    /// 同一个插件只占一个区域：再次点它的子样式时改这个区域的样式并选中，
+    /// 与宿主 sanitize 按 plugin 去重的规则一致。
+    func addPlugin(_ id: String, variant: String? = nil) {
         if let index = regions.firstIndex(where: { $0.plugin == id }) {
+            regions[index].variant = variant
             selected = index
             return
         }
         let rect = findFreeSpot() ?? splitLargestRegion()
-        regions.append(rect.toRegion(plugin: id))
+        regions.append(rect.toRegion(plugin: id, variant: variant))
         selected = regions.count - 1
     }
 
@@ -198,8 +206,11 @@ final class ViewEditorModel: ObservableObject {
         let sizes: [(Double, Double)] = [
             (100, 50), (50, 100), (66.66, 66.66), (50, 50),
             (33.33, 50), (50, 33.33), (33.33, 33.33), (25, 25),
+            (20, 20), (10, 10), (regionMinSize, regionMinSize),
         ]
+        // 先用原来的 5% 网格找大块，小尺寸用 2.5% 步进找细缝。
         for (w, h) in sizes {
+            let step = w <= 20 ? 2.5 : 5.0
             var py = 0.0
             while py + h <= 100 + 0.001 {
                 var px = 0.0
@@ -209,9 +220,9 @@ final class ViewEditorModel: ObservableObject {
                     if !others.contains(where: { candidate.intersects($0) }) {
                         return candidate
                     }
-                    px += 5
+                    px += step
                 }
-                py += 5
+                py += step
             }
         }
         return nil
@@ -224,19 +235,35 @@ final class ViewEditorModel: ObservableObject {
             regions[$0].w * regions[$0].h < regions[$1].w * regions[$1].h
         } ?? 0
         let original = GeomRect(regions[index])
+        let canSplitWide = original.w >= regionMinSize * 2
+        let canSplitTall = original.h >= regionMinSize * 2
         let newHalf: GeomRect
-        if original.w >= original.h {
+        if canSplitWide && (original.w >= original.h || !canSplitTall) {
             let half = original.w / 2
+            setGeometry(GeomRect(x: original.x, y: original.y, w: half, h: original.h), for: index)
             newHalf = GeomRect(x: original.x + half, y: original.y, w: half, h: original.h)
-            regions[index] = GeomRect(x: original.x, y: original.y, w: half, h: original.h)
-                .toRegion(plugin: regions[index].plugin)
-        } else {
+        } else if canSplitTall {
             let half = original.h / 2
+            setGeometry(GeomRect(x: original.x, y: original.y, w: original.w, h: half), for: index)
             newHalf = GeomRect(x: original.x, y: original.y + half, w: original.w, h: half)
-            regions[index] = GeomRect(x: original.x, y: original.y, w: original.w, h: half)
-                .toRegion(plugin: regions[index].plugin)
+        } else {
+            // 最大区域已经小到切不动：把它挪到角落并缩到最小尺寸，腾出的位置给新区域。
+            let corner = GeomRect(x: original.x, y: original.y,
+                                  w: regionMinSize, h: regionMinSize)
+            setGeometry(corner, for: index)
+            let spot = GeomRect(x: min(original.x + regionMinSize, 100 - regionMinSize),
+                                y: original.y, w: regionMinSize, h: regionMinSize)
+            newHalf = pushOutOfOthers(spot, index: -1)
         }
         return newHalf
+    }
+
+    /// 只替换几何，保留扩展 id 和子样式。拖拽、缩放、共享边、数值修改
+    /// 都走这里，避免带样式的时钟操作一次就退回默认样式。
+    private func setGeometry(_ rect: GeomRect, for index: Int) {
+        guard regions.indices.contains(index) else { return }
+        regions[index] = rect.toRegion(plugin: regions[index].plugin,
+                                       variant: regions[index].variant)
     }
 
     func removeSelected() {
@@ -258,7 +285,7 @@ final class ViewEditorModel: ObservableObject {
         rect.x = min(max(rect.x, 0), 100 - rect.w)
         rect.y = min(max(rect.y, 0), 100 - rect.h)
         rect = pushOutOfOthers(rect, index: index)
-        regions[index] = rect.toRegion(plugin: regions[index].plugin)
+        setGeometry(rect, for: index)
     }
 
     /// 缩放：anchor 是固定的对角，四条边分别处理；自由边不能越过
@@ -307,8 +334,8 @@ final class ViewEditorModel: ObservableObject {
                 if corner.isTop { minY = maxY - regionMinSize } else { maxY = minY + regionMinSize }
             }
         }
-        regions[index] = GeomRect(x: minX, y: minY, w: maxX - minX, h: maxY - minY)
-            .toRegion(plugin: current.plugin)
+        setGeometry(GeomRect(x: minX, y: minY, w: maxX - minX, h: maxY - minY),
+                    for: index)
     }
 
     /// 找出选中区域贴边共享的边：与邻居边缘距离 ≤ 0.5% 且沿边投影
@@ -371,8 +398,8 @@ final class ViewEditorModel: ObservableObject {
             nbr.w = nbr.maxX - x
             nbr.x = x
         }
-        regions[index] = sel.toRegion(plugin: regions[index].plugin)
-        regions[snap.neighbor] = nbr.toRegion(plugin: regions[snap.neighbor].plugin)
+        setGeometry(sel, for: index)
+        setGeometry(nbr, for: snap.neighbor)
     }
 
     /// 从其它区域里把 rect 推出来：沿穿透更小的轴退到贴边。
@@ -407,11 +434,11 @@ final class ViewEditorModel: ObservableObject {
     /// 数值面板修改后同样执行互斥约束：平移推出去，保证任何状态不重叠。
     func updateRegion(at index: Int, transform: (inout ViewRegion) -> Void) {
         guard regions.indices.contains(index), let start = regions[safe: index] else { return }
-        var region = start
+        var region = start.sanitized()
         transform(&region)
-        regions[index] = region.sanitized()
-        let rect = pushOutOfOthers(GeomRect(regions[index]), index: index)
-        regions[index] = rect.toRegion(plugin: region.plugin)
+        region = region.sanitized()
+        let rect = pushOutOfOthers(GeomRect(region), index: index)
+        regions[index] = rect.toRegion(plugin: region.plugin, variant: region.variant)
     }
 }
 
@@ -428,6 +455,10 @@ extension ViewRegion {
         r.y = (r.y * 100).rounded() / 100
         r.w = (r.w * 100).rounded() / 100
         r.h = (r.h * 100).rounded() / 100
+        if let variant = r.variant {
+            let trimmed = variant.trimmingCharacters(in: .whitespaces)
+            r.variant = trimmed.isEmpty ? nil : trimmed
+        }
         return r
     }
 }
@@ -439,6 +470,8 @@ struct ViewEditorView: View {
     let host: HostService
     /// 内嵌实时预览的内容缓存，随编辑拖拽实时刷新。
     let previewStore: EditorPreviewStore
+
+    private let paletteWidth: CGFloat = 190
 
     var body: some View {
         VStack(spacing: 10) {
@@ -481,7 +514,7 @@ struct ViewEditorView: View {
             HStack(alignment: .top, spacing: 12) {
                 // 左侧：已安装扩展面板
                 pluginPanel
-                    .frame(width: 170)
+                    .frame(width: paletteWidth)
                 // 中间：画布
                 canvas
                 // 右侧：数值精调 + 内嵌实时预览
@@ -501,7 +534,7 @@ struct ViewEditorView: View {
                     .foregroundColor(.orange)
             }
         }
-        .frame(minWidth: 760, minHeight: 520)
+        .frame(minWidth: 800, minHeight: 540)
     }
 
     private var canSave: Bool {
@@ -512,40 +545,130 @@ struct ViewEditorView: View {
         model.regions.map { $0.plugin }.filter { host.pluginName(for: $0) == nil }
     }
 
+    /// 保存前把样式写全：没选过的区域落成本插件的第一项，
+    /// 已下线的样式名也换回第一项，避免视图里留下空 variant。
+    private var normalizedRegions: [ViewRegion] {
+        model.regions.map { region in
+            var result = region
+            result.variant = effectiveVariant(region)
+            return result
+        }
+    }
+
     // MARK: - 左侧扩展面板
+
+    private var installedPlugins: [PluginInfo] {
+        host.plugins.filter { $0.installed }
+    }
 
     private var pluginPanel: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("已安装扩展")
                 .font(.system(size: 12, weight: .medium))
                 .foregroundColor(.secondary)
-            if host.plugins.filter({ $0.installed }).isEmpty {
+            if installedPlugins.isEmpty {
                 Text(host.running ? "未安装扩展" : "启动服务后显示")
                     .font(.system(size: 12))
                     .foregroundColor(.secondary)
+                Spacer(minLength: 0)
             } else {
-                ForEach(host.plugins.filter { $0.installed }) { plugin in
-                    Button {
-                        model.addPlugin(plugin.id)
-                    } label: {
-                        HStack {
-                            Text(plugin.name)
-                                .font(.system(size: 12))
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                            Spacer()
-                            Image(systemName: "plus.circle")
-                                .font(.system(size: 11))
-                                .foregroundColor(.secondary)
+                ScrollView(.vertical) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(installedPlugins) { plugin in
+                            pluginPaletteGroup(plugin)
+                            if plugin.id != installedPlugins.last?.id {
+                                Divider().padding(.leading, 2)
+                            }
                         }
                     }
-                    .buttonStyle(.borderless)
+                    // ScrollView 按内容理想宽度布局，必须给固定宽度，
+                    // 否则面板里的行会被压窄，文字全变成省略号。
+                    .frame(width: paletteWidth - 20, alignment: .leading)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            Spacer()
         }
         .padding(10)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color(NSColor.controlBackgroundColor)))
+    }
+
+    /// 一个扩展在左侧面板里的入口。有子样式的扩展展开成一组等宽行，
+    /// 组标题与子样式行用同一套缩进和右对齐图标，扩展多时也能滚动。
+    @ViewBuilder private func pluginPaletteGroup(_ plugin: PluginInfo) -> some View {
+        if plugin.variants.isEmpty {
+            Button { model.addPlugin(plugin.id) } label: {
+                panelRow(title: plugin.name, symbol: "plus.circle",
+                         selected: isSelected(plugin: plugin.id))
+            }
+            .buttonStyle(.plain)
+        } else {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Image(systemName: "square.on.square")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .frame(width: 14)
+                    Text(plugin.name)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 0)
+                }
+                ForEach(plugin.variants) { variant in
+                    Button { model.addPlugin(plugin.id, variant: variant.id) } label: {
+                        panelRow(title: variant.name, symbol: "plus",
+                                 indent: 20,
+                                 selected: isSelected(plugin: plugin.id, variant: variant.id))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    /// 区域实际用的样式。老视图没写 variant 或写了已下线的 id 时，
+    /// 按插件声明的第一项处理，和插件运行时的回退规则一致。
+    private func effectiveVariant(_ region: ViewRegion) -> String? {
+        guard let plugin = host.plugins.first(where: { $0.id == region.plugin }) else {
+            return region.variant
+        }
+        if plugin.variants.isEmpty { return nil }
+        if let id = region.variant, plugin.variants.contains(where: { $0.id == id }) {
+            return id
+        }
+        return plugin.variants[0].id
+    }
+
+    /// 画布里是否已存在这个插件的某个子样式。
+    private func isSelected(plugin: String, variant: String? = nil) -> Bool {
+        model.regions.contains { region in
+            guard region.plugin == plugin else { return false }
+            if let variant = variant { return effectiveVariant(region) == variant }
+            return true
+        }
+    }
+
+    private func panelRow(title: String, symbol: String, indent: CGFloat = 0,
+                          selected: Bool = false) -> some View {
+        HStack(spacing: 6) {
+            if indent > 0 {
+                Color.clear.frame(width: indent)
+            }
+            Text(title)
+                .font(.system(size: 12))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .foregroundColor(selected ? Color.accentColor : Color.primary)
+            Spacer(minLength: 2)
+            Image(systemName: selected ? "checkmark.circle.fill" : symbol)
+                .font(.system(size: 11))
+                .foregroundColor(selected ? Color.accentColor : .secondary)
+                .frame(width: 14)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
     }
 
     // MARK: - 中间画布（16:9，按百分比定位）
@@ -617,7 +740,7 @@ struct ViewEditorView: View {
                         lineWidth: isSelected ? 2 : 1
                     )
                 )
-            Text(host.pluginName(for: region.plugin) ?? region.plugin)
+            Text(regionLabel(region))
                 .font(.system(size: 11, weight: .medium))
                 .lineLimit(1)
                 .minimumScaleFactor(0.6)
@@ -625,7 +748,7 @@ struct ViewEditorView: View {
                 .padding(.vertical, 2)
                 .background(Capsule().fill(Color.white.opacity(0.85)))
                 .padding(4)
-                .frame(maxWidth: rect.width - 8)
+                .frame(maxWidth: max(20, rect.width - 8))
                 .allowsHitTesting(false)
             // 四角缩放把手，对角固定。position 用区域本地坐标。
             // 只有选中区域显示把手：否则相邻区域的把手互相重叠，
@@ -639,6 +762,17 @@ struct ViewEditorView: View {
         }
         .frame(width: rect.width, height: rect.height)
         .position(x: rect.midX, y: rect.midY)
+    }
+
+    /// 画布区域标签：有子样式时把样式名接在扩展名后面。
+    private func regionLabel(_ region: ViewRegion) -> String {
+        let name = host.pluginName(for: region.plugin) ?? region.plugin
+        guard let variant = effectiveVariant(region),
+              let plugin = host.plugins.first(where: { $0.id == region.plugin }),
+              let match = plugin.variants.first(where: { $0.id == variant }) else {
+            return name
+        }
+        return "\(name) · \(match.name)"
     }
 
     /// 四个把手的位置（区域本地坐标）与对应的缩放角。
@@ -822,8 +956,29 @@ struct ViewEditorView: View {
                 .font(.system(size: 12, weight: .medium))
                 .foregroundColor(.secondary)
             if let index = model.selected, let region = model.regions[safe: index] {
-                Text(host.pluginName(for: region.plugin) ?? region.plugin)
+                Text(regionLabel(region))
                     .font(.system(size: 13, weight: .medium))
+                if let plugin = host.plugins.first(where: { $0.id == region.plugin }),
+                   !plugin.variants.isEmpty {
+                    HStack {
+                        Text("样式")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                        Spacer(minLength: 4)
+                        Picker("样式", selection: Binding(
+                            get: { effectiveVariant(region) ?? "" },
+                            set: { newValue in
+                                model.updateRegion(at: index) { r in r.variant = newValue }
+                            }
+                        )) {
+                            ForEach(plugin.variants) { variant in
+                                Text(variant.name).tag(variant.id)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .frame(width: 96)
+                    }
+                }
                 numberRow("位置 X (%)", value: Binding(
                     get: { region.x },
                     set: { newValue in model.updateRegion(at: index) { r in r.x = newValue } }
@@ -872,8 +1027,8 @@ struct ViewEditorView: View {
     // MARK: - 内嵌实时预览
 
     /// 与编辑画布同一几何模型的实时预览，放在数值面板下方：
-    /// 拖拽时区域几何直接驱动预览排版，内容文本由 host /api/preview
-    /// 提供（去抖 250ms + 每秒轮询），取代原来的悬浮预览窗口。
+    /// 拖拽时把区域几何和设备宽高比发给 host /api/preview/html，
+    /// 拿回完整页面交给 WebKit 显示（去抖 250ms + 每秒轮询）。
     private var previewPanel: some View {
         VStack(spacing: 6) {
             Text("实时预览")
@@ -899,7 +1054,7 @@ struct ViewEditorView: View {
                 ? "custom-\(Int(Date().timeIntervalSince1970 * 1000))-\(Int.random(in: 100...999))"
                 : (model.viewId ?? ""),
             name: name,
-            regions: model.regions
+            regions: normalizedRegions
         )
         let finish: (Bool) -> Void = { ok in
             model.isSaving = false
@@ -948,7 +1103,7 @@ final class ViewEditorWindowController {
             window = existing
         } else {
             window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 800, height: 560),
+                contentRect: NSRect(x: 0, y: 0, width: 860, height: 580),
                 styleMask: [.titled, .closable],
                 backing: .buffered,
                 defer: false
@@ -958,7 +1113,7 @@ final class ViewEditorWindowController {
             window.center()
             self.window = window
             // 点标题栏红色关闭按钮也走同一套清理：移除预览视图，
-            // 停掉每秒一次的 /api/preview 轮询。
+            // 停掉每秒一次的 /api/preview/html 请求。
             NotificationCenter.default.addObserver(
                 forName: NSWindow.willCloseNotification, object: window, queue: .main
             ) { [weak self] _ in
@@ -974,7 +1129,7 @@ final class ViewEditorWindowController {
         }
         let hosting = NSHostingView(rootView: ViewEditorView(model: model, host: host, previewStore: previewStore))
         window.contentView = hosting
-        window.setContentSize(NSSize(width: 800, height: 560))
+        window.setContentSize(NSSize(width: 860, height: 580))
         NSApp.setActivationPolicy(.regular)
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -987,7 +1142,7 @@ final class ViewEditorWindowController {
 
     /// 关窗清理：替换 contentView 让 SwiftUI 视图树销毁，预览的 1s 轮询、
     /// 250ms 去抖订阅随视图生命周期一起取消（否则窗口只是 orderOut，
-    /// 视图仍存活，每秒都会向 host 发 /api/preview，每次触发插件渲染）；
+    /// 视图仍存活，每秒都会向 host 请求页面，每次触发插件渲染）；
     /// 同时清空预览缓存，避免下次打开闪现上一个视图的内容。
     private func teardownContent() {
         if window?.contentView is NSHostingView<ViewEditorView> {

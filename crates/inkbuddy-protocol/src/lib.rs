@@ -77,6 +77,9 @@ pub struct RenderParams {
     pub height: u32,
     /// Active theme name, currently always `"ink"`.
     pub theme: String,
+    /// 视图区域选中的子样式。插件用 id 匹配自己声明的 variants；
+    /// None 表示用 variants 的第一项。
+    pub variant: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -123,14 +126,27 @@ impl Response {
     }
 }
 
+/// 插件可选的一种子样式。id 用于匹配 render 请求的 `variant`，
+/// name 是控制端展示用的名字。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VariantInfo {
+    pub id: String,
+    pub name: String,
+}
+
 /// Reply payload for `describe`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PluginInfo {
     pub id: String,
     pub name: String,
     pub version: String,
     pub description: String,
     pub protocol: u32,
+    /// 该插件提供的子样式。空列表表示不可切换样式。
+    /// 老插件不返回这个字段，反序列化时按空列表处理。
+    pub variants: Vec<VariantInfo>,
 }
 
 /// Reply payload for `render`.
@@ -162,6 +178,16 @@ pub enum Block {
     Text { text: String },
     /// Escape hatch: raw HTML. The host sanitizes it with a tag allowlist
     /// before inserting it into the page.
+    ///
+    /// The markup can carry two optional attributes for the host's layout
+    /// estimates. They are read from the raw markup and stripped by the
+    /// sanitizer, so they never reach the page:
+    /// - `data-ink-height="<f32>"` on the root element: content height in
+    ///   "vh on a square screen" units, used to scale content into a region.
+    /// - `data-ink-role="primary|normal|muted|reading"` on a leaf element:
+    ///   visual weight of that line in the structured text preview.
+    /// Both are optional. Any plugin can use them; the host does not know
+    /// any plugin's class names.
     Html { html: String },
     /// Unknown block type from a newer or third-party plugin. The host skips
     /// that block and keeps the rest of the frame.

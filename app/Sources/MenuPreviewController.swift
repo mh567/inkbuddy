@@ -9,7 +9,7 @@ final class MenuPreviewModel: ObservableObject {
 }
 
 /// 菜单栏预览的 SwiftUI 壳：把共享画布接到菜单侧的取数对象上。
-/// store 的 contents 是 @Published，时钟/歌词变化时画布会自己重绘，
+/// store 的 frame 是 @Published，宿主返回新页面时画布会自己重绘，
 /// 不用控制器去比对内容差异。
 private struct MenuPreviewRoot: View {
     @ObservedObject var model: MenuPreviewModel
@@ -18,7 +18,7 @@ private struct MenuPreviewRoot: View {
     var body: some View {
         InkPreviewCanvas(
             regions: model.regions,
-            contents: store.contents,
+            frame: store.frame,
             aspect: model.aspect,
             showChrome: false
         )
@@ -27,9 +27,9 @@ private struct MenuPreviewRoot: View {
 
 /// 菜单栏下拉里的预览头部：上一行是 ◀ / 当前视图名 / ▶，下方显示墨水屏内容。
 ///
-/// 预览画布与设置里的编辑器预览共用 InkPreviewCanvas，同一套排版、同一份
-/// /api/preview 数据。菜单这里只负责视图切换头部和轮询生命周期：菜单打开时
-/// 拉当前视图的区域布局并定时取内容，关闭时停掉轮询。
+/// 预览画布与设置里的编辑器预览共用 InkPreviewCanvas，显示 host
+/// /api/preview/html 生成的页面。菜单这里只负责视图切换头部和轮询生命周期：
+/// 菜单打开时拉当前视图的区域布局并定时取页面，关闭时停掉轮询。
 final class MenuPreviewController: NSObject {
     let containerView: NSView
 
@@ -168,7 +168,7 @@ final class MenuPreviewController: NSObject {
 
     @objc private func poll() {
         syncLayout()
-        store.fetch(plugins: model.regions.map { $0.plugin })
+        store.fetch(regions: model.regions, aspect: model.aspect)
     }
 
     func setName(_ text: String) {

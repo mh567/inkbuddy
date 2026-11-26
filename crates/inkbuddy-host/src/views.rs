@@ -24,6 +24,9 @@ pub struct Region {
     pub y: f32,
     pub w: f32,
     pub h: f32,
+    /// 插件子样式 id。缺省表示插件自己选默认；值为空串也按缺省处理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
 }
 
 impl Region {
@@ -38,6 +41,7 @@ impl Region {
             y: h * index as f32,
             w: 100.0,
             h,
+            variant: None,
         }
     }
 
@@ -55,12 +59,14 @@ impl Region {
         let h = self.h.clamp(MIN_REGION_SIZE, 100.0);
         let x = Self::clamp_coord(self.x).min(100.0 - w);
         let y = Self::clamp_coord(self.y).min(100.0 - h);
+        let variant = self.variant.as_deref().map(str::trim).filter(|v| !v.is_empty());
         Region {
             plugin: self.plugin.trim().to_string(),
             x: (x * 100.0).round() / 100.0,
             y: (y * 100.0).round() / 100.0,
             w: (w * 100.0).round() / 100.0,
             h: (h * 100.0).round() / 100.0,
+            variant: variant.map(|v| v.chars().take(32).collect()),
         }
     }
 }
@@ -254,6 +260,7 @@ mod tests {
             y,
             w,
             h,
+            variant: None,
         }
     }
 
@@ -320,6 +327,17 @@ mod tests {
         };
         assert!(vs.current_regions().is_some());
         assert!(ViewState::default().current_regions().is_none());
+    }
+
+    #[test]
+    fn variant_survives_sanitize_and_empty_becomes_none() {
+        let mut r = region("clock", 0.0, 0.0, 100.0, 100.0);
+        r.variant = Some("  dot  ".to_string());
+        assert_eq!(r.sanitized().variant.as_deref(), Some("dot"));
+        r.variant = Some("   ".to_string());
+        assert_eq!(r.sanitized().variant, None);
+        r.variant = None;
+        assert_eq!(r.sanitized().variant, None);
     }
 
     #[test]

@@ -5,6 +5,12 @@ import AppKit
 /// 一个扩展。installed 来自 host 的卸载黑名单：目录扫描到 = 安装来源，
 /// 卸载只是本地标记。enabled 是 manifest 的运行时开关，host 的默认布局
 /// 用它过滤，菜单无视图时也要按同样规则回退。
+/// 插件声明的一个子样式，id 传给插件的 render 请求，name 用于界面展示。
+struct PluginVariant: Identifiable, Codable, Hashable {
+    let id: String
+    let name: String
+}
+
 struct PluginInfo: Identifiable, Codable {
     let id: String
     let name: String
@@ -14,23 +20,73 @@ struct PluginInfo: Identifiable, Codable {
     let enabled: Bool
     let defaultOn: Bool
     let running: Bool
+    /// 插件提供的子样式。老 host 没有这个字段时按空数组处理。
+    var variants: [PluginVariant]
 
     enum CodingKeys: String, CodingKey {
-        case id, name, version, description, installed, enabled, running
+        case id, name, version, description, installed, enabled, running, variants
         case defaultOn = "default_on"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        version = try c.decode(String.self, forKey: .version)
+        description = try c.decode(String.self, forKey: .description)
+        installed = try c.decode(Bool.self, forKey: .installed)
+        enabled = try c.decode(Bool.self, forKey: .enabled)
+        defaultOn = try c.decode(Bool.self, forKey: .defaultOn)
+        running = try c.decode(Bool.self, forKey: .running)
+        variants = try c.decodeIfPresent([PluginVariant].self, forKey: .variants) ?? []
+    }
+
+    /// setInstalled 里重建对象时用：保留已有字段，只改 installed / running。
+    init(id: String, name: String, version: String, description: String,
+         installed: Bool, enabled: Bool, defaultOn: Bool, running: Bool,
+         variants: [PluginVariant] = []) {
+        self.id = id
+        self.name = name
+        self.version = version
+        self.description = description
+        self.installed = installed
+        self.enabled = enabled
+        self.defaultOn = defaultOn
+        self.running = running
+        self.variants = variants
     }
 }
 
 /// 一个屏幕区域：把某个扩展放到屏幕的哪个位置、占多大。
 /// x/y 是左上角，w/h 是宽高，全部为屏幕百分比（0-100）。
+/// variant 是该区域选用的插件子样式；nil 表示插件自己决定默认。
 struct ViewRegion: Codable, Equatable, Identifiable {
     var plugin: String
     var x: Double
     var y: Double
     var w: Double
     var h: Double
+    var variant: String?
 
     var id: String { plugin }
+
+    /// 旧调用点（菜单预览的竖排区域）不需要子样式。
+    init(plugin: String, x: Double, y: Double, w: Double, h: Double, variant: String? = nil) {
+        self.plugin = plugin
+        self.x = x
+        self.y = y
+        self.w = w
+        self.h = h
+        self.variant = variant
+    }
+
+    /// 预览缓存的 key。与 host 的 preview_key 规则一致。
+    var previewKey: String {
+        if let variant = variant, !variant.isEmpty {
+            return "\(plugin):\(variant)"
+        }
+        return plugin
+    }
 }
 
 /// 一个具名视图：扩展的区域布局。对应 host 的 /api/views。
@@ -341,15 +397,17 @@ final class HostService: ObservableObject {
             DispatchQueue.main.async {
                 if ok, let self = self,
                    let index = self.plugins.firstIndex(where: { $0.id == id }) {
+                    let old = self.plugins[index]
                     self.plugins[index] = PluginInfo(
-                        id: self.plugins[index].id,
-                        name: self.plugins[index].name,
-                        version: self.plugins[index].version,
-                        description: self.plugins[index].description,
+                        id: old.id,
+                        name: old.name,
+                        version: old.version,
+                        description: old.description,
                         installed: installed,
-                        enabled: self.plugins[index].enabled,
-                        defaultOn: self.plugins[index].defaultOn,
-                        running: installed ? self.plugins[index].running : false
+                        enabled: old.enabled,
+                        defaultOn: old.defaultOn,
+                        running: installed ? old.running : false,
+                        variants: old.variants
                     )
                 } else if !ok {
                     // 失败时重拉，保证界面与服务端一致
@@ -426,7 +484,14 @@ final class HostService: ObservableObject {
                     "id": view.id,
                     "name": view.name,
                     "regions": view.regions.map { r in
-                        ["plugin": r.plugin, "x": r.x, "y": r.y, "w": r.w, "h": r.h]
+                        var region: [String: Any] = [
+                            "plugin": r.plugin, "x": r.x, "y": r.y, "w": r.w, "h": r.h
+                        ]
+                        // nil 不写这个键，host 侧按缺省处理。
+                        if let variant = r.variant, !variant.isEmpty {
+                            region["variant"] = variant
+                        }
+                        return region
                     }
                 ]
             }

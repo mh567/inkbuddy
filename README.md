@@ -48,7 +48,8 @@ http://<mac-局域网-IP>:9012/
 | `/api/frame` | 聚合后的展示内容（JSON），含视图区域数据与页面版本号 |
 | `/api/plugins` | 已安装插件及运行状态 |
 | `/api/views`、`/api/views/current` | 视图列表读写、应用视图 |
-| `/api/preview` | 插件内容的结构化预览（POST），控制端编辑器与预览使用 |
+| `/api/preview` | 插件内容的结构化文本预览（POST） |
+| `/api/preview/html` | 按给定区域与宽高比生成的完整页面（POST），控制端编辑器与菜单栏预览使用 |
 | `/api/display` | 显示模式（gray/bw/text）与反色（POST） |
 | `/api/health` | 健康检查，含设备最近上报的屏幕宽高比 |
 
@@ -64,6 +65,8 @@ http://<ip>:9012/?plugins=ai-quota          # 只显示 AI 额度
 不带参数时显示所有 `default_on = true` 的插件（歌词，以及装了 Codex CLI 的机器上的 AI 额度）。显示内容优先跟随当前视图（见下文「视图」）；没有选中视图时退到 URL 参数，再退到 `default_on`。选择放在 URL 里。
 
 视图生效时每个插件渲染在自己的区域里，字号按区域大小自动缩放（宽度占比与高度装得下内容两个约束取小），缩放用的宽高比来自设备浏览器每次轮询上报的真实视口尺寸。
+
+墨水屏页面底部是 `inkbuddy` 条，点它进入全屏展示，底部条随之隐藏。全屏下点左侧区域切到上一个视图、右侧区域切到下一个视图；点中间区域在顶部显示或隐藏「退出全屏」按钮。视图切换与菜单栏左右箭头走同一份视图数据。
 
 扩展目录在运行时会被重新扫描，新放进目录的扩展即时生效。
 
@@ -106,9 +109,9 @@ inkbuddy --list-plugins
 - 显示始终跟随当前视图的布局；没有选中视图时墨水屏按流式竖排渲染（URL 参数 / `default_on`）。
 - 旧格式（`plugins` 列表）加载时自动迁移为竖排等分区域。
 - 接口：`GET/POST /api/views`（读写整个列表）、`POST /api/views/current`（应用视图，`id` 传 `null` 只清指针）。
-- `/api/frame` 返回每区域的几何、文本行与字号缩放，供墨水屏页面取帧；控制端的编辑器预览与菜单栏预览走 `/api/preview`，取同一套结构化内容后按相同规则原生排版。
+- `/api/frame` 返回每区域的几何、文本行与字号缩放，供墨水屏页面取帧；控制端的编辑器预览与菜单栏预览走 `/api/preview/html`，宿主用与取帧相同的代码生成完整页面，控制端用 WebKit 显示，两处是同一份 HTML 和 CSS。
 
-macOS 菜单栏 app 的视图编辑窗口：左侧从已安装扩展添加区域（自动避让已有区域），画布上拖拽移动、四角缩放、相邻区域共享边同步拖动；右侧数值精调，下方内嵌实时预览（随拖拽实时渲染，排版与墨水屏页面同源）。画布比例自动同步设备实测宽高比，选择会持久化。「保存」落盘，「应用」直接生效且编辑窗口保持打开，方便对着墨水屏持续调整。
+macOS 菜单栏 app 的视图编辑窗口：左侧从已安装扩展添加区域（自动避让已有区域），画布上拖拽移动、四角缩放、相邻区域共享边同步拖动；右侧数值精调，下方内嵌实时预览（用 WebKit 显示宿主生成的页面，与墨水屏页面同源）。画布比例自动同步设备实测宽高比，选择会持久化。「保存」落盘，「应用」直接生效且编辑窗口保持打开，方便对着墨水屏持续调整。
 
 ### 扩展安装与卸载
 
@@ -136,7 +139,7 @@ macOS 菜单栏 app 的视图编辑窗口：左侧从已安装扩展添加区域
 | 插件 | 用途 | 说明 |
 | --- | --- | --- |
 | `lyrics` | 正在播放的同步歌词 | [crates/inkbuddy-plugin-lyrics/README.md](crates/inkbuddy-plugin-lyrics/README.md) |
-| `clock` | 当前日期与时间 | [crates/inkbuddy-plugin-clock/README.md](crates/inkbuddy-plugin-clock/README.md) |
+| `clock` | 当前日期与时间，视图里可给时钟区域选经典、点阵、台历 | [crates/inkbuddy-plugin-clock/README.md](crates/inkbuddy-plugin-clock/README.md) |
 | `ai-quota` | Codex 套餐与 5 小时、周额度用量，进度条展示 | [crates/inkbuddy-plugin-ai-quota/README.md](crates/inkbuddy-plugin-ai-quota/README.md) |
 
 ## 写自己的插件

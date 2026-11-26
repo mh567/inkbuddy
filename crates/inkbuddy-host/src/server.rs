@@ -7,7 +7,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use inkbuddy_protocol::{RenderParams, RenderResult};
+use inkbuddy_protocol::{RenderParams, RenderResult, VariantInfo};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -187,6 +187,8 @@ struct PluginSummary {
     enabled: bool,
     default_on: bool,
     running: bool,
+    /// 插件声明的子样式；控制端据此把时钟展开成可选样式。
+    variants: Vec<VariantInfo>,
 }
 
 /// Resolve the plugin ids for the no-view path: the URL parameter wins when
@@ -215,9 +217,162 @@ fn resolve_ids(set: &PluginSet, query: &Option<String>, uninstalled: &[String]) 
         .collect()
 }
 
+/// 预览请求的一项。老控制端只传字符串数组（没有 variant），用 untagged
+/// 兼容；新控制端传 {"plugin":"clock","variant":"dot"}。
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PreviewItem {
+    Plain(String),
+    WithVariant {
+        plugin: String,
+        #[serde(default)]
+        variant: Option<String>,
+    },
+}
+
+impl PreviewItem {
+    fn plugin(&self) -> &str {
+        match self {
+            PreviewItem::Plain(p) => p,
+            PreviewItem::WithVariant { plugin, .. } => plugin,
+        }
+    }
+
+    fn variant(&self) -> Option<&str> {
+        match self {
+            PreviewItem::Plain(_) => None,
+            PreviewItem::WithVariant { variant, .. } => variant.as_deref(),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct PreviewRequest {
-    plugins: Vec<String>,
+    plugins: Vec<PreviewItem>,
+}
+
+/// 预览内容的 key：有 variant 时拼成 "plugin:variant"，让同一插件的
+/// 不同子样式在编辑器里各占一份缓存，互不覆盖。
+fn preview_key(plugin: &str, variant: Option<&str>) -> String {
+    match variant {
+        Some(v) if !v.is_empty() => format!("{plugin}:{v}"),
+        _ => plugin.to_string(),
+    }
+}
+
+/// 控制端预览用的请求：传当前正在编辑（尚未保存）的区域布局和画布宽高比。
+/// host 用与墨水屏完全相同的代码生成页面，控制端只需在 WebKit 里显示。
+#[derive(Deserialize)]
+struct PreviewHtmlRequest {
+    regions: Vec<Region>,
+    #[serde(default = "default_preview_aspect")]
+    aspect: f32,
+}
+
+fn default_preview_aspect() -> f32 {
+    1.0
+}
+
+#[derive(Serialize)]
+struct PreviewHtmlResponse {
+    /// 完整独立 HTML 文档，样式与墨水屏页面同源，可直接喂给 WebView。
+    html: String,
+    /// 文档签名，内容不变时控制端跳过重新加载，避免预览闪烁。
+    signature: String,
+}
+
+/// 把取帧得到的 HTML 包成独立文档。直接复用设备页面的 head 与 body 标记，
+/// 只做三处改动：注入帧内容、写死显示模式的 body class、去掉轮询脚本
+/// （预览内容由控制端每次取数提供）。这样底部条、画布高度和区域定位
+/// 与设备一模一样，预览与真机按同一套标记渲染。
+fn preview_document(frame_html: &str, mode: &str, invert: bool) -> String {
+    let cut = INK_PAGE.find("<script>").unwrap_or(INK_PAGE.len());
+    let mut doc = INK_PAGE[..cut].to_string();
+    let classes = format!(
+        " class=\"layout-region mode-{} {}\"",
+        mode,
+        if invert { "invert" } else { "" }
+    );
+    doc = doc.replacen("<body>", &format!("<body{classes}>"), 1);
+    doc = doc.replacen(
+        "<div id=\"frame\">载入中…</div>",
+        &format!("<div id=\"frame\">{frame_html}</div>"),
+        1,
+    );
+    doc.push_str("</body></html>");
+    doc
+}
+
+/// 编辑器实时预览：按未保存的区域布局渲染一帧，返回完整 HTML 文档。
+/// 与 `/api/frame` 共用 `render_frame_with_mode`，所以点阵、台历这类
+/// HTML 块样式在预览里和设备上是同一份内容和同一份样式。
+async fn preview_html(
+    State(state): State<Shared>,
+    Json(req): Json<PreviewHtmlRequest>,
+) -> Response {
+    refresh_plugins(&state).await;
+    let display = state.display.read().await.clone();
+    let fallback_ms = state.config.display.refresh_ms;
+
+    let regions: Vec<Region> = req
+        .regions
+        .iter()
+        .take(MAX_PLUGIN_IDS)
+        .map(Region::sanitized)
+        .collect();
+
+    // 与 /api/frame 一致：同一插件只占一个区域，取第一个区域的 variant。
+    let mut seen = HashSet::new();
+    let selected: Vec<(String, Option<String>, Arc<crate::plugin::PluginProcess>)> = {
+        let guard = state.plugins.read().await;
+        let uninstalled = state.uninstalled.read().await;
+        regions
+            .iter()
+            .filter(|r| seen.insert(r.plugin.clone()))
+            .filter(|r| is_installed(&guard, &uninstalled, &r.plugin))
+            .filter_map(|r| {
+                guard
+                    .get(&r.plugin)
+                    .map(|p| (r.plugin.clone(), r.variant.clone(), Arc::clone(&p)))
+            })
+            .collect()
+    };
+
+    let mut futures = Vec::new();
+    for (id, variant, p) in selected {
+        let params = RenderParams {
+            width: 0,
+            height: 0,
+            theme: "ink".to_string(),
+            variant,
+        };
+        futures.push(async move { (id, p.render(&params).await) });
+    }
+    let results = futures::future::join_all(futures).await;
+    let parts: Vec<(String, RenderResult)> = results
+        .into_iter()
+        .filter_map(|(id, result)| result.ok().map(|r| (id, r)))
+        .collect();
+
+    let frame = render_frame_with_mode(
+        &parts,
+        fallback_ms,
+        Some(&regions),
+        display.mode == "text",
+        req.aspect.clamp(0.3, 4.0),
+    );
+    let doc = preview_document(&frame.html, &display.mode, display.invert);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&doc, &mut hasher);
+    let signature = format!("{:016x}", std::hash::Hasher::finish(&hasher));
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(PreviewHtmlResponse {
+            html: doc,
+            signature,
+        }),
+    )
+        .into_response()
 }
 
 #[derive(Serialize)]
@@ -242,38 +397,46 @@ struct PreviewContent {
 async fn preview_frame(State(state): State<Shared>, Json(req): Json<PreviewRequest>) -> Response {
     refresh_plugins(&state).await;
     let text_mode = state.display.read().await.mode == "text";
-    let params = RenderParams {
-        width: 0,
-        height: 0,
-        theme: "ink".to_string(),
-    };
-    let selected: Vec<(String, Arc<crate::plugin::PluginProcess>)> = {
+    let selected: Vec<(String, Option<String>, Arc<crate::plugin::PluginProcess>)> = {
         let guard = state.plugins.read().await;
         let uninstalled = state.uninstalled.read().await;
         let mut seen = HashSet::new();
         req.plugins
             .iter()
-            .filter(|id| seen.insert((*id).clone()))
-            .filter(|id| is_installed(&guard, &uninstalled, id))
-            .filter_map(|id| guard.get(id).map(|p| (id.clone(), Arc::clone(&p))))
+            .filter(|item| seen.insert(preview_key(item.plugin(), item.variant())))
+            .filter(|item| is_installed(&guard, &uninstalled, item.plugin()))
+            .filter_map(|item| {
+                guard.get(item.plugin()).map(|p| {
+                    (
+                        preview_key(item.plugin(), item.variant()),
+                        item.variant().map(str::to_string),
+                        Arc::clone(&p),
+                    )
+                })
+            })
             // 与 MAX_REGIONS_PER_VIEW / /api/frame 一致：一个视图最多 64 个区域，
             // 编辑器预览要能看到全部区域，不能在这里截成 8 个。
             .take(MAX_PLUGIN_IDS)
             .collect()
     };
     let mut futures = Vec::new();
-    for (id, p) in selected {
-        let params = params.clone();
-        futures.push(async move { (id, p.render(&params).await) });
+    for (key, variant, p) in selected {
+        let params = RenderParams {
+            width: 0,
+            height: 0,
+            theme: "ink".to_string(),
+            variant,
+        };
+        futures.push(async move { (key, p.render(&params).await) });
     }
     let results = futures::future::join_all(futures).await;
     let out: Vec<PreviewContent> = results
         .into_iter()
-        .filter_map(|(id, result)| {
+        .filter_map(|(key, result)| {
             result.ok().map(|r| {
                 let preview = preview_content(&r, text_mode);
                 PreviewContent {
-                    plugin: id,
+                    plugin: key,
                     lines: preview.lines,
                     blocks: preview.blocks,
                     content_units: preview.content_units,
@@ -288,10 +451,11 @@ async fn preview_frame(State(state): State<Shared>, Json(req): Json<PreviewReque
 async fn get_frame(State(state): State<Shared>, Query(q): Query<FrameQuery>) -> impl IntoResponse {
     refresh_plugins(&state).await;
     let fallback_ms = state.config.display.refresh_ms;
-    let params = RenderParams {
+    let base_params = RenderParams {
         width: q.width.unwrap_or(0),
         height: q.height.unwrap_or(0),
         theme: "ink".to_string(),
+        variant: None,
     };
 
     // 先快照布局与插件句柄，再释放读锁，之后才做子进程 IO；慢插件不会阻塞
@@ -314,9 +478,23 @@ async fn get_frame(State(state): State<Shared>, Query(q): Query<FrameQuery>) -> 
             }
             None => resolve_ids(&guard, &q.plugins, &uninstalled),
         };
-        let selected: Vec<(String, Arc<crate::plugin::PluginProcess>)> = ids
+        // 区域的子样式随插件一起带下去，并参与渲染缓存的 key。
+        // 同一个插件在视图里只占一个区域（sanitize 按 plugin 去重），
+        // 所以 ids 仍按 plugin 标识，variant 单独查表。
+        let variants: HashMap<String, Option<String>> = match &layout {
+            Some(regions) => regions
+                .iter()
+                .map(|r| (r.plugin.clone(), r.variant.clone()))
+                .collect(),
+            None => HashMap::new(),
+        };
+        let selected: Vec<(String, Option<String>, Arc<crate::plugin::PluginProcess>)> = ids
             .iter()
-            .filter_map(|id| guard.get(id).map(|p| (id.clone(), p)))
+            .filter_map(|id| {
+                guard.get(id).map(|p| {
+                    (id.clone(), variants.get(id).cloned().flatten(), p)
+                })
+            })
             .collect();
         (layout, ids, selected)
     };
@@ -328,27 +506,32 @@ async fn get_frame(State(state): State<Shared>, Query(q): Query<FrameQuery>) -> 
         let mut to_render = Vec::new();
         let mut resolved: HashMap<String, RenderResult> = HashMap::new();
         let now = Instant::now();
-        for (id, p) in &selected {
+        for (id, variant, p) in &selected {
+            let key = preview_key(id, variant.as_deref());
             let fresh = cache
-                .get(id)
+                .get(&key)
                 .map(|(at, _, interval)| now.duration_since(*at) < Duration::from_millis(*interval))
                 .unwrap_or(false);
             if fresh {
-                if let Some((_, result, _)) = cache.get(id) {
+                if let Some((_, result, _)) = cache.get(&key) {
                     resolved.insert(id.clone(), result.clone());
                 }
             } else {
-                to_render.push((id.clone(), Arc::clone(p), params.clone()));
+                let params = RenderParams {
+                    variant: variant.clone(),
+                    ..base_params.clone()
+                };
+                to_render.push((id.clone(), key, Arc::clone(p), params));
             }
         }
         (to_render, resolved)
     };
 
     let mut futures = Vec::new();
-    for (id, p, params) in to_render {
+    for (id, key, p, params) in to_render {
         futures.push(async move {
             let result = p.render(&params).await;
-            (id, result)
+            (id, key, result)
         });
     }
     let results = futures::future::join_all(futures).await;
@@ -358,20 +541,20 @@ async fn get_frame(State(state): State<Shared>, Query(q): Query<FrameQuery>) -> 
         let cache = state.render_cache.lock().await;
         cache
             .iter()
-            .map(|(id, (_, r, _))| (id.clone(), r.clone()))
+            .map(|(key, (_, r, _))| (key.clone(), r.clone()))
             .collect()
     };
     let mut updates = Vec::new();
-    for (id, result) in results {
+    for (id, key, result) in results {
         match result {
             Ok(r) => {
                 let interval = r.refresh_ms.unwrap_or(fallback_ms).clamp(250, 30_000);
-                resolved.insert(id.clone(), r.clone());
-                updates.push((id, r, interval));
+                resolved.insert(id, r.clone());
+                updates.push((key, r, interval));
             }
             Err(e) => {
                 warn!(plugin = %id, error = %e, "render failed, using last frame if available");
-                if let Some(r) = stale_fallback.remove(&id) {
+                if let Some(r) = stale_fallback.remove(&key) {
                     resolved.insert(id, r);
                 }
             }
@@ -508,6 +691,7 @@ async fn get_plugins(State(state): State<Shared>) -> impl IntoResponse {
                 .unwrap_or_else(|| m.plugin.description.clone()),
             default_on: m.runtime.default_on,
             running,
+            variants: i.map(|v| v.variants).unwrap_or_default(),
         });
     }
     for (id, p) in offline {
@@ -521,6 +705,7 @@ async fn get_plugins(State(state): State<Shared>) -> impl IntoResponse {
             description: m.plugin.description.clone(),
             default_on: m.runtime.default_on,
             running: false,
+            variants: Vec::new(),
         });
     }
     ([(header::CACHE_CONTROL, "no-store")], Json(out))
@@ -710,6 +895,7 @@ pub fn router(state: Shared) -> Router {
         .route("/ink", get(get_ink))
         .route("/api/frame", get(get_frame))
         .route("/api/preview", post(preview_frame))
+        .route("/api/preview/html", post(preview_html))
         .route("/api/display", axum::routing::post(set_display))
         .route("/api/plugins", get(get_plugins))
         .route("/api/plugins/{id}/installed", post(set_installed))
@@ -802,5 +988,48 @@ mod tests {
         let escaped = html_escape("</title><script>alert(1)</script>");
         assert!(!escaped.contains("<script>"));
         assert!(escaped.contains("&lt;/title&gt;"));
+    }
+
+    #[test]
+    fn preview_item_accepts_plain_and_variant_forms() {
+        let req: PreviewRequest = serde_json::from_str(
+            r#"{"plugins":["lyrics",{"plugin":"clock","variant":"dot"},{"plugin":"clock"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(req.plugins.len(), 3);
+        assert_eq!(req.plugins[0].plugin(), "lyrics");
+        assert_eq!(req.plugins[0].variant(), None);
+        assert_eq!(req.plugins[1].plugin(), "clock");
+        assert_eq!(req.plugins[1].variant(), Some("dot"));
+        assert_eq!(req.plugins[2].variant(), None);
+    }
+
+    #[test]
+    fn preview_key_separates_variants() {
+        assert_eq!(preview_key("clock", None), "clock");
+        assert_eq!(preview_key("clock", Some("")), "clock");
+        assert_eq!(preview_key("clock", Some("dot")), "clock:dot");
+        assert_ne!(
+            preview_key("clock", Some("dot")),
+            preview_key("clock", Some("calendar"))
+        );
+    }
+
+    #[test]
+    fn preview_document_uses_the_device_css_and_layout_classes() {
+        let html = "<div class=\"block\">26</div>";
+        let doc = preview_document(html, "gray", false);
+        // 样式表来自同一份 ink.html：点阵字体与通用块规则都在文档里
+        assert!(doc.contains("font-family: 'Silkscreen'"));
+        assert!(doc.contains(".block + .block"));
+        // 区域布局 class、底部条和画布标记与设备一致
+        assert!(doc.contains("class=\"layout-region mode-gray \""));
+        assert!(doc.contains("id=\"reader-bar\""));
+        assert!(doc.contains("--canvas-h"));
+        assert!(doc.contains(html));
+        // 反色和显示模式进入文档，签名会跟着变
+        let inverted = preview_document(html, "bw", true);
+        assert!(inverted.contains("class=\"layout-region mode-bw invert\""));
+        assert_ne!(doc, inverted);
     }
 }
