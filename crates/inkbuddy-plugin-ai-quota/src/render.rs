@@ -237,6 +237,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stylesheet_gives_frame_a_definite_width() {
+        // `#frame` 在 `#wrap` 的 flex 列里，没有宽度就会收缩到内容宽。
+        // 那样 `.quota` 的 `width: 100%` 无从解析，整块退化成内容宽度：
+        // 进度条的 `flex: 1 1 auto` 拿不到剩余空间被压成一条细线，
+        // `.quota-meta` 的 `margin-left: auto` 也不再把它推到右边。
+        // 去掉空白再比对，免得换个排版格式就让测试失效。
+        let css: String = include_str!("../../../web/ink.html")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            css.contains("#frame{width:100%"),
+            "web/ink.html 需要给 #frame 确定宽度，否则额度看板的进度条会塌成细线"
+        );
+    }
+
     /// 从选择器文本里挑出 `.quota-xxx` 形式的类名，去掉开头的点。
     fn quota_class_names(selector: &str) -> Vec<String> {
         let mut names = Vec::new();
