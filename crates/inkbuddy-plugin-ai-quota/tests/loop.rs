@@ -73,6 +73,23 @@ fn answers_unknown_method_and_exits_on_shutdown() {
         "未知方法不应让插件退出"
     );
 
+    // 纯非法 JSON 与缺 id：只写 stderr，进程不能退出，后续请求仍要正常。
+    writeln!(stdin, "not json").expect("write malformed");
+    stdin.flush().expect("flush");
+    writeln!(stdin, r#"{{"method":"describe"}}"#).expect("write missing id");
+    stdin.flush().expect("flush");
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        child.try_wait().expect("try_wait").is_none(),
+        "非法输入不应让插件退出"
+    );
+
+    writeln!(stdin, r#"{{"id":10,"method":"describe"}}"#).expect("write describe after malformed");
+    stdin.flush().expect("flush");
+    let reply = recv_reply(&replies);
+    assert_eq!(reply["id"].as_u64(), Some(10));
+    assert_eq!(reply["ok"].as_bool(), Some(true));
+
     // shutdown：回 ok 后进程退出。
     writeln!(stdin, r#"{{"id":2,"method":"shutdown"}}"#).expect("write shutdown");
     stdin.flush().expect("flush");

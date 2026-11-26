@@ -34,12 +34,18 @@ fn parse_request_line(line: &str) -> ParsedRequest {
         eprintln!("忽略缺少 id 的请求行");
         return ParsedRequest::Ignore;
     };
+    // 先取原始 method（缺失记 <missing>），失败文案带上它便于宿主定位版本差异。
+    let method = value
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<missing>")
+        .to_string();
     match serde_json::from_value::<Request>(value) {
         Ok(req) => ParsedRequest::Request(req),
         // 有 id 就能回：未知 method 或字段非法都归为这条失败响应。
         Err(_) => ParsedRequest::Bad {
             id,
-            error: "unsupported method or invalid request".to_string(),
+            error: format!("unsupported method or invalid request: {method}"),
         },
     }
 }
@@ -117,11 +123,23 @@ mod tests {
             other => panic!("expected Request, got {other:?}"),
         }
 
-        // 未知 method：保留 id，回失败响应。
+        // 未知 method：保留 id，失败文案带上原始 method。
         match parse_request_line(r#"{"id":9,"method":"future_method"}"#) {
             ParsedRequest::Bad { id, error } => {
                 assert_eq!(id, 9);
-                assert_eq!(error, "unsupported method or invalid request");
+                assert_eq!(
+                    error,
+                    "unsupported method or invalid request: future_method"
+                );
+            }
+            other => panic!("expected Bad, got {other:?}"),
+        }
+
+        // 缺 method 时失败文案记 <missing>。
+        match parse_request_line(r#"{"id":4}"#) {
+            ParsedRequest::Bad { id, error } => {
+                assert_eq!(id, 4);
+                assert_eq!(error, "unsupported method or invalid request: <missing>");
             }
             other => panic!("expected Bad, got {other:?}"),
         }
