@@ -121,7 +121,7 @@
     gap: calc(1.5vw * var(--ink-scale, 1));
     font-size: calc(2.6vw * var(--ink-scale, 1));
   }
-  .quota-label { flex: 0 0 auto; }
+  .quota-label { flex: 0 0 3.1em; white-space: nowrap; }
   .quota-bar {
     flex: 1 1 auto;
     height: calc(2.4vw * var(--ink-scale, 1));
@@ -151,11 +151,12 @@
   .q-95 { width: 95%; }
   .q-100 { width: 100%; }
   .quota-pct {
-    flex: 0 0 auto; min-width: 3.2em; text-align: right;
+    flex: 0 0 3.1em; text-align: right;
     font-weight: 700; font-variant-numeric: tabular-nums;
   }
   .quota-reset {
-    flex: 0 0 auto; color: #8a8a8a; white-space: nowrap;
+    flex: 0 0 auto; min-width: 8.6em;
+    color: #8a8a8a; white-space: nowrap;
   }
   .quota-stale {
     font-size: calc(2.2vw * var(--ink-scale, 1));

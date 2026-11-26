@@ -254,6 +254,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stylesheet_pins_bar_columns_to_fixed_widths() {
+        // 两条进度条各在一行，同一行还有标签、百分比、倒计时三列。
+        // 这三列按内容宽度排的话，「5 小时」比「本周」宽 12px，
+        // 「37小时43分后重置」比「3小时19分后重置」宽 5px，
+        // 进度条的左右两端就各偏一段。定宽（em，随字号缩放）才能对齐。
+        let css: String = include_str!("../../../web/ink.html")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        for selector in [".quota-label", ".quota-pct", ".quota-reset"] {
+            let body = rule_body(&css, selector)
+                .unwrap_or_else(|| panic!("web/ink.html 缺少 {selector} 规则"));
+            assert!(
+                !body.contains("flex:00auto") || body.contains("min-width:"),
+                "{selector} 写着 flex: 0 0 auto 却没给宽度，两条进度条会对不齐：{body}"
+            );
+        }
+        for selector in [".quota-label", ".quota-reset"] {
+            let body = rule_body(&css, selector).unwrap();
+            assert!(
+                body.contains("nowrap"),
+                "{selector} 定宽后文字不能换行，否则窄屏下这一行会被撑高：{body}"
+            );
+        }
+    }
+
+    /// 取某条类选择器规则的声明体。传入的 CSS 需要已经去掉全部空白。
+    fn rule_body<'a>(css: &'a str, selector: &str) -> Option<&'a str> {
+        let mut cursor = 0;
+        while let Some(found) = css[cursor..].find(selector) {
+            let at = cursor + found;
+            let rest = &css[at + selector.len()..];
+            // 选择器后面紧跟 `{` 才算规则头，`body.invert .quota-x` 这类
+            // 组合选择器的内层不会命中。
+            if let Some(declarations) = rest.strip_prefix('{') {
+                if let Some(end) = declarations.find('}') {
+                    return Some(&declarations[..end]);
+                }
+            }
+            cursor = at + selector.len();
+        }
+        None
+    }
+
     /// 从选择器文本里挑出 `.quota-xxx` 形式的类名，去掉开头的点。
     fn quota_class_names(selector: &str) -> Vec<String> {
         let mut names = Vec::new();
