@@ -282,14 +282,15 @@ struct PreviewHtmlResponse {
 }
 
 /// 把取帧得到的 HTML 包成独立文档。直接复用设备页面的 head 与 body 标记，
-/// 只做三处改动：注入帧内容、写死显示模式的 body class、去掉轮询脚本
-/// （预览内容由控制端每次取数提供）。这样底部条、画布高度和区域定位
-/// 与设备一模一样，预览与真机按同一套标记渲染。
+/// 只做四处改动：注入帧内容、写死显示模式的 body class、加上 preview class
+/// （画布按整页高度算，底部条不占位）、去掉轮询脚本（预览内容由控制端
+/// 每次取数提供）。区域位置、字号缩放与设备按同一套公式算；预览画布不含
+/// 底部条，纵向可用的那几十像素比设备多一点，其余一致。
 fn preview_document(frame_html: &str, mode: &str, invert: bool) -> String {
     let cut = INK_PAGE.find("<script>").unwrap_or(INK_PAGE.len());
     let mut doc = INK_PAGE[..cut].to_string();
     let classes = format!(
-        " class=\"layout-region mode-{} {}\"",
+        " class=\"layout-region preview mode-{} {}\"",
         mode,
         if invert { "invert" } else { "" }
     );
@@ -382,7 +383,8 @@ struct PreviewContent {
     /// 按块分组的内容：块内行紧挨着，块间留间距，控制端据此复刻页面排版。
     blocks: Vec<PreviewBlock>,
     /// 内容按基准字号需要的高度（正方形屏幕下的 vh）。客户端用它
-    /// 结合自己的画布宽高比算 fit 缩放，与墨水屏的公式一致。
+    /// 结合自己的画布宽高比算 fit 缩放，与墨水屏的公式一致——可用高度
+    /// 同样要先扣掉区域上下留白。
     #[serde(rename = "contentUnits")]
     content_units: f32,
     /// 服务端当前是否为纯文本模式（隐藏拼音行、标题加大加粗），
@@ -1022,14 +1024,78 @@ mod tests {
         // 样式表来自同一份 ink.html：点阵字体与通用块规则都在文档里
         assert!(doc.contains("font-family: 'Silkscreen'"));
         assert!(doc.contains(".block + .block"));
-        // 区域布局 class、底部条和画布标记与设备一致
-        assert!(doc.contains("class=\"layout-region mode-gray \""));
+        // 区域布局 class、预览 class、画布标记与设备一致。
+        // 底部条标记仍在文档里，预览时由 preview 规则关掉。
+        assert!(doc.contains("class=\"layout-region preview mode-gray \""));
         assert!(doc.contains("id=\"reader-bar\""));
         assert!(doc.contains("--canvas-h"));
         assert!(doc.contains(html));
         // 反色和显示模式进入文档，签名会跟着变
         let inverted = preview_document(html, "bw", true);
-        assert!(inverted.contains("class=\"layout-region mode-bw invert\""));
+        assert!(inverted.contains("class=\"layout-region preview mode-bw invert\""));
         assert_ne!(doc, inverted);
+    }
+
+    #[test]
+    fn preview_document_drops_the_reader_bar_from_the_canvas() {
+        // 预览窗口只有两三百像素高，56px 的底部条会占掉两三成高度，
+        // 区域百分比随之变形。两件事必须同时成立：body 上挂了 preview，
+        // 样式表里有对应的整页高度规则。只断言规则文本存在没有意义——
+        // 样式表是从 ink.html 整段复制过来的，有没有 class 都在。
+        let doc = preview_document("<div></div>", "gray", false);
+        assert!(
+            doc.contains("<body class=\"layout-region preview "),
+            "preview class missing on <body>"
+        );
+        assert!(
+            doc.contains("body.preview { --canvas-h: 100vh; }"),
+            "preview class must give the canvas the full viewport height"
+        );
+        assert!(
+            doc.contains("body.preview #reader-bar, body.preview #status { display: none; }"),
+            "preview class must hide the reader bar and the status line"
+        );
+    }
+
+    #[test]
+    fn device_page_sizes_the_canvas_around_the_reader_bar() {
+        // 设备页面：画布是视口减去底部条，底部条本身仍在（点它进全屏）。
+        assert!(INK_PAGE.contains("--canvas-h: calc(100vh - var(--bar-h))"));
+        assert!(INK_PAGE.contains("id=\"reader-bar\""));
+        // 预览用另一套画布高度，两者不能共用同一个值。
+        assert!(INK_PAGE.contains("body.preview { --canvas-h: 100vh; }"));
+    }
+
+    #[test]
+    fn region_sections_carry_a_gutter() {
+        // 区域布局没有 #wrap 那层留白，内容会贴到墨水屏边缘。
+        // 留白写在区块规则里，数值必须与 render::REGION_PAD_* 一致，
+        // 否则缩放按不含留白的内容框算，内容又压回边缘。
+        let gutter = format!(
+            "padding: {}vh {}vw",
+            crate::render::REGION_PAD_Y,
+            crate::render::REGION_PAD_X
+        );
+        let section = css_rule(".frame-canvas .plugin-section {");
+        assert!(
+            section.contains("box-sizing: border-box"),
+            "padding needs border-box: {section}"
+        );
+        assert!(section.contains(&gutter), "region gutter missing: {section}");
+
+        // 相邻区块那条规则更具体，会把基础排版里的 padding-top 盖回去，
+        // 所以它必须自己把留白写全，否则第二个以后的区块没有上留白。
+        let sibling = css_rule(".frame-canvas .plugin-section + .plugin-section {");
+        assert!(sibling.contains("margin: 0"), "stacked margin should reset: {sibling}");
+        assert!(sibling.contains(&gutter), "sibling keeps the same gutter: {sibling}");
+    }
+
+    /// 取出 ink.html 里某条规则的声明块（到下一个 `}` 为止）。
+    fn css_rule(selector: &str) -> String {
+        let start = INK_PAGE
+            .find(selector)
+            .unwrap_or_else(|| panic!("missing rule: {selector}"));
+        let rest = &INK_PAGE[start..];
+        rest[..rest.find('}').expect("rule body")].to_string()
     }
 }

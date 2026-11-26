@@ -39,13 +39,22 @@
      页面脚本根据 frame 响应的 layout 字段切换，容器去掉留白。 */
   body.layout-region #wrap { padding: 0; }
   .frame-canvas { position: relative; width: 100%; height: var(--canvas-h); }
+  /* 区域四周留白：内容不贴墨水屏边缘。竖排/流式布局由 #wrap 的
+     padding 负责，区域布局没有这层留白，所以加在区块自己身上。
+     上下对应 host 的 REGION_PAD_Y、左右对应 REGION_PAD_X，两个方向都
+     参与字号缩放（按留白后的可用宽高算），不要单独改其中一个。 */
   .frame-canvas .plugin-section {
     position: absolute; overflow: hidden;
+    box-sizing: border-box;
+    padding: 3vh 4vw;
     display: flex; flex-direction: column;
     align-items: center; justify-content: center; text-align: center;
   }
+  /* 相邻区块只清掉竖排布局的间距与分隔线。留白再写一遍：这条选择器
+     比上面那条更具体，不写 padding 会让基础排版里的 padding-top: 4vh
+     有机会顶回来（取决于两条规则的先后），第二个以后的区块就没上留白。 */
   .frame-canvas .plugin-section + .plugin-section {
-    margin: 0; border-top: 0; padding-top: 0;
+    margin: 0; border-top: 0; padding: 3vh 4vw;
   }
   .block { width: 100%; }
   .block + .block { margin-top: 2vh; }
@@ -101,6 +110,11 @@
   /* 全屏模式：底部条与状态行退出，内容铺满整个视口。
      同时尝试浏览器原生全屏；不支持时这套 class 仍让页面占满屏幕。 */
   body.reader-full #reader-bar, body.reader-full #status { display: none; }
+  /* 编辑器与菜单里的预览：画布就是整页，底部条和状态行不占位。
+     预览窗口比设备小得多，56px 的条在小画布里会吃掉两三成高度，
+     区域百分比跟着变形，和墨水屏对不上。 */
+  body.preview { --canvas-h: 100vh; }
+  body.preview #reader-bar, body.preview #status { display: none; }
   :fullscreen, :-webkit-full-screen { width: 100%; height: 100%; background: #ffffff; }
 
   /* 全屏下的三块触摸区：左 30% 上一视图，中间显示/隐藏顶部按钮，右 30% 下一视图。 */

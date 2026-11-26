@@ -180,7 +180,8 @@ pub struct FrameRegion {
     pub y: f32,
     pub w: f32,
     pub h: f32,
-    /// 服务端算好的字号缩放系数，原生预览直接使用，与墨水屏保持一致。
+    /// 服务端算好的字号缩放系数。fit 已扣掉区域四周的留白，
+    /// 客户端要自己复算时按同一套规则（可用宽高）来。
     pub scale: f32,
     pub lines: Vec<PreviewLine>,
 }
@@ -352,16 +353,26 @@ pub struct Frame {
     pub layout: bool,
 }
 
+/// 区域内容四周的留白。与 web/ink.html 里 `.frame-canvas .plugin-section`
+/// 的 `padding: 3vh 4vw` 对应：竖排布局有 #wrap 的留白，区域布局没有，
+/// 就加在区块自己身上。单位分别是屏幕高度、宽度的百分比。
+/// 缩放按扣掉留白后的可用高度与宽度算：空间不够时缩小字号，内容不压回边缘。
+pub(crate) const REGION_PAD_Y: f32 = 3.0;
+pub(crate) const REGION_PAD_X: f32 = 4.0;
+
 /// 区域内容的缩放系数：宽度与高度两个约束取较小值。
-/// - 宽度：字号以 vw 定义，宽度占比直接决定文字相对区域的填充比例，
-///   全宽区域恒为 1（与旧竖排布局字号一致）。
+/// - 宽度：字号以 vw 定义，可用宽度占屏幕的比例决定文字相对区域的填充比例。
+///   可用宽度扣掉左右留白，换行位置因此与留白前一致。
 /// - 高度：内容装不下时自动缩小。`content_vh` 是内容按基准字号需要的
-///   高度（屏幕高度的百分比，已含宽高比换算），fit = 区域高度 / 内容高度，
-///   装得下时 fit ≥ 1 不起作用，装不下时把字号压到刚好放得下。
+///   高度（屏幕高度的百分比，已含宽高比换算），fit = 可用高度 / 内容高度；
+///   可用高度扣掉上下留白，装得下时 fit ≥ 1 不起作用，装不下时把字号
+///   压到刚好放得下。
 fn region_scale(w: f32, h: f32, content_vh: f32) -> f32 {
-    let width_scale = (w / 100.0).clamp(0.1, 1.0);
-    let fit = if content_vh > 0.01 && h > 0.01 {
-        (h / content_vh).clamp(0.1, 1.0)
+    let usable_w = (w - REGION_PAD_X * 2.0).max(0.0);
+    let width_scale = (usable_w / 100.0).clamp(0.1, 1.0);
+    let usable_h = (h - REGION_PAD_Y * 2.0).max(0.0);
+    let fit = if content_vh > 0.01 {
+        (usable_h / content_vh).clamp(0.1, 1.0)
     } else {
         1.0
     };
@@ -441,12 +452,10 @@ fn css_safe_id(id: &str) -> bool {
 
 /// 单个区域的字号覆盖规则：基准尺寸 × 缩放系数，算成具体数值输出。
 /// 这是接入规范的一部分：插件只要用标准块/行类型输出内容，
-/// 缩放就自动生效，插件自身不需要处理尺寸。scale=1 的区域不输出。
+/// 缩放就自动生效，插件自身不需要处理尺寸。区域都要留白，
+/// 缩放必然小于 1，所以每个区域都会有一组规则。
 /// text_mode（纯文本显示模式）下标题块用更大的基准字号，与页面 CSS 一致。
 fn section_overrides(plugin: &str, scale: f32, text_mode: bool) -> String {
-    if scale >= 0.995 {
-        return String::new();
-    }
     let m = |v: f32| fmt_pct(v * scale);
     let sel = format!(".frame-canvas section[data-plugin=\"{}\"]", esc(plugin));
     let mut css = String::new();
@@ -488,7 +497,7 @@ fn html_for_regions(
     text_mode: bool,
     aspect: f32,
 ) -> String {
-    // 有内容的区域才生成字号覆盖；scale=1 的区域不产生规则。
+    // 有内容的区域才生成字号覆盖；没装或没内容的区域不产生规则。
     let mut rules = String::new();
     for region in layout {
         if let Some((_, result)) = parts.iter().find(|(id, _)| id == &region.plugin) {
@@ -687,17 +696,34 @@ mod tests {
 
     #[test]
     fn region_scale_tracks_width_and_height_fit() {
-        // 宽度约束不变：全宽恒为 1，半宽 0.5，极窄夹到 0.1。
-        assert_eq!(region_scale(100.0, 50.0, 10.0), 1.0);
-        assert_eq!(region_scale(50.0, 50.0, 10.0), 0.5);
+        // 宽度约束：扣掉左右留白后占屏幕的比例；极窄的区域夹到 0.1。
+        let full_width = (100.0 - REGION_PAD_X * 2.0) / 100.0;
+        assert_eq!(region_scale(100.0, 50.0, 10.0), full_width);
+        assert_eq!(region_scale(50.0, 50.0, 10.0), 0.42);
         assert_eq!(region_scale(2.0, 50.0, 10.0), 0.1);
-        // 高度装不下时缩小：时钟型内容约 20.7 vh，压到 13.8 高后约 0.67。
+        // 高度装不下时缩小：时钟型内容约 20.7 vh，区域高 13.8，扣掉上下
+        // 留白 6vh 后可用 7.8，压到约 0.38。
         let clock_units = 6.2 * 1.4 + 5.0 + 7.0;
-        assert_eq!(region_scale(100.0, 13.8, clock_units), 0.67);
-        // 装得下时高度不起作用。
-        assert_eq!(region_scale(100.0, 86.2, clock_units), 1.0);
-        // 极矮区域夹到下限附近（3 / 20.68 ≈ 0.145）。
-        assert_eq!(region_scale(100.0, 3.0, clock_units), 0.15);
+        assert_eq!(region_scale(100.0, 13.8, clock_units), 0.38);
+        // 装得下时高度不起作用，只剩宽度约束。
+        assert_eq!(region_scale(100.0, 86.2, clock_units), full_width);
+        // 区域比留白还矮：夹到下限。
+        assert_eq!(region_scale(100.0, 3.0, clock_units), 0.1);
+    }
+
+    #[test]
+    fn region_scale_leaves_room_for_the_gutter() {
+        // 留白后的可用尺寸说了算：内容高度正好等于可用高度时，高度不再是
+        // 瓶颈，缩放由宽度决定；再高一个单位，高度就压过宽度。
+        let units = 10.0;
+        let fits_h = units + REGION_PAD_Y * 2.0;
+        let full_width = (100.0 - REGION_PAD_X * 2.0) / 100.0;
+        assert_eq!(region_scale(100.0, fits_h, units), full_width);
+        assert!(region_scale(100.0, fits_h - 1.0, units) < full_width);
+        // 窄区域的可用宽度再扣一次留白：92% 宽的区域只剩 84%。
+        assert_eq!(region_scale(92.0, 200.0, 10.0), 0.84);
+        // 极矮的区域夹到下限，不会算出 0 或负数。
+        assert_eq!(region_scale(100.0, REGION_PAD_Y, units), 0.1);
     }
 
     #[test]
@@ -766,13 +792,17 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_region_needs_no_override() {
+    fn fullscreen_region_scales_to_its_content_box() {
         let parts = vec![("clock".into(), text_block("时间"))];
         let layout = vec![Region { plugin: "clock".into(), x: 0.0, y: 0.0, w: 100.0, h: 100.0, variant: None }];
         let frame = render_frame(&parts, 500, Some(&layout));
-        // scale=1 的区域直接用页面基准样式，不输出覆盖规则
-        assert!(!frame.html.contains("<style>"));
-        assert!(!frame.html.contains("font-size:"));
+        // 满屏区域也要为左右留白让出宽度：缩放是可用宽度占比，不是 1。
+        let expected = (100.0 - REGION_PAD_X * 2.0) / 100.0;
+        assert!(frame.html.contains(&format!("--ink-scale: {expected};")));
+        // 留白之外的区域（更窄）依旧按宽度占比缩小。
+        let narrow = vec![Region { plugin: "clock".into(), x: 0.0, y: 0.0, w: 50.0, h: 100.0, variant: None }];
+        let narrow_frame = render_frame(&parts, 500, Some(&narrow));
+        assert!(narrow_frame.html.contains("--ink-scale: 0.42;"));
     }
 
     #[test]
@@ -781,9 +811,10 @@ mod tests {
         let layout = vec![Region { plugin: "clock".into(), x: 0.0, y: 0.0, w: 50.0, h: 50.0, variant: None }];
         let normal = render_frame(&parts, 500, Some(&layout));
         let text = render_frame_with_mode(&parts, 500, Some(&layout), true, 1.0);
-        // 3.8vw × 0.5 = 1.9vw（常规）；5vw × 0.5 = 2.5vw（纯文本模式）
-        assert!(normal.html.contains(".block-text p { font-size: 1.9vw;"));
-        assert!(text.html.contains(".block-text p { font-size: 2.5vw;"));
+        // 50% 宽的区域扣掉左右留白是 42%：3.8vw × 0.42 ≈ 1.6vw（常规），
+        // 5vw × 0.42 = 2.1vw（纯文本模式）。
+        assert!(normal.html.contains(".block-text p { font-size: 1.6vw;"));
+        assert!(text.html.contains(".block-text p { font-size: 2.1vw;"));
     }
 
     #[test]
@@ -876,17 +907,17 @@ mod tests {
         assert!(frame.html.contains("frame-canvas"));
         assert!(frame.html.contains("left:0%;top:0%;width:60%;height:100%"));
         assert!(frame.html.contains("left:60%;top:0%;width:40%;height:100%"));
-        // 字号覆盖由服务端算好直接输出（60x100 → 0.6，40x100 → 0.4）：
-        // 6.2vw × 0.6 = 3.72vw，6.2vw × 0.4 = 2.48vw。
+        // 字号覆盖由服务端算好直接输出（60 宽 → 可用 52%，40 宽 → 可用 32%）：
+        // 6.2vw × 0.52 = 3.22vw，6.2vw × 0.32 = 1.98vw。
         assert!(frame.html.contains(
-            ".frame-canvas section[data-plugin=\"lyrics\"] .line-primary { font-size: 3.72vw;"
+            ".frame-canvas section[data-plugin=\"lyrics\"] .line-primary { font-size: 3.22vw;"
         ));
         assert!(frame.html.contains(
-            ".frame-canvas section[data-plugin=\"clock\"] .line-primary { font-size: 2.48vw;"
+            ".frame-canvas section[data-plugin=\"clock\"] .line-primary { font-size: 1.98vw;"
         ));
         // 同一份系数也下发给 HTML 块的自定义样式
-        assert!(frame.html.contains("--ink-scale: 0.6;"));
-        assert!(frame.html.contains("--ink-scale: 0.4;"));
+        assert!(frame.html.contains("--ink-scale: 0.52;"));
+        assert!(frame.html.contains("--ink-scale: 0.32;"));
         assert_eq!(frame.regions.len(), 2);
         assert_eq!(frame.regions[0].plugin, "lyrics");
         assert_eq!(frame.regions[0].lines.len(), 1);
@@ -975,6 +1006,7 @@ mod tests {
             variant: None,
         }];
         let frame = render_frame(&parts, 500, Some(&layout));
-        assert!(frame.html.contains("--ink-scale: 0.4;"));
+        // 40% 宽的区域扣掉左右留白还剩 32%。
+        assert!(frame.html.contains("--ink-scale: 0.32;"));
     }
 }
