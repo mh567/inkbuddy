@@ -1,0 +1,18 @@
+[package]
+name = "inkbuddy-plugin-ai-quota"
+description = "First-party inkbuddy plugin: Codex plan and quota usage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "inkbuddy-plugin-ai-quota"
+path = "src/main.rs"
+
+[dependencies]
+inkbuddy-protocol = { path = "../inkbuddy-protocol" }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }

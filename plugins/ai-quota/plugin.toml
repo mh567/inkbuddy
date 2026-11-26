@@ -1,0 +1,12 @@
+[plugin]
+id = "ai-quota"
+name = "AI 额度"
+version = "0.1.0"
+description = "Codex 套餐与 5 小时、周额度用量"
+command = "../../target/release/inkbuddy-plugin-ai-quota"
+
+[runtime]
+enabled = true
+default_on = false
+timeout_ms = 8000
+args = []

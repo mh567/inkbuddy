@@ -759,6 +759,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "inkbuddy-plugin-ai-quota"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "inkbuddy-protocol",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "inkbuddy-plugin-clock"
 version = "0.1.0"
 dependencies = [
