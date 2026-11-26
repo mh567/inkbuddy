@@ -1,13 +1,82 @@
 //! AI 额度插件的协议入口。
 //!
-//! 当前只是让 crate 可编译的最小循环：describe 返回插件信息，
-//! 其余方法回空成功响应。app-server 客户端与正式协议循环在后续任务接入。
+//! 当前只是让 crate 可编译的协议循环：describe 返回插件信息，其余方法回空
+//! 成功响应，shutdown 回完即退出。app-server 客户端与正式渲染在后续任务接入。
 
 use anyhow::Result;
 use inkbuddy_protocol::{Method, PluginInfo, Request, Response, PROTOCOL_VERSION};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 const PLUGIN_ID: &str = "ai-quota";
+
+/// 一行输入解析后的结果。
+#[derive(Debug)]
+enum ParsedRequest {
+    /// 合法请求，走正常处理分支。
+    Request(Request),
+    /// 拿得到 id 但 method 未识别或字段非法，需要回一条失败响应。
+    Bad { id: u64, error: String },
+    /// 连 id 都取不到（非法 JSON 或缺 id），无法回响应，只能跳过。
+    Ignore,
+}
+
+/// 解析宿主写入的一行请求。区分非法 JSON、缺 id 和可回失败响应的坏请求，
+/// 避免宿主一直等到超时。
+fn parse_request_line(line: &str) -> ParsedRequest {
+    let value = match serde_json::from_str::<serde_json::Value>(line.trim()) {
+        Ok(value) => value,
+        Err(_) => {
+            eprintln!("忽略无法解析的请求行");
+            return ParsedRequest::Ignore;
+        }
+    };
+    let Some(id) = value.get("id").and_then(serde_json::Value::as_u64) else {
+        eprintln!("忽略缺少 id 的请求行");
+        return ParsedRequest::Ignore;
+    };
+    match serde_json::from_value::<Request>(value) {
+        Ok(req) => ParsedRequest::Request(req),
+        // 有 id 就能回：未知 method 或字段非法都归为这条失败响应。
+        Err(_) => ParsedRequest::Bad {
+            id,
+            error: "unsupported method or invalid request".to_string(),
+        },
+    }
+}
+
+/// 处理一条合法请求，产出对应响应。
+fn handle_request(req: Request) -> Response {
+    match req.method {
+        Method::Describe => {
+            // 用 JSON 构造 PluginInfo：提交态协议没有 variants 字段也没有
+            // Default，工作区协议两者都有，这样写对两种版本都能编译。
+            // TODO: 协议 variants/Default 合并进提交态后，改回结构体字面量。
+            match serde_json::from_value::<PluginInfo>(serde_json::json!({
+                "id": PLUGIN_ID,
+                "name": "AI 额度",
+                "version": env!("CARGO_PKG_VERSION"),
+                "description": "Codex 套餐与 5 小时、周额度用量",
+                "protocol": PROTOCOL_VERSION,
+            })) {
+                Ok(info) => Response::success(req.id, &info),
+                // 不因构造失败杀掉进程，回一条失败响应让宿主继续。
+                Err(e) => Response::failure(req.id, format!("describe: {e}")),
+            }
+        }
+        _ => Response::empty_ok(req.id),
+    }
+}
+
+/// 把一条响应写成一行 JSON 并 flush。
+async fn write_response<W>(stdout: &mut W, resp: &Response) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let out = serde_json::to_string(resp)?;
+    stdout.write_all(format!("{out}\n").as_bytes()).await?;
+    stdout.flush().await?;
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -15,39 +84,66 @@ async fn main() -> Result<()> {
     let mut stdout = tokio::io::stdout();
 
     while let Some(line) = reader.next_line().await? {
-        let req: Request = match serde_json::from_str(line.trim()) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        let resp = match req.method {
-            Method::Describe => {
-                // 用 JSON 构造 PluginInfo：提交态协议没有 variants 字段也没有
-                // Default，工作区协议两者都有，这样写对两种版本都能编译。
-                // TODO: 协议 variants/Default 合并进提交态后，改回结构体字面量。
-                match serde_json::from_value::<PluginInfo>(serde_json::json!({
-                    "id": PLUGIN_ID,
-                    "name": "AI 额度",
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "description": "Codex 套餐与 5 小时、周额度用量",
-                    "protocol": PROTOCOL_VERSION,
-                })) {
-                    Ok(info) => Response::success(req.id, &info),
-                    // 不因构造失败杀进程，回一条失败响应让宿主继续。
-                    Err(e) => Response::failure(req.id, format!("describe: {e}")),
-                }
+        let (resp, shutdown) = match parse_request_line(&line) {
+            ParsedRequest::Request(req) => {
+                let shutdown = req.method == Method::Shutdown;
+                (handle_request(req), shutdown)
             }
-            _ => Response::empty_ok(req.id),
+            ParsedRequest::Bad { id, error } => (Response::failure(id, error), false),
+            ParsedRequest::Ignore => continue,
         };
 
-        let out = serde_json::to_string(&resp)?;
-        stdout.write_all(format!("{out}\n").as_bytes()).await?;
-        stdout.flush().await?;
+        write_response(&mut stdout, &resp).await?;
 
         // 回完 shutdown 响应就退出，避免把长驻子进程留在后台。
-        if req.method == Method::Shutdown {
+        if shutdown {
             break;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_request_line_handles_valid_unknown_and_invalid() {
+        match parse_request_line(r#"{"id":1,"method":"describe"}"#) {
+            ParsedRequest::Request(req) => {
+                assert_eq!(req.id, 1);
+                assert_eq!(req.method, Method::Describe);
+            }
+            other => panic!("expected Request, got {other:?}"),
+        }
+
+        // 未知 method：保留 id，回失败响应。
+        match parse_request_line(r#"{"id":9,"method":"future_method"}"#) {
+            ParsedRequest::Bad { id, error } => {
+                assert_eq!(id, 9);
+                assert_eq!(error, "unsupported method or invalid request");
+            }
+            other => panic!("expected Bad, got {other:?}"),
+        }
+
+        // 纯非法 JSON 与缺少 id 都无法回响应，只能忽略。
+        assert!(matches!(
+            parse_request_line("not json"),
+            ParsedRequest::Ignore
+        ));
+        assert!(matches!(
+            parse_request_line(r#"{"method":"describe"}"#),
+            ParsedRequest::Ignore
+        ));
+        assert!(matches!(parse_request_line(""), ParsedRequest::Ignore));
+    }
+
+    #[test]
+    fn plugin_id_matches_manifest() {
+        let manifest = include_str!("../../../plugins/ai-quota/plugin.toml");
+        assert!(
+            manifest.contains(&format!("id = \"{PLUGIN_ID}\"")),
+            "PLUGIN_ID 必须与 plugins/ai-quota/plugin.toml 的 id 一致"
+        );
+    }
 }

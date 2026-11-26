@@ -11,11 +11,15 @@ pub fn width_class(used_percent: u32) -> &'static str {
     CLASSES[((bucket + 2) / 5) as usize]
 }
 
-/// 套餐名映射；按原始字符串精确匹配，未知值保留原文，缺失值返回「未知套餐」。
+/// 套餐名映射；按原始字符串精确匹配，未知值保留原文，缺失或空白返回「未知套餐」。
 pub fn plan_label(raw: Option<&str>) -> String {
     let Some(value) = raw else {
         return "未知套餐".to_string();
     };
+    // 空串或纯空白显示空白比降级文字更糟，统一回「未知套餐」。
+    if value.trim().is_empty() {
+        return "未知套餐".to_string();
+    }
     match value {
         "plus" => "Plus".to_string(),
         "pro" => "Pro".to_string(),
@@ -103,6 +107,20 @@ mod tests {
                 width_class(p)
             );
         }
+
+        // 单调不减：百分比增大时填充宽度不能回退。
+        let bucket = |p: u32| {
+            width_class(p)
+                .trim_start_matches("q-")
+                .parse::<u32>()
+                .expect("class ends with a number")
+        };
+        for p in 0..100u32 {
+            assert!(
+                bucket(p) <= bucket(p + 1),
+                "width class not monotonic at {p}"
+            );
+        }
     }
 
     #[test]
@@ -123,13 +141,15 @@ mod tests {
             assert_eq!(plan_label(Some(raw)), expected);
         }
 
-        // 只按原始字符串精确匹配，大小写或空白差异视为未知值并原样返回
+        // 大小写差异视为未知值，原样返回
         assert_eq!(plan_label(Some("PLUS")), "PLUS");
+        // 带非空白内容的首尾空白也按原始字符串返回
         assert_eq!(plan_label(Some(" plus ")), " plus ");
 
-        // 未知值保留原始文本，缺失值有专门提示
+        // 未知值保留原始文本；空串、纯空白与缺失值降级为「未知套餐」
         assert_eq!(plan_label(Some("mystery-plan")), "mystery-plan");
-        assert_eq!(plan_label(Some("")), "");
+        assert_eq!(plan_label(Some("")), "未知套餐");
+        assert_eq!(plan_label(Some("   ")), "未知套餐");
         assert_eq!(plan_label(None), "未知套餐");
     }
 
@@ -150,6 +170,11 @@ mod tests {
         // 整点与不足一小时仍保留两个字段
         assert_eq!(reset_countdown(Some(now + 3600), now), "1小时0分后重置");
         assert_eq!(reset_countdown(Some(now + 60), now), "0小时1分后重置");
+        // 周窗口上界：7 天 = 168 小时 0 分
+        assert_eq!(
+            reset_countdown(Some(now + 7 * 24 * 3600), now),
+            "168小时0分后重置"
+        );
 
         // 不足 1 分钟、恰好到期、已过期
         assert_eq!(reset_countdown(Some(now + 59), now), "即将重置");
