@@ -36,6 +36,9 @@ pub fn plan_label(raw: Option<&str>) -> String {
 }
 
 /// 距重置时间的倒计时文字；分钟数向上取整。
+///
+/// 不足 1 小时只写分钟，超过 24 小时换成天并略去分钟，
+/// 免得周窗口显示成「37小时29分」这种要心算的长度。
 pub fn reset_countdown(resets_at: Option<i64>, now: i64) -> String {
     let Some(resets_at) = resets_at else {
         return "重置时间未知".to_string();
@@ -45,7 +48,18 @@ pub fn reset_countdown(resets_at: Option<i64>, now: i64) -> String {
         return "即将重置".to_string();
     }
     let total_mins = remaining.saturating_add(59) / 60;
-    format!("{}小时{}分后重置", total_mins / 60, total_mins % 60)
+    if total_mins < 60 {
+        return format!("{total_mins}分钟后重置");
+    }
+    let (total_hours, mins) = (total_mins / 60, total_mins % 60);
+    if total_hours < 24 {
+        return format!("{total_hours}小时{mins}分后重置");
+    }
+    let (days, hours) = (total_hours / 24, total_hours % 24);
+    if hours == 0 {
+        return format!("{days}天后重置");
+    }
+    format!("{days}天{hours}小时后重置")
 }
 
 /// 转义 HTML 保留字符。
@@ -167,13 +181,32 @@ mod tests {
             reset_countdown(Some(now + 4 * 3600 + 11 * 60 + 41), now),
             "4小时12分后重置"
         );
-        // 整点与不足一小时仍保留两个字段
+        // 整点仍保留两个字段
         assert_eq!(reset_countdown(Some(now + 3600), now), "1小时0分后重置");
-        assert_eq!(reset_countdown(Some(now + 60), now), "0小时1分后重置");
-        // 周窗口上界：7 天 = 168 小时 0 分
+
+        // 不足 1 小时只写分钟，不出现「0 小时」
+        assert_eq!(reset_countdown(Some(now + 60), now), "1分钟后重置");
+        assert_eq!(reset_countdown(Some(now + 59 * 60), now), "59分钟后重置");
+
+        // 超过 24 小时换成天，分钟略去
+        assert_eq!(
+            reset_countdown(Some(now + 37 * 3600 + 29 * 60), now),
+            "1天13小时后重置"
+        );
+        assert_eq!(
+            reset_countdown(Some(now + 2 * 24 * 3600 + 3 * 3600), now),
+            "2天3小时后重置"
+        );
+        // 整天的边界：24 小时、7 天（周窗口上界）
+        assert_eq!(reset_countdown(Some(now + 24 * 3600), now), "1天后重置");
         assert_eq!(
             reset_countdown(Some(now + 7 * 24 * 3600), now),
-            "168小时0分后重置"
+            "7天后重置"
+        );
+        // 23 小时 59 分仍按小时写，小时数不进位到天
+        assert_eq!(
+            reset_countdown(Some(now + 23 * 3600 + 59 * 60), now),
+            "23小时59分后重置"
         );
 
         // 不足 1 分钟、恰好到期、已过期

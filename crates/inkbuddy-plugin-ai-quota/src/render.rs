@@ -129,7 +129,7 @@ mod tests {
         assert!(html.contains("51%"), "{html}");
         assert_eq!(html.matches("quota-row").count(), 2, "{html}");
         assert!(html.contains("4小时12分后重置"), "{html}");
-        assert!(html.contains("168小时0分后重置"), "{html}");
+        assert!(html.contains("7天后重置"), "{html}");
     }
 
     #[test]
