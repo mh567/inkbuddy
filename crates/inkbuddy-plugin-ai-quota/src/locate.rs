@@ -48,8 +48,18 @@ pub fn resolve_codex(
 
 /// 从环境变量读出 `CODEX_BIN`、`PATH`、`HOME` 后调用 [`resolve_codex`]。
 pub fn codex_from_env() -> Option<PathBuf> {
+    let explicit = std::env::var_os("CODEX_BIN").map(PathBuf::from);
+    if let Some(path) = explicit.as_deref() {
+        if !path.is_file() {
+            // 显式配置不回落是约定行为，但得让人知道为什么最后没找到。
+            eprintln!(
+                "ai-quota: CODEX_BIN={} 不存在，按约定不回落到 PATH",
+                path.display()
+            );
+        }
+    }
     resolve_codex(
-        std::env::var_os("CODEX_BIN").map(PathBuf::from),
+        explicit,
         std::env::var_os("PATH"),
         std::env::var_os("HOME").map(PathBuf::from),
     )

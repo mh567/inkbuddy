@@ -34,8 +34,7 @@ struct Board {
 impl Board {
     fn new() -> Self {
         Self {
-            service: locate::codex_from_env()
-                .map(|bin| QuotaService::start(bin, POLL_INTERVAL)),
+            service: locate::codex_from_env().map(|bin| QuotaService::start(bin, POLL_INTERVAL)),
             served_first: false,
         }
     }
@@ -172,14 +171,16 @@ async fn main() -> Result<()> {
             ParsedRequest::Ignore => continue,
         };
 
-        // 先回响应，宿主不必等收尾。
-        write_response(&mut stdout, &resp).await?;
-
+        // 宿主要读到响应行才返回，随即 SIGKILL 还活着的插件，所以收尾必须在
+        // 写响应之前做完，否则 app-server 子进程会变成孤儿。
         if shutdown {
-            // 退出前把 app-server 子进程带走，不留后台进程。
             if let Some(service) = board.service.take() {
                 service.shutdown().await;
             }
+        }
+        write_response(&mut stdout, &resp).await?;
+
+        if shutdown {
             break;
         }
     }

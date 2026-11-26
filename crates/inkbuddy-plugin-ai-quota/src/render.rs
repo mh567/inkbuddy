@@ -8,6 +8,14 @@ use crate::model::{QuotaSnapshot, QuotaWindow};
 
 /// 渲染完整的额度看板；快照未就绪或失败时降级为提示块。
 pub fn render_html(snapshot: &QuotaSnapshot, now: i64) -> String {
+    // 登出与找不到 CLI 是终态：此时旧百分比会误导用户，整块换成提示。
+    if let Some(failure) = snapshot.failure.as_deref() {
+        if failure == crate::rpc::LOGIN_REQUIRED || failure == crate::app_server::FAILURE_NOT_FOUND
+        {
+            return render_notice(failure);
+        }
+    }
+
     let Some(updated_at) = snapshot.updated_at else {
         return match snapshot.failure.as_deref() {
             Some(failure) => render_notice(failure),
@@ -193,6 +201,29 @@ mod tests {
         let html = render_html(&QuotaSnapshot::default(), 1_700_000_000);
         assert!(html.contains("quota-notice"), "{html}");
         assert!(html.contains("正在读取额度…"), "{html}");
+    }
+
+    #[test]
+    fn login_required_replaces_stale_board_with_notice() {
+        // 登出是终态：旧百分比会误导用户，整块换成提示。
+        let now = 1_700_000_000_i64;
+        let mut snapshot = sample_snapshot();
+        snapshot.failure = Some(crate::rpc::LOGIN_REQUIRED.to_string());
+        let html = render_html(&snapshot, now);
+        assert!(html.contains("Codex 未登录"), "{html}");
+        assert!(!html.contains("quota-row"), "{html}");
+        assert!(!html.contains("更新于"), "{html}");
+    }
+
+    #[test]
+    fn read_failure_keeps_stale_board() {
+        let now = 1_700_000_000_i64;
+        let mut snapshot = sample_snapshot();
+        snapshot.updated_at = Some(now - 180);
+        snapshot.failure = Some("额度读取失败".to_string());
+        let html = render_html(&snapshot, now);
+        assert!(html.contains("quota-row"), "{html}");
+        assert!(html.contains("更新于 3 分钟前"), "{html}");
     }
 
     #[test]

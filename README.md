@@ -58,7 +58,7 @@ http://<mac-局域网-IP>:9012/
 http://<ip>:9012/?plugins=lyrics            # 只显示歌词
 http://<ip>:9012/?plugins=clock             # 只显示时钟
 http://<ip>:9012/?plugins=lyrics,clock      # 组合，歌词在上、时钟在下
-http://<ip>:9012/?plugins=ai-quota       # 只看 AI 额度
+http://<ip>:9012/?plugins=ai-quota          # 只显示 AI 额度
 ```
 
 不带参数时显示所有 `default_on = true` 的插件（默认只有歌词）。显示内容优先跟随当前视图（见下文「视图」）；没有选中视图时退到 URL 参数，再退到 `default_on`。选择放在 URL 里。

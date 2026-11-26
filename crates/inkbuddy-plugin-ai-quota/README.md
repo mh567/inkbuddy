@@ -1,6 +1,6 @@
 # AI 额度插件（inkbuddy-plugin-ai-quota）
 
-在墨水屏上显示本机 Codex CLI 账号的套餐和额度用量。插件 id 为 `ai-quota`，安装后的清单在 `plugins/ai-quota/plugin.toml`。默认不随展示页开启，用 `?plugins=ai-quota` 参数、视图（在 macOS app 里把 AI 额度加进视图）或 `default_on = true` 启用。
+在墨水屏上显示本机 Codex CLI 账号的套餐和额度用量。插件 id 为 `ai-quota`，安装后的清单在 `plugins/ai-quota/plugin.toml`。默认为关闭，用 `?plugins=ai-quota` 参数、视图（在 macOS app 里把 AI 额度加进视图）或 `default_on = true` 启用。
 
 ## 显示内容
 
@@ -18,7 +18,7 @@
 - `account/read`：读账号类型和套餐名。
 - `account/rateLimits/read`：读 5 小时与周两个窗口的已用百分比、重置时间，以及重置券数量。
 
-连上之后每 60 秒主动读一次账号和额度；收到 `account/rateLimits/updated`、`account/updated` 通知时把可用字段合并进当前快照。app-server 断线后按 1 秒到 30 秒的退避间隔重连，重连期间保留最后一次成功快照，页面不会闪空。
+连上之后每 60 秒主动读一次账号和额度；收到 `account/rateLimits/updated`、`account/updated` 通知时把可用字段合并进当前快照。app-server 断线后按 1 秒到 30 秒的退避间隔重连，重连期间页面沿用旧数据。
 
 宿主的 `render` 读内存快照并直接返回；首次 `render` 时快照尚未就绪，最多等 3 秒。插件返回的 `refresh_ms` 是 30000，让倒计时保持准确，实际取数由内部的 60 秒定时器驱动。
 
@@ -48,8 +48,10 @@ args = []
 | --- | --- |
 | 找不到 Codex CLI | 「未找到 Codex CLI」 |
 | Codex 未登录 | 「Codex 未登录，请先运行 codex login」 |
-| 读取失败但已有旧数据 | 旧数据加「更新于 X 分钟前」 |
+| 读取失败但已有旧数据 | 看板照旧，看板下方按距上次成功更新显示「刚刚更新」「更新于 X 分钟前」或「更新于 X 小时前」 |
 | 读取失败且没有旧数据 | 「额度读取失败」 |
+
+登出和找不到 CLI 时，整块看板换成对应的提示文字，旧百分比不再显示，避免旧数字误导用户。
 
 ## 单独运行
 

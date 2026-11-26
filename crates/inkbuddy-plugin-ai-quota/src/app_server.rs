@@ -21,6 +21,8 @@ use crate::rpc::{
 
 /// 单次 JSON-RPC 请求的等待上限。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// 首轮两个并发请求共同的等待上限；首帧预算只有 3 秒，一侧不来时不能白等 10 秒。
+const PAIR_TIMEOUT: Duration = Duration::from_secs(5);
 /// shutdown 时等待后台任务收尾的上限。
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -163,6 +165,20 @@ enum PairOutcome {
     Stopped,
     /// IO 失败、进程退出或超时。
     Failed,
+}
+
+/// 超时或 IO 失败时的收尾：一侧到手就补齐另一侧，别把已读到的结果丢掉。
+fn partial_pair(
+    first: Option<Result<Value, String>>,
+    second: Option<Result<Value, String>>,
+) -> PairOutcome {
+    let timeout = || Err("timeout".to_string());
+    match (first, second) {
+        (Some(first), Some(second)) => PairOutcome::Results(first, second),
+        (Some(first), None) => PairOutcome::Results(first, timeout()),
+        (None, Some(second)) => PairOutcome::Results(timeout(), second),
+        (None, None) => PairOutcome::Failed,
+    }
 }
 
 /// 一次连接的结局。
@@ -494,6 +510,11 @@ impl Session<'_> {
     ) -> PairOutcome {
         let (first_id, first_method, first_params) = first;
         let (second_id, second_method, second_params) = second;
+        // 两个 id 相同时第一条 guard 永远命中，第二个结果永不赋值，会白等满超时。
+        if first_id == second_id {
+            eprintln!("ai-quota: 并发请求的 id 不能相同: {first_id}");
+            return PairOutcome::Failed;
+        }
         if !self
             .send(&json!({"id": first_id, "method": first_method, "params": first_params}))
             .await
@@ -506,9 +527,12 @@ impl Session<'_> {
 
         let mut first_result = None;
         let mut second_result = None;
-        let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + PAIR_TIMEOUT;
         loop {
-            if let (Some(first), Some(second)) = (first_result.clone(), second_result.clone()) {
+            // 两个都到齐才取走，避免每轮克隆整棵 Value。
+            if first_result.is_some() && second_result.is_some() {
+                let first = first_result.take().expect("checked above");
+                let second = second_result.take().expect("checked above");
                 return PairOutcome::Results(first, second);
             }
             let line = tokio::select! {
@@ -518,15 +542,15 @@ impl Session<'_> {
                         Ok(Ok(Some(line))) => line,
                         Ok(Ok(None)) => {
                             eprintln!("ai-quota: app-server 提前关闭 stdout");
-                            return PairOutcome::Failed;
+                            return partial_pair(first_result, second_result);
                         }
                         Ok(Err(err)) => {
                             eprintln!("ai-quota: 读取 app-server 输出失败: {err}");
-                            return PairOutcome::Failed;
+                            return partial_pair(first_result, second_result);
                         }
                         Err(_) => {
-                            eprintln!("ai-quota: 等待 {first_method}/{second_method} 响应超时");
-                            return PairOutcome::Failed;
+                            eprintln!("ai-quota: 等待 {first_method} 与 {second_method} 响应超时");
+                            return partial_pair(first_result, second_result);
                         }
                     }
                 }
@@ -645,6 +669,27 @@ mod tests {
             ..QuotaSnapshot::default()
         };
         assert!(is_ready(&failed));
+    }
+
+    #[test]
+    fn partial_pair_keeps_the_side_already_received() {
+        match partial_pair(Some(Ok(json!({"plan": "plus"}))), None) {
+            PairOutcome::Results(Ok(value), Err(error)) => {
+                assert_eq!(value["plan"], "plus");
+                assert_eq!(error, "timeout");
+            }
+            _ => panic!("一侧到手时应返回 Results"),
+        }
+
+        match partial_pair(None, Some(Ok(json!({"rateLimits": {}})))) {
+            PairOutcome::Results(Err(error), Ok(value)) => {
+                assert_eq!(error, "timeout");
+                assert!(value.get("rateLimits").is_some());
+            }
+            _ => panic!("一侧到手时应返回 Results"),
+        }
+
+        assert!(matches!(partial_pair(None, None), PairOutcome::Failed));
     }
 
     #[test]

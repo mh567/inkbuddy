@@ -46,10 +46,10 @@ inkbuddy 宿主
 
 - 插件启动后连接 app-server，握手，取账号和额度，存入内存快照。
 - 后台任务持续读 app-server 的 stdout：带 `id` 的消息按 id 匹配请求，不带 `id` 的消息按通知处理。
-- 60 秒定时器调用一次 `account/rateLimits/read`；收到额度通知时也更新快照。
+- 60 秒定时器先调 `account/read` 再调 `account/rateLimits/read`。先读账号是为了在运行中登出时立刻发现，切到「未登录」提示；只读额度的话，登出后拿到的还是旧数字。收到额度通知时也更新快照。
 - 宿主的 `render` 只读快照，直接返回。首次 `render` 若快照未就绪，最多等 3 秒。
-- app-server 退出后按 1 秒到 30 秒的退避间隔重连，期间保留最后一次快照。
-- `shutdown` 请求到达后取消定时器、终止 app-server 子进程，再回响应退出。
+- app-server 退出后按 1 秒到 30 秒的退避间隔重连，期间保留最后一次快照。连接存活满 30 秒后，下一次重连从 1 秒重新开始，避免反复快速失败的连接把退避推高。
+- `shutdown` 请求到达后先取消定时器、终止 app-server 子进程，再回响应退出。宿主读到响应就 SIGKILL 还活着的插件，收尾放在响应之后会被打断，子进程变孤儿。
 - 日志写 stderr；stdout 只写协议响应。
 
 ## 页面输出
@@ -80,6 +80,11 @@ inkbuddy 宿主
 | --- | --- |
 | `crates/inkbuddy-plugin-ai-quota/Cargo.toml` | 新 crate，依赖 `inkbuddy-protocol`、`tokio`、`serde_json`、`anyhow`、`chrono` |
 | `crates/inkbuddy-plugin-ai-quota/src/main.rs` | 协议循环、app-server 客户端、快照、渲染 |
+| `crates/inkbuddy-plugin-ai-quota/src/locate.rs` | 按 `CODEX_BIN`、`PATH`、`~/.local/bin` 查找可执行文件 |
+| `crates/inkbuddy-plugin-ai-quota/src/formatting.rs` | 套餐名、百分比宽度 class、重置倒计时、HTML 转义 |
+| `crates/inkbuddy-plugin-ai-quota/src/render.rs` | 把快照渲染成 HTML 块 |
+| `crates/inkbuddy-plugin-ai-quota/tests/loop.rs` | 协议循环端到端测试：render、坏请求、shutdown 收尾 |
+| `crates/inkbuddy-plugin-ai-quota/tests/service.rs` | 额度服务端到端测试：握手、轮询、通知、失败提示 |
 | `crates/inkbuddy-plugin-ai-quota/README.md` | 插件说明：数据来源、配置方式、输出内容 |
 | `Cargo.toml` | workspace members 加入新 crate |
 | `plugins/ai-quota/plugin.toml` | id `ai-quota`，默认不开启，超时 8000 毫秒 |

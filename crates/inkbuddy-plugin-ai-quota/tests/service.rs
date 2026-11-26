@@ -87,7 +87,8 @@ for raw in sys.stdin:
                     marker.write("1")
             send({"id": request_id, "result": account_result()})
     elif method == "account/rateLimits/read":
-        send({"id": request_id, "result": rate_limits(window(0, 300), window(51, 10080))})
+        if MODE != "no_limits":
+            send({"id": request_id, "result": rate_limits(window(0, 300), window(51, 10080))})
         if MODE == "notify" and not updated_sent:
             updated_sent = True
             send({
@@ -291,10 +292,25 @@ async fn service_notices_logout_while_running() {
     // 假服务进程仍应只启动过这一次。
     tokio::time::sleep(Duration::from_secs(6)).await;
     let spawns = fs::read_to_string(fake.dir.join("spawns")).expect("读取 spawn 日志");
-    assert_eq!(
-        spawns.lines().count(),
-        1,
-        "登出后不应反复重启 app-server"
+    assert_eq!(spawns.lines().count(), 1, "登出后不应反复重启 app-server");
+
+    shutdown_quickly(service).await;
+}
+
+#[tokio::test]
+async fn service_reports_failure_quickly_when_limits_missing() {
+    // 只回 account/read、不回额度：首轮不能按 10 秒请求超时空等，
+    // 应按 5 秒的 pair 上限尽早给出失败提示。
+    let fake = fake_codex("no_limits");
+    let service = QuotaService::start(fake.bin.clone(), Duration::from_secs(30));
+
+    let started = Instant::now();
+    let snapshot = service.wait_first(Duration::from_secs(8)).await;
+    assert_eq!(snapshot.failure.as_deref(), Some("额度读取失败"));
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "首轮等待耗时 {:?}，pair 超时上限没有生效",
+        started.elapsed()
     );
 
     shutdown_quickly(service).await;
