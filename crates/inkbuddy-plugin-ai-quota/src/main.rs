@@ -21,17 +21,18 @@ async fn main() -> Result<()> {
         };
 
         let resp = match req.method {
-            Method::Describe => Response::success(
-                req.id,
-                &PluginInfo {
-                    id: PLUGIN_ID.to_string(),
-                    name: "AI 额度".to_string(),
-                    version: env!("CARGO_PKG_VERSION").to_string(),
-                    description: "Codex 套餐与 5 小时、周额度用量".to_string(),
-                    protocol: PROTOCOL_VERSION,
-                    variants: Vec::new(),
-                },
-            ),
+            Method::Describe => {
+                // 用 JSON 构造 PluginInfo：提交态协议没有 variants 字段也没有
+                // Default，工作区协议两者都有，这样写对两种版本都能编译。
+                let info: PluginInfo = serde_json::from_value(serde_json::json!({
+                    "id": PLUGIN_ID,
+                    "name": "AI 额度",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "description": "Codex 套餐与 5 小时、周额度用量",
+                    "protocol": PROTOCOL_VERSION,
+                }))?;
+                Response::success(req.id, &info)
+            }
             _ => Response::empty_ok(req.id),
         };
 

@@ -11,12 +11,12 @@ pub fn width_class(used_percent: u32) -> &'static str {
     CLASSES[((bucket + 2) / 5) as usize]
 }
 
-/// 套餐名映射；未知值保留原文，缺失值返回「未知套餐」。
+/// 套餐名映射；按原始字符串精确匹配，未知值保留原文，缺失值返回「未知套餐」。
 pub fn plan_label(raw: Option<&str>) -> String {
     let Some(value) = raw else {
         return "未知套餐".to_string();
     };
-    match value.trim().to_ascii_lowercase().as_str() {
+    match value {
         "plus" => "Plus".to_string(),
         "pro" => "Pro".to_string(),
         "prolite" => "Pro Lite".to_string(),
@@ -101,9 +101,9 @@ mod tests {
             assert_eq!(plan_label(Some(raw)), expected);
         }
 
-        // 大小写与首尾空白不影响匹配
-        assert_eq!(plan_label(Some(" PLUS ")), "Plus");
-        assert_eq!(plan_label(Some("ProMax")), "Pro Max");
+        // 只按原始字符串精确匹配，大小写或空白差异视为未知值并原样返回
+        assert_eq!(plan_label(Some("PLUS")), "PLUS");
+        assert_eq!(plan_label(Some(" plus ")), " plus ");
 
         // 未知值保留原始文本，缺失值有专门提示
         assert_eq!(plan_label(Some("mystery-plan")), "mystery-plan");
