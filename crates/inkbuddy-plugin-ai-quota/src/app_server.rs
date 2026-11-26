@@ -34,7 +34,7 @@ const CLIENT_NAME: &str = "inkbuddy-ai-quota";
 const CLIENT_TITLE: &str = "InkBuddy AI Quota";
 
 /// 找不到可执行文件时的提示。
-const FAILURE_NOT_FOUND: &str = "未找到 Codex CLI";
+pub const FAILURE_NOT_FOUND: &str = "未找到 Codex CLI";
 /// 其它取数失败（含进程退出、握手失败、超时）的提示。
 const FAILURE_READ: &str = "额度读取失败";
 
@@ -118,7 +118,9 @@ impl QuotaService {
 }
 
 fn is_ready(snapshot: &QuotaSnapshot) -> bool {
-    snapshot.updated_at.is_some() || snapshot.failure.is_some()
+    // 只拿到套餐名还不算就绪：`account/updated` 通知常在额度读取返回前到达，
+    // 若此时放行首轮渲染，页面会先闪一帧「暂无数据」。等到任一窗口或失败原因。
+    snapshot.five_hour.is_some() || snapshot.weekly.is_some() || snapshot.failure.is_some()
 }
 
 fn unix_now() -> i64 {
@@ -147,6 +149,16 @@ fn account_failure(message: &str) -> &'static str {
 enum RequestOutcome {
     /// 收到匹配 id 的响应。
     Result(Result<Value, String>),
+    /// 收到 stop 信号。
+    Stopped,
+    /// IO 失败、进程退出或超时。
+    Failed,
+}
+
+/// 两个并发请求的结局。
+enum PairOutcome {
+    /// 两个请求都收到响应，按传入顺序返回。
+    Results(Result<Value, String>, Result<Value, String>),
     /// 收到 stop 信号。
     Stopped,
     /// IO 失败、进程退出或超时。
@@ -271,8 +283,25 @@ async fn run_session(
         };
     }
 
-    match session.request(2, "account/read", json!({}), stop).await {
-        RequestOutcome::Result(Ok(value)) => {
+    // 账号与额度一起发：两次读取各要一次网络往返，串行会超过首轮等待窗口。
+    let account_request = (2, "account/read", json!({}));
+    let limits_request = (3, "account/rateLimits/read", json!({}));
+    let (account, limits) = match session
+        .request_pair(account_request, limits_request, stop)
+        .await
+    {
+        PairOutcome::Results(account, limits) => (account, limits),
+        PairOutcome::Stopped => return SessionEnd::Stopped,
+        PairOutcome::Failed => {
+            publish_failure(tx, FAILURE_READ);
+            return SessionEnd::Ended {
+                reset_backoff: is_stable(started.elapsed()),
+            };
+        }
+    };
+
+    match account {
+        Ok(value) => {
             apply_account(&mut session.snapshot, &value, unix_now());
             if matches!(value.get("account"), Some(Value::Null)) {
                 // 未登录时不必再读额度；发布失败快照后等用户登录再重连。
@@ -282,15 +311,23 @@ async fn run_session(
                 };
             }
         }
-        RequestOutcome::Result(Err(message)) => {
+        Err(message) => {
             eprintln!("ai-quota: account/read 失败: {message}");
             publish_failure(tx, account_failure(&message));
             return SessionEnd::Ended {
                 reset_backoff: is_stable(started.elapsed()),
             };
         }
-        RequestOutcome::Stopped => return SessionEnd::Stopped,
-        RequestOutcome::Failed => {
+    }
+
+    match limits {
+        Ok(value) => {
+            apply_rate_limits(&mut session.snapshot, &value, unix_now());
+            // 账号与额度都到手后统一发布，避免首轮只拿到半份数据。
+            session.publish();
+        }
+        Err(message) => {
+            eprintln!("ai-quota: account/rateLimits/read 失败: {message}");
             publish_failure(tx, FAILURE_READ);
             return SessionEnd::Ended {
                 reset_backoff: is_stable(started.elapsed()),
@@ -299,30 +336,6 @@ async fn run_session(
     }
 
     let mut next_id = 4;
-    match session
-        .request(3, "account/rateLimits/read", json!({}), stop)
-        .await
-    {
-        RequestOutcome::Result(Ok(value)) => {
-            apply_rate_limits(&mut session.snapshot, &value, unix_now());
-            // 账号与额度都到手后统一发布，避免首轮只拿到半份数据。
-            session.publish();
-        }
-        RequestOutcome::Result(Err(message)) => {
-            eprintln!("ai-quota: account/rateLimits/read 失败: {message}");
-            publish_failure(tx, FAILURE_READ);
-            return SessionEnd::Ended {
-                reset_backoff: is_stable(started.elapsed()),
-            };
-        }
-        RequestOutcome::Stopped => return SessionEnd::Stopped,
-        RequestOutcome::Failed => {
-            publish_failure(tx, FAILURE_READ);
-            return SessionEnd::Ended {
-                reset_backoff: is_stable(started.elapsed()),
-            };
-        }
-    }
 
     let mut ticker = tokio::time::interval(poll_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -469,6 +482,74 @@ impl Session<'_> {
         self.publish();
     }
 
+    /// 同时发出两个请求并等到两条响应；期间收到的通知先应用。
+    ///
+    /// 首轮要读账号和额度，两次读取各走一次网络往返，串行会超出宿主给的首轮
+    /// 等待窗口，所以一起发出、按 id 分别收结果。
+    async fn request_pair(
+        &mut self,
+        first: (u64, &str, Value),
+        second: (u64, &str, Value),
+        stop: &mut oneshot::Receiver<()>,
+    ) -> PairOutcome {
+        let (first_id, first_method, first_params) = first;
+        let (second_id, second_method, second_params) = second;
+        if !self
+            .send(&json!({"id": first_id, "method": first_method, "params": first_params}))
+            .await
+            || !self
+                .send(&json!({"id": second_id, "method": second_method, "params": second_params}))
+                .await
+        {
+            return PairOutcome::Failed;
+        }
+
+        let mut first_result = None;
+        let mut second_result = None;
+        let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
+        loop {
+            if let (Some(first), Some(second)) = (first_result.clone(), second_result.clone()) {
+                return PairOutcome::Results(first, second);
+            }
+            let line = tokio::select! {
+                _ = &mut *stop => return PairOutcome::Stopped,
+                line = tokio::time::timeout_at(deadline, self.lines.next_line()) => {
+                    match line {
+                        Ok(Ok(Some(line))) => line,
+                        Ok(Ok(None)) => {
+                            eprintln!("ai-quota: app-server 提前关闭 stdout");
+                            return PairOutcome::Failed;
+                        }
+                        Ok(Err(err)) => {
+                            eprintln!("ai-quota: 读取 app-server 输出失败: {err}");
+                            return PairOutcome::Failed;
+                        }
+                        Err(_) => {
+                            eprintln!("ai-quota: 等待 {first_method}/{second_method} 响应超时");
+                            return PairOutcome::Failed;
+                        }
+                    }
+                }
+            };
+
+            match parse_message(&line) {
+                RpcMessage::Response { id, result } if id == first_id => {
+                    first_result = Some(result);
+                }
+                RpcMessage::Response { id, result } if id == second_id => {
+                    second_result = Some(result);
+                }
+                RpcMessage::Response { .. } | RpcMessage::Unknown => {}
+                RpcMessage::Request { id, method } => {
+                    self.reject_request(id, &method).await;
+                }
+                RpcMessage::Notification { method, params } => {
+                    self.apply_notification(&method, &params);
+                }
+            }
+        }
+    }
+
     /// 发请求并等待匹配 id 的响应；期间收到的通知先应用。
     async fn request(
         &mut self,
@@ -540,6 +621,30 @@ mod tests {
     #[test]
     fn next_backoff_starts_at_one_second() {
         assert_eq!(next_backoff(Duration::ZERO), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn is_ready_requires_window_or_failure() {
+        // 只有套餐名和更新时间：额度通知先到时不能当作首轮就绪。
+        let plan_only = QuotaSnapshot {
+            plan: Some("plus".to_string()),
+            updated_at: Some(1_700_000_000),
+            ..QuotaSnapshot::default()
+        };
+        assert!(!is_ready(&plan_only));
+
+        let with_window = QuotaSnapshot {
+            five_hour: Some(crate::model::QuotaWindow::default()),
+            updated_at: Some(1_700_000_000),
+            ..QuotaSnapshot::default()
+        };
+        assert!(is_ready(&with_window));
+
+        let failed = QuotaSnapshot {
+            failure: Some(FAILURE_NOT_FOUND.to_string()),
+            ..QuotaSnapshot::default()
+        };
+        assert!(is_ready(&failed));
     }
 
     #[test]

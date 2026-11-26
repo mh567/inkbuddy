@@ -4,6 +4,7 @@
 
 pub mod app_server;
 pub mod formatting;
+pub mod locate;
 pub mod model;
 pub mod render;
 pub mod rpc;

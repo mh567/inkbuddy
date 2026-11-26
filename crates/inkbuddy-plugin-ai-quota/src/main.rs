@@ -1,13 +1,70 @@
 //! AI 额度插件的协议入口。
 //!
-//! 当前只是让 crate 可编译的协议循环：describe 返回插件信息，其余方法回空
-//! 成功响应，shutdown 回完即退出。app-server 客户端与正式渲染在后续任务接入。
+//! 启动时按环境查找 Codex CLI 并起一个长驻额度服务，`render` 从服务快照
+//! 读数据渲染 HTML 块；找不到 CLI 时直接返回提示块。日志写 stderr，
+//! stdout 只写协议响应。
+
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use inkbuddy_protocol::{Method, PluginInfo, Request, Response, PROTOCOL_VERSION};
+use inkbuddy_plugin_ai_quota::app_server::{self, QuotaService};
+use inkbuddy_plugin_ai_quota::locate;
+use inkbuddy_plugin_ai_quota::model::QuotaSnapshot;
+use inkbuddy_plugin_ai_quota::render::render_html;
+use inkbuddy_protocol::{
+    Block, Method, PluginInfo, RenderResult, Request, Response, PROTOCOL_VERSION,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 const PLUGIN_ID: &str = "ai-quota";
+
+/// 后台读取额度的间隔。
+const POLL_INTERVAL: Duration = Duration::from_secs(60);
+/// 首次 render 等待快照的上限。
+const FIRST_RENDER_WAIT: Duration = Duration::from_secs(3);
+/// 页面刷新间隔，只用来让倒计时保持准确；取数由服务定时器驱动。
+const REFRESH_MS: u64 = 30_000;
+
+/// 插件运行状态：额度服务与「是否已经等过首轮」。
+struct Board {
+    service: Option<QuotaService>,
+    served_first: bool,
+}
+
+impl Board {
+    fn new() -> Self {
+        Self {
+            service: locate::codex_from_env()
+                .map(|bin| QuotaService::start(bin, POLL_INTERVAL)),
+            served_first: false,
+        }
+    }
+
+    /// 当前快照；没有服务时返回「未找到 Codex CLI」。
+    fn current(&self) -> QuotaSnapshot {
+        match &self.service {
+            Some(service) => service.snapshot().borrow().clone(),
+            None => QuotaSnapshot {
+                failure: Some(app_server::FAILURE_NOT_FOUND.to_string()),
+                ..QuotaSnapshot::default()
+            },
+        }
+    }
+
+    /// 首次有服务时等首轮数据，之后只读快照。
+    async fn render(&mut self) -> String {
+        let snapshot = if !self.served_first {
+            self.served_first = true;
+            match &self.service {
+                Some(service) => service.wait_first(FIRST_RENDER_WAIT).await,
+                None => self.current(),
+            }
+        } else {
+            self.current()
+        };
+        render_html(&snapshot, unix_now())
+    }
+}
 
 /// 一行输入解析后的结果。
 #[derive(Debug)]
@@ -51,7 +108,7 @@ fn parse_request_line(line: &str) -> ParsedRequest {
 }
 
 /// 处理一条合法请求，产出对应响应。
-fn handle_request(req: Request) -> Response {
+async fn handle_request(req: Request, board: &mut Board) -> Response {
     match req.method {
         Method::Describe => {
             // 用 JSON 构造 PluginInfo：提交态协议没有 variants 字段也没有
@@ -69,7 +126,15 @@ fn handle_request(req: Request) -> Response {
                 Err(e) => Response::failure(req.id, format!("describe: {e}")),
             }
         }
-        _ => Response::empty_ok(req.id),
+        Method::Render => {
+            let html = board.render().await;
+            let result = RenderResult {
+                blocks: vec![Block::Html { html }],
+                refresh_ms: Some(REFRESH_MS),
+            };
+            Response::success(req.id, &result)
+        }
+        Method::Ping | Method::Configure | Method::Shutdown => Response::empty_ok(req.id),
     }
 }
 
@@ -84,25 +149,37 @@ where
     Ok(())
 }
 
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or_default()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut reader = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
+    let mut board = Board::new();
 
     while let Some(line) = reader.next_line().await? {
         let (resp, shutdown) = match parse_request_line(&line) {
             ParsedRequest::Request(req) => {
                 let shutdown = req.method == Method::Shutdown;
-                (handle_request(req), shutdown)
+                (handle_request(req, &mut board).await, shutdown)
             }
             ParsedRequest::Bad { id, error } => (Response::failure(id, error), false),
             ParsedRequest::Ignore => continue,
         };
 
+        // 先回响应，宿主不必等收尾。
         write_response(&mut stdout, &resp).await?;
 
-        // 回完 shutdown 响应就退出，避免把长驻子进程留在后台。
         if shutdown {
+            // 退出前把 app-server 子进程带走，不留后台进程。
+            if let Some(service) = board.service.take() {
+                service.shutdown().await;
+            }
             break;
         }
     }

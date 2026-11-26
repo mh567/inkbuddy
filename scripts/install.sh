@@ -21,11 +21,12 @@ cd "$ROOT"
 cargo build --release
 
 echo "==> Creating $HOME_DIR/plugins"
-mkdir -p "$HOME_DIR/plugins/lyrics" "$HOME_DIR/plugins/clock" "$HOME_DIR/cache/lyrics"
+mkdir -p "$HOME_DIR/plugins/lyrics" "$HOME_DIR/plugins/clock" "$HOME_DIR/plugins/ai-quota" "$HOME_DIR/cache/lyrics"
 
 HOST_BIN_ABS="$ROOT/target/release/inkbuddy"
 PLUGIN_BIN_ABS="$ROOT/target/release/inkbuddy-plugin-lyrics"
 CLOCK_BIN_ABS="$ROOT/target/release/inkbuddy-plugin-clock"
+AI_QUOTA_BIN_ABS="$ROOT/target/release/inkbuddy-plugin-ai-quota"
 
 # Escape backslashes and double quotes so an install path containing them
 # still produces a valid TOML basic string in command = "..." (backslashes
@@ -39,6 +40,7 @@ toml_escape() {
 
 LYRICS_CMD_TOML="$(toml_escape "$PLUGIN_BIN_ABS")"
 CLOCK_CMD_TOML="$(toml_escape "$CLOCK_BIN_ABS")"
+AI_QUOTA_CMD_TOML="$(toml_escape "$AI_QUOTA_BIN_ABS")"
 
 # Only create a manifest when one is absent. Re-running install.sh must not
 # silently clobber a user's edited enabled/default_on/timeout_ms/args.
@@ -72,6 +74,23 @@ command = "$CLOCK_CMD_TOML"
 enabled = true
 default_on = false
 timeout_ms = 2000
+args = []
+EOF
+fi
+
+if [ ! -f "$HOME_DIR/plugins/ai-quota/plugin.toml" ]; then
+  cat > "$HOME_DIR/plugins/ai-quota/plugin.toml" <<EOF
+[plugin]
+id = "ai-quota"
+name = "AI 额度"
+version = "0.1.0"
+description = "Codex 套餐与 5 小时、周额度用量"
+command = "$AI_QUOTA_CMD_TOML"
+
+[runtime]
+enabled = true
+default_on = false
+timeout_ms = 8000
 args = []
 EOF
 fi

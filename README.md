@@ -58,6 +58,7 @@ http://<mac-局域网-IP>:9012/
 http://<ip>:9012/?plugins=lyrics            # 只显示歌词
 http://<ip>:9012/?plugins=clock             # 只显示时钟
 http://<ip>:9012/?plugins=lyrics,clock      # 组合，歌词在上、时钟在下
+http://<ip>:9012/?plugins=ai-quota       # 只看 AI 额度
 ```
 
 不带参数时显示所有 `default_on = true` 的插件（默认只有歌词）。显示内容优先跟随当前视图（见下文「视图」）；没有选中视图时退到 URL 参数，再退到 `default_on`。选择放在 URL 里。
@@ -136,6 +137,7 @@ macOS 菜单栏 app 的视图编辑窗口：左侧从已安装扩展添加区域
 | --- | --- | --- |
 | `lyrics` | 正在播放的同步歌词 | [crates/inkbuddy-plugin-lyrics/README.md](crates/inkbuddy-plugin-lyrics/README.md) |
 | `clock` | 当前日期与时间 | [crates/inkbuddy-plugin-clock/README.md](crates/inkbuddy-plugin-clock/README.md) |
+| `ai-quota` | Codex 套餐与 5 小时、周额度用量，进度条展示 | [crates/inkbuddy-plugin-ai-quota/README.md](crates/inkbuddy-plugin-ai-quota/README.md) |
 
 ## 写自己的插件
 
@@ -151,6 +153,7 @@ Rust 插件可直接依赖 `inkbuddy-protocol` crate 拿到全部类型定义。
 | `crates/inkbuddy-host` | 主程序：插件进程管理、HTTP 服务、视图、页面渲染 |
 | `crates/inkbuddy-plugin-lyrics` | 歌词插件（核心功能），[说明](crates/inkbuddy-plugin-lyrics/README.md) |
 | `crates/inkbuddy-plugin-clock` | 时钟插件，演示组合与最小插件写法，[说明](crates/inkbuddy-plugin-clock/README.md) |
+| `crates/inkbuddy-plugin-ai-quota` | AI 额度看板插件，读本机 Codex CLI 的账号额度，[说明](crates/inkbuddy-plugin-ai-quota/README.md) |
 | `web/ink.html` | 墨水屏展示页（编译进主程序） |
 | `app/Sources` | macOS 菜单栏 app（Swift，编译进 InkBuddy.app） |
 | `plugins/*/plugin.toml` | 开发用的插件清单 |

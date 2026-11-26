@@ -17,7 +17,7 @@ cargo build --release --workspace
 
 echo "==> 组装 bundle"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$RESDIR/plugins/lyrics" "$RESDIR/plugins/clock"
+mkdir -p "$APP/Contents/MacOS" "$RESDIR/plugins/lyrics" "$RESDIR/plugins/clock" "$RESDIR/plugins/ai-quota"
 
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -52,6 +52,7 @@ swiftc -O app/Sources/main.swift app/Sources/AppDelegate.swift app/Sources/AppSt
 cp target/release/inkbuddy "$RESDIR/inkbuddy-host"
 cp target/release/inkbuddy-plugin-lyrics "$RESDIR/plugins/lyrics/inkbuddy-plugin-lyrics"
 cp target/release/inkbuddy-plugin-clock "$RESDIR/plugins/clock/inkbuddy-plugin-clock"
+cp target/release/inkbuddy-plugin-ai-quota "$RESDIR/plugins/ai-quota/inkbuddy-plugin-ai-quota"
 
 # 歌词插件读取 Now Playing 用的 MediaRemote 组件随 app 分发
 cp vendor/nowplaying-cli/MediaRemoteMini.dylib "$RESDIR/plugins/lyrics/MediaRemoteMini.dylib"
@@ -89,6 +90,21 @@ command = "./inkbuddy-plugin-clock"
 enabled = true
 default_on = false
 timeout_ms = 2000
+args = []
+EOF
+
+cat > "$RESDIR/plugins/ai-quota/plugin.toml" <<'EOF'
+[plugin]
+id = "ai-quota"
+name = "AI 额度"
+version = "0.1.0"
+description = "Codex 套餐与 5 小时、周额度用量"
+command = "./inkbuddy-plugin-ai-quota"
+
+[runtime]
+enabled = true
+default_on = false
+timeout_ms = 8000
 args = []
 EOF
 
