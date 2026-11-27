@@ -245,7 +245,7 @@
   /* 纯文本模式收掉装饰性的圆形印记 */
   body.mode-text .clock-cal-seal { display: none; }
 
-  /* AI 额度看板：三行结构，尺寸跟随 --ink-scale。 */
+  /* AI 额度看板：标题行加若干额度行，尺寸跟随 --ink-scale。 */
   .quota {
     box-sizing: border-box; width: 100%;
     display: flex; flex-direction: column;
@@ -284,6 +284,12 @@
     display: flex; align-items: center;
     gap: calc(1.5vw * var(--ink-scale, 1));
     font-size: calc(2.6vw * var(--ink-scale, 1));
+  }
+  /* 分组标题：一组模型（Gemini、Claude 与 GPT）占一行的额度卡用它分段。 */
+  .quota-group {
+    margin-top: calc(0.8vw * var(--ink-scale, 1));
+    font-size: calc(2.2vw * var(--ink-scale, 1));
+    color: #8a8a8a; letter-spacing: .12em;
   }
   .quota-label { flex: 0 0 3.1em; white-space: nowrap; }
   .quota-bar {
@@ -337,13 +343,13 @@
   body.invert .quota-bar { border-color: #ffffff; background: #000000; }
   body.invert .quota-fill { background: #ffffff; }
   body.invert .quota-meta, body.invert .quota-reset,
-  body.invert .quota-stale { color: #b0b0b0; }
+  body.invert .quota-stale, body.invert .quota-group { color: #b0b0b0; }
   body.invert .quota-notice-text { color: #ffffff; }
   /* 纯黑白：辅助文字推到纯黑；反色时推到纯白。 */
   body.mode-bw .quota-meta, body.mode-bw .quota-reset,
-  body.mode-bw .quota-stale { color: #000000; }
+  body.mode-bw .quota-stale, body.mode-bw .quota-group { color: #000000; }
   body.invert.mode-bw .quota-meta, body.invert.mode-bw .quota-reset,
-  body.invert.mode-bw .quota-stale { color: #ffffff; }
+  body.invert.mode-bw .quota-stale, body.invert.mode-bw .quota-group { color: #ffffff; }
 </style>
 </head>
 <body>

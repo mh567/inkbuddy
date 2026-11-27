@@ -1,0 +1,19 @@
+[package]
+name = "inkbuddy-plugin-antigravity-quota"
+description = "First-party inkbuddy plugin: Antigravity quota usage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "inkbuddy-plugin-antigravity-quota"
+path = "src/main.rs"
+
+[dependencies]
+inkbuddy-protocol = { path = "../inkbuddy-protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }

@@ -17,7 +17,7 @@ cargo build --release --workspace
 
 echo "==> 组装 bundle"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$RESDIR/plugins/lyrics" "$RESDIR/plugins/clock" "$RESDIR/plugins/ai-quota" "$RESDIR/plugins/command-code"
+mkdir -p "$APP/Contents/MacOS" "$RESDIR/plugins/lyrics" "$RESDIR/plugins/clock" "$RESDIR/plugins/ai-quota" "$RESDIR/plugins/command-code" "$RESDIR/plugins/antigravity-quota"
 
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -54,6 +54,7 @@ cp target/release/inkbuddy-plugin-lyrics "$RESDIR/plugins/lyrics/inkbuddy-plugin
 cp target/release/inkbuddy-plugin-clock "$RESDIR/plugins/clock/inkbuddy-plugin-clock"
 cp target/release/inkbuddy-plugin-ai-quota "$RESDIR/plugins/ai-quota/inkbuddy-plugin-ai-quota"
 cp target/release/inkbuddy-plugin-command-code "$RESDIR/plugins/command-code/inkbuddy-plugin-command-code"
+cp target/release/inkbuddy-plugin-antigravity-quota "$RESDIR/plugins/antigravity-quota/inkbuddy-plugin-antigravity-quota"
 
 # 歌词插件读取 Now Playing 用的 MediaRemote 组件随 app 分发
 cp vendor/nowplaying-cli/MediaRemoteMini.dylib "$RESDIR/plugins/lyrics/MediaRemoteMini.dylib"
@@ -113,6 +114,30 @@ command = "./inkbuddy-plugin-ai-quota"
 [runtime]
 enabled = true
 default_on = $AI_QUOTA_DEFAULT_ON
+timeout_ms = 8000
+args = []
+EOF
+
+# antigravity-quota 读的是本机反重力的语言服务器。没装这个 app 时开着它，裸页面
+# 会一直挂着一行「未找到 Antigravity」，所以打包时按有没有 app 决定默认值。
+# 只装了命令行版的机器也会留下 ~/.gemini/antigravity-cli，一并算作装了。
+if [ -d "/Applications/Antigravity.app" ] || [ -d "$HOME/.gemini/antigravity" ] || [ -d "$HOME/.gemini/antigravity-cli" ]; then
+  ANTIGRAVITY_QUOTA_DEFAULT_ON=true
+else
+  ANTIGRAVITY_QUOTA_DEFAULT_ON=false
+fi
+
+cat > "$RESDIR/plugins/antigravity-quota/plugin.toml" <<EOF
+[plugin]
+id = "antigravity-quota"
+name = "反重力额度"
+version = "0.1.0"
+description = "Antigravity 套餐与 5 小时、周额度用量"
+command = "./inkbuddy-plugin-antigravity-quota"
+
+[runtime]
+enabled = true
+default_on = $ANTIGRAVITY_QUOTA_DEFAULT_ON
 timeout_ms = 8000
 args = []
 EOF

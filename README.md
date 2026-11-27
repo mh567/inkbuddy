@@ -61,9 +61,10 @@ http://<ip>:9012/?plugins=clock             # 只显示时钟
 http://<ip>:9012/?plugins=lyrics,clock      # 组合，歌词在上、时钟在下
 http://<ip>:9012/?plugins=ai-quota          # 只显示 AI 额度
 http://<ip>:9012/?plugins=command-code       # 只显示 Command Code 额度
+http://<ip>:9012/?plugins=antigravity-quota  # 只显示反重力额度
 ```
 
-不带参数时显示所有 `default_on = true` 的插件（歌词，以及装了 Codex CLI 的机器上的 AI 额度、装了 cmd CLI 的机器上的 Command Code 额度）。显示内容优先跟随当前视图（见下文「视图」）；没有选中视图时退到 URL 参数，再退到 `default_on`。选择放在 URL 里。
+不带参数时显示所有 `default_on = true` 的插件（歌词，以及装了 Codex CLI 的机器上的 AI 额度、装了 cmd CLI 的机器上的 Command Code 额度、装了反重力的机器上的反重力额度）。显示内容优先跟随当前视图（见下文「视图」）；没有选中视图时退到 URL 参数，再退到 `default_on`。选择放在 URL 里。
 
 视图生效时每个插件渲染在自己的区域里，字号按区域大小自动缩放（可用宽度占比与高度装得下内容两个约束取小），缩放用的宽高比来自设备浏览器每次轮询上报的真实视口尺寸。每个区域四周留白（上下 3vh、左右 4vw），内容不贴墨水屏边缘；缩放按扣掉留白后的可用宽高算，内容多时字号变小。
 
@@ -143,6 +144,7 @@ macOS 菜单栏 app 的视图编辑窗口：左侧从已安装扩展添加区域
 | `clock` | 当前日期与时间，视图里可给时钟区域选经典、点阵、台历 | [crates/inkbuddy-plugin-clock/README.md](crates/inkbuddy-plugin-clock/README.md) |
 | `ai-quota` | Codex 套餐与 5 小时、周额度用量，进度条展示 | [crates/inkbuddy-plugin-ai-quota/README.md](crates/inkbuddy-plugin-ai-quota/README.md) |
 | `command-code` | Command Code 套餐与 5 小时、周、月额度用量 | [crates/inkbuddy-plugin-command-code/README.md](crates/inkbuddy-plugin-command-code/README.md) |
+| `antigravity-quota` | Antigravity 的 Gemini、Claude/GPT 两组 5 小时与周额度，读本机语言服务器 | [crates/inkbuddy-plugin-antigravity-quota/README.md](crates/inkbuddy-plugin-antigravity-quota/README.md) |
 
 ## 写自己的插件
 
@@ -160,6 +162,7 @@ Rust 插件可直接依赖 `inkbuddy-protocol` crate 拿到全部类型定义。
 | `crates/inkbuddy-plugin-clock` | 时钟插件，演示组合与最小插件写法，[说明](crates/inkbuddy-plugin-clock/README.md) |
 | `crates/inkbuddy-plugin-ai-quota` | AI 额度看板插件，读本机 Codex CLI 的账号额度，[说明](crates/inkbuddy-plugin-ai-quota/README.md) |
 | `crates/inkbuddy-plugin-command-code` | Command Code 额度看板插件，读本机 Command Code CLI 的账号额度，[说明](crates/inkbuddy-plugin-command-code/README.md) |
+| `crates/inkbuddy-plugin-antigravity-quota` | 反重力额度看板插件，读本机反重力语言服务器的额度接口，[说明](crates/inkbuddy-plugin-antigravity-quota/README.md) |
 | `web/ink.html` | 墨水屏展示页（编译进主程序） |
 | `app/Sources` | macOS 菜单栏 app（Swift，编译进 InkBuddy.app） |
 | `plugins/*/plugin.toml` | 开发用的插件清单 |

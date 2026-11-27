@@ -1,0 +1,12 @@
+[plugin]
+id = "antigravity-quota"
+name = "反重力额度"
+version = "0.1.0"
+description = "Antigravity 套餐与 5 小时、周额度用量"
+command = "../../target/release/inkbuddy-plugin-antigravity-quota"
+
+[runtime]
+enabled = true
+default_on = true
+timeout_ms = 8000
+args = []

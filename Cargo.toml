@@ -6,6 +6,7 @@ members = [
     "crates/inkbuddy-plugin-lyrics",
     "crates/inkbuddy-plugin-clock",
     "crates/inkbuddy-plugin-ai-quota",
+    "crates/inkbuddy-plugin-antigravity-quota",
     "crates/inkbuddy-plugin-command-code",
 ]
 
