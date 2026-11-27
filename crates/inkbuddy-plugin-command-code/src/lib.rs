@@ -6,3 +6,4 @@ pub mod api;
 pub mod auth;
 pub mod formatting;
 pub mod model;
+pub mod render;
