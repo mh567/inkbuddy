@@ -17,7 +17,7 @@ cargo build --release --workspace
 
 echo "==> 组装 bundle"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$RESDIR/plugins/lyrics" "$RESDIR/plugins/clock" "$RESDIR/plugins/ai-quota"
+mkdir -p "$APP/Contents/MacOS" "$RESDIR/plugins/lyrics" "$RESDIR/plugins/clock" "$RESDIR/plugins/ai-quota" "$RESDIR/plugins/command-code"
 
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -53,6 +53,7 @@ cp target/release/inkbuddy "$RESDIR/inkbuddy-host"
 cp target/release/inkbuddy-plugin-lyrics "$RESDIR/plugins/lyrics/inkbuddy-plugin-lyrics"
 cp target/release/inkbuddy-plugin-clock "$RESDIR/plugins/clock/inkbuddy-plugin-clock"
 cp target/release/inkbuddy-plugin-ai-quota "$RESDIR/plugins/ai-quota/inkbuddy-plugin-ai-quota"
+cp target/release/inkbuddy-plugin-command-code "$RESDIR/plugins/command-code/inkbuddy-plugin-command-code"
 
 # 歌词插件读取 Now Playing 用的 MediaRemote 组件随 app 分发
 cp vendor/nowplaying-cli/MediaRemoteMini.dylib "$RESDIR/plugins/lyrics/MediaRemoteMini.dylib"
@@ -112,6 +113,29 @@ command = "./inkbuddy-plugin-ai-quota"
 [runtime]
 enabled = true
 default_on = $AI_QUOTA_DEFAULT_ON
+timeout_ms = 8000
+args = []
+EOF
+
+# command-code 读的是本机 Command Code CLI 保存的登录态。没装 cmd 时开着它，
+# 裸页面会一直挂着一行未登录提示，所以打包时按有没有 cmd 决定默认值。
+if command -v cmd >/dev/null 2>&1 || [ -x "$HOME/.local/bin/cmd" ]; then
+  COMMAND_CODE_DEFAULT_ON=true
+else
+  COMMAND_CODE_DEFAULT_ON=false
+fi
+
+cat > "$RESDIR/plugins/command-code/plugin.toml" <<EOF
+[plugin]
+id = "command-code"
+name = "Command Code 额度"
+version = "0.1.0"
+description = "Command Code 套餐与 5 小时、周、月额度用量"
+command = "./inkbuddy-plugin-command-code"
+
+[runtime]
+enabled = true
+default_on = $COMMAND_CODE_DEFAULT_ON
 timeout_ms = 8000
 args = []
 EOF

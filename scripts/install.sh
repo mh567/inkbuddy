@@ -21,12 +21,13 @@ cd "$ROOT"
 cargo build --release
 
 echo "==> Creating $HOME_DIR/plugins"
-mkdir -p "$HOME_DIR/plugins/lyrics" "$HOME_DIR/plugins/clock" "$HOME_DIR/plugins/ai-quota" "$HOME_DIR/cache/lyrics"
+mkdir -p "$HOME_DIR/plugins/lyrics" "$HOME_DIR/plugins/clock" "$HOME_DIR/plugins/ai-quota" "$HOME_DIR/plugins/command-code" "$HOME_DIR/cache/lyrics"
 
 HOST_BIN_ABS="$ROOT/target/release/inkbuddy"
 PLUGIN_BIN_ABS="$ROOT/target/release/inkbuddy-plugin-lyrics"
 CLOCK_BIN_ABS="$ROOT/target/release/inkbuddy-plugin-clock"
 AI_QUOTA_BIN_ABS="$ROOT/target/release/inkbuddy-plugin-ai-quota"
+COMMAND_CODE_BIN_ABS="$ROOT/target/release/inkbuddy-plugin-command-code"
 
 # Escape backslashes and double quotes so an install path containing them
 # still produces a valid TOML basic string in command = "..." (backslashes
@@ -46,9 +47,18 @@ else
   AI_QUOTA_DEFAULT_ON=false
 fi
 
+# command-code 读的是本机 Command Code CLI 保存的登录态。没装 cmd 的机器上
+# 开着它，裸页面会一直挂着一行未登录提示，所以按有没有 cmd 决定默认值。
+if command -v cmd >/dev/null 2>&1 || [ -x "$HOME/.local/bin/cmd" ]; then
+  COMMAND_CODE_DEFAULT_ON=true
+else
+  COMMAND_CODE_DEFAULT_ON=false
+fi
+
 LYRICS_CMD_TOML="$(toml_escape "$PLUGIN_BIN_ABS")"
 CLOCK_CMD_TOML="$(toml_escape "$CLOCK_BIN_ABS")"
 AI_QUOTA_CMD_TOML="$(toml_escape "$AI_QUOTA_BIN_ABS")"
+COMMAND_CODE_CMD_TOML="$(toml_escape "$COMMAND_CODE_BIN_ABS")"
 
 # Only create a manifest when one is absent. Re-running install.sh must not
 # silently clobber a user's edited enabled/default_on/timeout_ms/args.
@@ -104,6 +114,27 @@ EOF
   if [ "$AI_QUOTA_DEFAULT_ON" = "false" ]; then
     echo "    no codex found on PATH or in ~/.local/bin; ai-quota stays off by default."
     echo "    Install Codex, then set default_on = true in $HOME_DIR/plugins/ai-quota/plugin.toml."
+  fi
+fi
+
+if [ ! -f "$HOME_DIR/plugins/command-code/plugin.toml" ]; then
+  cat > "$HOME_DIR/plugins/command-code/plugin.toml" <<EOF
+[plugin]
+id = "command-code"
+name = "Command Code 额度"
+version = "0.1.0"
+description = "Command Code 套餐与 5 小时、周、月额度用量"
+command = "$COMMAND_CODE_CMD_TOML"
+
+[runtime]
+enabled = true
+default_on = $COMMAND_CODE_DEFAULT_ON
+timeout_ms = 8000
+args = []
+EOF
+  if [ "$COMMAND_CODE_DEFAULT_ON" = "false" ]; then
+    echo "    no cmd found on PATH or in ~/.local/bin; command-code stays off by default."
+    echo "    Install Command Code CLI, then set default_on = true in $HOME_DIR/plugins/command-code/plugin.toml."
   fi
 fi
 
