@@ -7,7 +7,7 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::api::{self, FetchError};
-use crate::model::{QuotaSnapshot, FAILURE_READ, LOGIN_REQUIRED};
+use crate::model::{QuotaSnapshot, FAILURE_NOT_FOUND, FAILURE_READ, LOGIN_REQUIRED};
 
 /// shutdown 时等待后台任务收尾的上限。
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -133,12 +133,23 @@ fn auth_snapshot() -> QuotaSnapshot {
 /// 取数失败：保留旧快照，仅更新提示文案。
 fn failed_snapshot(previous: &QuotaSnapshot, message: String) -> QuotaSnapshot {
     let mut snapshot = previous.clone();
-    // 登录提示是终态，后续传输失败不改变它。
-    if snapshot.failure.as_deref() == Some(LOGIN_REQUIRED) {
+    // 登录提示与「额度数据未找到」都是终态，后续传输失败不改写它们。
+    if matches!(
+        snapshot.failure.as_deref(),
+        Some(LOGIN_REQUIRED) | Some(FAILURE_NOT_FOUND)
+    ) {
         return snapshot;
     }
     snapshot.failure = Some(message);
     snapshot
+}
+
+/// 取数失败时更新等待节奏：限流与传输失败都退避，凭据问题保持正常间隔。
+fn on_fetch_error(state: &mut PollState, error: &FetchError, base: Duration) {
+    match error {
+        FetchError::RateLimited(_) | FetchError::Transport => state.on_failure(base),
+        FetchError::Auth | FetchError::InvalidKey => state.on_success(),
+    }
 }
 
 /// 后台取数循环。
@@ -163,22 +174,28 @@ async fn run(
                 // updated_at 由 fetch_snapshot 统一设置。
                 let _ = tx.send_replace(snapshot);
             }
-            Err(FetchError::Auth) => {
-                // 凭据失效后按正常间隔继续探测，用户在 CLI 重新登录即可恢复。
-                state.on_success();
-                eprintln!("command-code: 鉴权失败，按正常间隔继续探测");
-                let _ = tx.send_replace(auth_snapshot());
-            }
-            Err(FetchError::RateLimited(code)) => {
-                state.on_failure(poll_interval);
-                // 日志只写状态码，凭据留在进程内存里。
-                eprintln!("command-code: 取数被限流，状态码 {code}");
-                let snapshot = failed_snapshot(&previous, format!("额度读取失败（HTTP {code}）"));
-                let _ = tx.send_replace(snapshot);
-            }
-            Err(FetchError::Transport) => {
-                eprintln!("command-code: 取数失败");
-                let snapshot = failed_snapshot(&previous, FAILURE_READ.to_string());
+            Err(error) => {
+                on_fetch_error(&mut state, &error, poll_interval);
+                let snapshot = match &error {
+                    FetchError::Auth => {
+                        // 凭据在进程启动时读入，命令行重新登录后要重启插件进程才会生效。
+                        eprintln!("command-code: 鉴权失败，重启插件进程后才会重新读取凭据");
+                        auth_snapshot()
+                    }
+                    FetchError::InvalidKey => {
+                        eprintln!("command-code: apiKey 含非法字符，无法构造认证头");
+                        auth_snapshot()
+                    }
+                    FetchError::RateLimited(code) => {
+                        // 日志只写状态码，凭据留在进程内存里。
+                        eprintln!("command-code: 取数被限流，状态码 {code}");
+                        failed_snapshot(&previous, format!("额度读取失败（HTTP {code}）"))
+                    }
+                    FetchError::Transport => {
+                        eprintln!("command-code: 取数失败");
+                        failed_snapshot(&previous, FAILURE_READ.to_string())
+                    }
+                };
                 let _ = tx.send_replace(snapshot);
             }
         }
@@ -302,6 +319,33 @@ mod tests {
         let login = auth_snapshot();
         let still_login = failed_snapshot(&login, FAILURE_READ.to_string());
         assert_eq!(still_login.failure.as_deref(), Some(LOGIN_REQUIRED));
+
+        // 额度未找到同样是终态。
+        let not_found = QuotaSnapshot {
+            failure: Some(FAILURE_NOT_FOUND.to_string()),
+            updated_at: Some(1_700_000_000),
+            ..QuotaSnapshot::default()
+        };
+        let still_not_found = failed_snapshot(&not_found, FAILURE_READ.to_string());
+        assert_eq!(still_not_found.failure.as_deref(), Some(FAILURE_NOT_FOUND));
+        assert_eq!(still_not_found.updated_at, not_found.updated_at);
+    }
+
+    #[test]
+    fn on_fetch_error_backs_off_transport_and_rate_limit_only() {
+        let base = Duration::from_secs(60);
+
+        let mut state = PollState::new();
+        on_fetch_error(&mut state, &FetchError::Transport, base);
+        assert_eq!(state.delay(base), Duration::from_secs(120));
+        on_fetch_error(&mut state, &FetchError::RateLimited(503), base);
+        assert_eq!(state.delay(base), Duration::from_secs(240));
+
+        let mut state = PollState::new();
+        on_fetch_error(&mut state, &FetchError::Auth, base);
+        assert_eq!(state, PollState::Normal);
+        on_fetch_error(&mut state, &FetchError::InvalidKey, base);
+        assert_eq!(state, PollState::Normal);
     }
 
     #[tokio::test]

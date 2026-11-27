@@ -10,9 +10,11 @@
 //!
 //! The host sends a [`Request`] line and reads exactly one [`Response`] line
 //! with the matching `id`. Non-response stdout lines are ignored; diagnostics
-//! go to stderr. Every request gets exactly one response line, including
-//! malformed requests and unknown methods; otherwise the host waits until
-//! its deadline.
+//! go to stderr. Every request carrying an `id` gets exactly one response
+//! line, including unknown methods and invalid fields; otherwise the host
+//! waits until its deadline. A line that is not valid JSON or has no `id`
+//! is skipped by the plugin, since the host pairs replies by `id` and there
+//! is nothing to echo. Hosts send well-formed requests with an `id`.
 //!
 //! Both sides cap a single line at 1 MiB. `id` is a monotonically increasing
 //! `u64` and stays below 2^53 so JSON implementations in other languages can

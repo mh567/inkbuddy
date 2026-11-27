@@ -53,9 +53,9 @@ base URL `https://api.commandcode.ai`，认证头 `Authorization: Bearer <key>`�
 | `windowLimits.weekly.used / cap / resetAt` | 周窗口的进度与重置时间 |
 | `summary.totalCount / totalCost / totalTokens` | 本期用量，存入快照 |
 
-套餐档位的 credit 池内置一份，用于算月度百分比：`Go 10`、`GOAT 70`、`Pro 30`、`Max 150`、`Ultra 300`、`Teams Pro 40`。`planId` 带 `_v1` 后缀或版本尾巴时先归一化再查表。窗口上限以接口返回的 `cap` 为准，内置值只在 `cap` 缺失时兜底，不反向从百分比推算上限。
+套餐档位的 credit 池内置一份，用于算月度百分比：`Go 10`、`GOAT 70`、`Pro 30`、`Max 150`、`Ultra 300`、`Teams Pro 40`。`planId` 带 `_v1` 后缀或版本尾巴时先归一化再查表。5 小时与周窗口的上限只取接口返回的 `cap`；`cap` 或 `used` 缺失时该行百分比写 `None`，页面显示 `--`，不从百分比反推上限，也不按套餐补一个固定窗口值。
 
-三个 `resetAt` 形态都要处理：毫秒时间戳、秒时间戳、ISO 8601 字符串。窗口滚动的一瞬间接口可能省略 `resetAt`，此时沿用旧快照的时间，让倒计时继续走，不要把空窗口显示成坏数据。
+三个 `resetAt` 形态都要处理：毫秒时间戳、秒时间戳、ISO 8601 字符串。窗口滚动的一瞬间接口可能省略整个窗口、`cap`、`used` 或 `resetAt`；此时沿用旧快照的重置时间，百分比写 `None`，让倒计时继续走。连重置时间也拿不到时该行才留空。
 
 进度条百分比：`5小时 = used / cap * 100`、`本周 = used / cap * 100`、`本月 = (池子 - monthlyCredits) / 池子 * 100`，四舍五入到最近的 5%，钳在 0–100。月行只算套餐额度，顶部显示的剩余 credit 是 monthlyCredits、purchasedCredits、freeCredits 三项之和，额外购买和赠送的 credit 不进月度百分比。Command Code 的 credit 不等于美元，对全额额度模型 1 credit 约等于 1 美元用量，高额度模型按倍率折算，所以页面只写 credit 和百分比，不换算成美元。
 
@@ -71,7 +71,7 @@ inkbuddy 宿主
 ```
 
 - 启动时读凭据，起后台任务。首轮立刻取数，之后按 60 秒一轮。
-- 遇到 429 或 5xx 按 2×、4×、8× 退避，上限 30 分钟；成功一次就重置回 60 秒。额度耗尽的 `limited` 状态不算错误，按正常间隔继续查重置时间。
+- 遇到 429、5xx 或网络失败按 2×、4×、8× 退避，上限 30 分钟；成功一次就重置回 60 秒。额度耗尽的 `limited` 状态不算错误，按正常间隔继续查重置时间。
 - `render` 只读快照，直接返回。首次 `render` 若快照未就绪，最多等 3 秒。
 - `shutdown` 到达后先取消后台任务，再回响应退出。宿主读到响应就 SIGKILL 还活着的插件，收尾放在响应之后会被打断。
 - 日志写 stderr；stdout 只写协议响应。日志里不打印 key 和 token。
@@ -105,7 +105,7 @@ inkbuddy 宿主
 
 设计上把请求限制在四条只读 GET：
 
-- 只访问 `api.commandcode.ai`，不访问其他域名，不跟随重定向到第三方。
+- 只访问 `api.commandcode.ai`，不访问其他域名，不跟随重定向到第三方。请求发出前校验目标地址：生产域名，或测试钩子指向的本机 loopback；响应的地址与路径也要落在允许集合里。key 只随请求发往这些地址。
 - 不发 `/alpha/generate` 或任何模型推理请求，不消耗订阅额度。
 - 不读 `auth.json` 里的 OAuth access/refresh token，只用 `apiKey`。
 - 60 秒基础间隔加指数退避；快照没变化时也照常取，不做高频轮询。
@@ -129,10 +129,11 @@ inkbuddy 宿主
 | `crates/inkbuddy-plugin-command-code/tests/api.rs` | 取数测试：假 HTTP server、字段缺失、退避、失败提示 |
 | `crates/inkbuddy-plugin-command-code/README.md` | 插件说明：数据来源、配置方式、输出内容、风控边界 |
 | `Cargo.toml` | workspace members 加入新 crate |
-| `plugins/command-code/plugin.toml` | id `command-code`，默认按本机是否装 `cmd` 决定，超时 8000 毫秒 |
+| `plugins/command-code/plugin.toml` | id `command-code`，默认按本机是否留有 `cmd` 登录态决定，超时 8000 毫秒 |
 | `web/ink.html` | Command Code 图标样式 |
 | `scripts/install.sh` | 安装插件二进制和清单；按 `command -v cmd` 决定 `default_on` |
-| `scripts/build-macos-app.sh` | 把插件打进 app bundle；按 `command -v cmd` 决定 `default_on` |
+| `scripts/build-macos-app.sh` | 把插件打进 app bundle；bundle 清单先写 `default_on = false` |
+| `app/Sources/HostService.swift` | app 启动时按 `~/.commandcode/auth.json` 改写 `default_on`；`plugin.toml` 只在首次安装时从 bundle 复制 |
 | `README.md` | 插件索引加一行 |
 
 ## 测试
@@ -140,7 +141,7 @@ inkbuddy 宿主
 单元测试：
 
 - `planId` 映射和未知值回退，带版本后缀的归一化。
-- `used / cap` 到宽度 class 的换算，包括 0、100、超出钳位、cap 缺失。
+- `used / cap` 到宽度 class 的换算，包括 0、100、超出钳位、cap 或 used 缺失时写 `None`。
 - 剩余 credit 到月度百分比的换算。
 - 三种 `resetAt` 格式的解析，以及空值沿用旧快照。
 - 倒计时文字格式，包括已过期和整天。
@@ -148,7 +149,7 @@ inkbuddy 宿主
 - 渲染文本中的特殊字符转义。
 - 凭据读取顺序：环境变量优先、`auth.json` 回退、两者都没有。
 
-集成测试用本地假 HTTP server 返回固定的 `/alpha/*` JSON，验证四个请求的顺序与依赖、并发取数、订阅失败时的降级、401 提示、退避、shutdown 收尾。测试用假 key，不读真实令牌，不访问 `api.commandcode.ai`。
+集成测试用本地假 HTTP server 返回固定的 `/alpha/*` JSON，验证四个请求的顺序与依赖、并发取数、订阅失败时的降级、401 提示、退避、shutdown 收尾。另外覆盖地址白名单、计费响应全空时的终态、非法凭据、窗口缺失时重置时间沿用。测试用假 key，不读真实令牌，不访问 `api.commandcode.ai`。
 
 ## 验收
 

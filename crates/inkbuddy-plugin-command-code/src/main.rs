@@ -21,7 +21,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(60);
 const FIRST_RENDER_WAIT: Duration = Duration::from_secs(3);
 /// 页面刷新间隔，只用来让倒计时保持准确；取数由服务定时器驱动。
 const REFRESH_MS: u64 = 30_000;
-/// 测试钩子：覆盖取数 base；为空时使用生产常量。
+/// 测试钩子：把取数地址覆盖到本机假 server；只允许 loopback。
 const BASE_URL_ENV: &str = "COMMAND_CODE_BASE_URL";
 
 /// 插件运行状态：额度服务与「是否已经等过首轮」。
@@ -32,14 +32,9 @@ struct Board {
 
 impl Board {
     fn new() -> Self {
-        // 测试钩子为空时走生产常量，这个值只在测试进程里使用。
-        let base = std::env::var(BASE_URL_ENV)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| api::BASE_URL.to_string());
         Self {
             service: auth::api_key()
-                .map(|key| QuotaService::start_with_base(key, base, POLL_INTERVAL)),
+                .map(|key| QuotaService::start_with_base(key, resolve_base(), POLL_INTERVAL)),
             served_first: false,
         }
     }
@@ -70,6 +65,26 @@ impl Board {
     }
 }
 
+/// 解析取数地址：环境变量只接受本机 loopback，其余情况固定走生产地址。
+fn resolve_base() -> String {
+    let overridden = std::env::var(BASE_URL_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    resolve_base_from(overridden)
+}
+
+fn resolve_base_from(overridden: Option<String>) -> String {
+    match overridden {
+        Some(value) if api::is_loopback_base(&value) => value,
+        Some(_) => {
+            eprintln!("command-code: 取数地址覆盖值不在允许范围，改用生产地址");
+            api::BASE_URL.to_string()
+        }
+        None => api::BASE_URL.to_string(),
+    }
+}
+
 /// 一行输入解析后的结果。
 #[derive(Debug)]
 enum ParsedRequest {
@@ -77,12 +92,12 @@ enum ParsedRequest {
     Request(Request),
     /// 拿得到 id 但 method 未识别或字段非法，需要回一条失败响应。
     Bad { id: u64, error: String },
-    /// 连 id 都取不到（非法 JSON 或缺 id），无法回响应，只能跳过。
+    /// 连 id 都取不到，这一行没有对应的响应，主循环跳过。
     Ignore,
 }
 
-/// 解析宿主写入的一行请求。区分非法 JSON、缺 id 和可回失败响应的坏请求，
-/// 避免宿主一直等到超时。
+/// 解析宿主写入的一行请求。区分非法 JSON、缺 id 和可回失败响应的坏请求；
+/// 宿主按 id 匹配响应，缺 id 的行没有可回的响应。
 fn parse_request_line(line: &str) -> ParsedRequest {
     let value = match serde_json::from_str::<serde_json::Value>(line.trim()) {
         Ok(value) => value,
@@ -115,7 +130,7 @@ fn parse_request_line(line: &str) -> ParsedRequest {
 async fn handle_request(req: Request, board: &mut Board) -> Response {
     match req.method {
         Method::Describe => {
-            // 用 JSON 构造 PluginInfo：老版本协议没有 variants 字段，这样写对两种都兼容。
+            // 按协议结构构造 PluginInfo，variants 留空。
             match serde_json::from_value::<PluginInfo>(serde_json::json!({
                 "id": PLUGIN_ID,
                 "name": "Command Code 额度",
@@ -244,5 +259,32 @@ mod tests {
             manifest.contains(&format!("id = \"{PLUGIN_ID}\"")),
             "PLUGIN_ID 必须与 plugins/command-code/plugin.toml 的 id 一致"
         );
+    }
+
+    #[test]
+    fn base_override_only_accepts_loopback() {
+        assert_eq!(resolve_base_from(None), api::BASE_URL);
+        assert_eq!(resolve_base_from(Some(String::new())), api::BASE_URL);
+        assert_eq!(
+            resolve_base_from(Some("http://127.0.0.1:9012".to_string())),
+            "http://127.0.0.1:9012"
+        );
+        assert_eq!(
+            resolve_base_from(Some("http://localhost:8080".to_string())),
+            "http://localhost:8080"
+        );
+        // 生产地址、远程域名、带 userinfo 的地址都回退到生产常量。
+        for value in [
+            api::BASE_URL,
+            "https://attacker.example",
+            "http://user:pass@127.0.0.1:9012",
+            "https://api.commandcode.ai/evil",
+        ] {
+            assert_eq!(
+                resolve_base_from(Some(value.to_string())),
+                api::BASE_URL,
+                "value {value}"
+            );
+        }
     }
 }

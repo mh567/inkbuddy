@@ -7,9 +7,9 @@ use reqwest::{Client, Url};
 use serde_json::Value;
 
 use crate::formatting::{month_percent, parse_reset_at, used_cap_percent};
-use crate::model::{QuotaSnapshot, QuotaWindow, UsageSummary};
+use crate::model::{QuotaSnapshot, QuotaWindow, UsageSummary, FAILURE_NOT_FOUND};
 
-/// 取数 base URL；测试注入本地假 server，不会访问真实域名。
+/// 生产取数地址；测试钩子只能把请求留在本机 loopback。
 pub const BASE_URL: &str = "https://api.commandcode.ai";
 /// 社区验证过的 CLI 标识头值；不读取本机 CLI 版本。
 const API_VERSION: &str = "1.88.5";
@@ -28,9 +28,11 @@ const USAGE_PATH: &str = "/alpha/usage/summary";
 pub enum FetchError {
     /// 401/403：凭据缺失或过期。
     Auth,
+    /// apiKey 含非法字符，无法放进认证头。
+    InvalidKey,
     /// 429/5xx：限流或服务端临时错误，携带原始状态码。
     RateLimited(u16),
-    /// 超时、网络错误、重定向或响应无法解析。
+    /// 超时、网络错误、地址不在允许范围、重定向或响应无法解析。
     Transport,
 }
 
@@ -43,31 +45,81 @@ pub fn build_client() -> Client {
         .expect("构造 HTTP 客户端失败")
 }
 
-/// 构造三个请求头：认证、CLI 版本、运行环境。
-pub fn build_headers(key: &str) -> HeaderMap {
-    let mut headers = HeaderMap::with_capacity(3);
-    if let Ok(value) = HeaderValue::from_str(&format!("Bearer {key}")) {
-        headers.insert("authorization", value);
+/// 构造三个请求头：认证、CLI 版本、运行环境。key 无法放进头时返回明确错误。
+pub fn build_headers(key: &str) -> Result<HeaderMap, FetchError> {
+    if key.trim().is_empty() {
+        return Err(FetchError::InvalidKey);
     }
+    let mut headers = HeaderMap::with_capacity(3);
+    let auth =
+        HeaderValue::from_str(&format!("Bearer {key}")).map_err(|_| FetchError::InvalidKey)?;
+    headers.insert("authorization", auth);
     if let Ok(value) = HeaderValue::from_str(API_VERSION) {
         headers.insert("x-command-code-version", value);
     }
     if let Ok(value) = HeaderValue::from_str(CLI_ENVIRONMENT) {
         headers.insert("x-cli-environment", value);
     }
-    headers
+    Ok(headers)
 }
 
-/// 把 HTTP 状态码归类为取数错误；成功或普通 4xx 返回 `None`。
+/// 把 HTTP 状态码归类为取数错误；只有 2xx 算拿到数据。
 pub fn classify_status(code: u16) -> Option<FetchError> {
     match code {
+        200..=299 => None,
         401 | 403 => Some(FetchError::Auth),
-        429 => Some(FetchError::RateLimited(code)),
-        500..=599 => Some(FetchError::RateLimited(code)),
-        // 客户端禁用重定向，收到 3xx 表示没有拿到数据。
-        300..=399 => Some(FetchError::Transport),
-        _ => None,
+        429 | 500..=599 => Some(FetchError::RateLimited(code)),
+        _ => Some(FetchError::Transport),
     }
+}
+
+/// 取数地址是否落在允许集合：生产域名，或本机 loopback（测试用）。
+pub fn allowed_base(base: &str) -> bool {
+    is_loopback_base(base) || is_production_base(base)
+}
+
+/// 测试钩子可以覆盖到的地址：http 的本机 loopback，可带端口。
+pub fn is_loopback_base(base: &str) -> bool {
+    let Ok(url) = Url::parse(base) else {
+        return false;
+    };
+    clean_origin(&url) && url.scheme() == "http" && is_loopback_host(&url)
+}
+
+fn is_production_base(base: &str) -> bool {
+    let Ok(url) = Url::parse(base) else {
+        return false;
+    };
+    clean_origin(&url) && is_production_host(&url)
+}
+
+fn is_production_host(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("api.commandcode.ai"))
+        && url.port_or_known_default() == Some(443)
+}
+
+fn is_loopback_host(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_matches(|ch| ch == '[' || ch == ']');
+    host.eq_ignore_ascii_case("localhost")
+        || host == "::1"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// 地址必须是干净的 origin：无用户名密码、无路径、查询或片段。
+fn clean_origin(url: &Url) -> bool {
+    url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none()
 }
 
 /// 下一次退避间隔：从 60 秒起翻倍，上限 30 分钟。成功后的重置由调用方处理。
@@ -122,7 +174,7 @@ pub fn apply_subscriptions(snapshot: &mut QuotaSnapshot, value: &Value, previous
     }
 }
 
-/// credit 与两个滚动窗口写入快照；窗口字段不足时留 `None`，不推算上限。
+/// credit 与两个滚动窗口写入快照；算不出百分比时写 `None`，不推算上限，有重置时间则沿用。
 pub fn apply_credits(snapshot: &mut QuotaSnapshot, value: &Value, previous: &QuotaSnapshot) {
     if let Some(credits) = value.get("credits") {
         let monthly = number(credits.get("monthlyCredits"));
@@ -131,10 +183,13 @@ pub fn apply_credits(snapshot: &mut QuotaSnapshot, value: &Value, previous: &Quo
         // 套餐单项单独留存，月行百分比只用这一项，额外 credit 只进顶部总额。
         snapshot.monthly_credits_remaining = monthly;
         if let (Some(monthly), Some(purchased), Some(free)) = (monthly, purchased, free) {
-            snapshot.credits_remaining = Some(monthly + purchased + free);
+            // 三项都是有限值，和仍可能溢出成 inf，页面会显示「余 inf」。
+            let total = monthly + purchased + free;
+            snapshot.credits_remaining = total.is_finite().then_some(total);
         }
         if let (Some(purchased), Some(free)) = (purchased, free) {
-            snapshot.credits_extra = Some(purchased + free);
+            let extra = purchased + free;
+            snapshot.credits_extra = extra.is_finite().then_some(extra);
         }
     }
     let limits = value.get("windowLimits");
@@ -165,7 +220,7 @@ pub fn apply_usage(snapshot: &mut QuotaSnapshot, value: &Value) {
 }
 
 /// 取一轮快照：whoami → 订阅与 credit 并发 → 用量。
-/// 只向 `base` 发四个只读 GET；任何一步鉴权/限流/传输失败都返回错误，由调用方保留旧快照。
+/// 只向允许的 origin 发四个只读 GET；任何一步鉴权/限流/传输失败都返回错误，由调用方保留旧快照。
 /// `base` 传 origin（scheme://host[:port]）即可；`Url::join` 用绝对路径替换 base 的已有路径，路径前缀会被覆盖。
 pub async fn fetch_snapshot(
     client: &Client,
@@ -173,7 +228,12 @@ pub async fn fetch_snapshot(
     key: &str,
     previous: &QuotaSnapshot,
 ) -> Result<QuotaSnapshot, FetchError> {
-    let headers = build_headers(key);
+    // 请求发出前先卡住地址和凭据，避免 key 被带到别的域名。
+    if !allowed_base(base) {
+        eprintln!("command-code: 取数地址不在允许范围内");
+        return Err(FetchError::Transport);
+    }
+    let headers = build_headers(key)?;
 
     let whoami_url = endpoint(base, WHOAMI_PATH, None, None)?;
     let whoami = get_json(client, &whoami_url, &headers).await?;
@@ -187,6 +247,11 @@ pub async fn fetch_snapshot(
     );
     let subscriptions = subscriptions?;
     let credits = credits?;
+
+    // 两个计费响应都没有可识别字段时，整块换成「额度数据未找到」终态。
+    if !has_billing_data(&subscriptions, &credits) {
+        return Ok(not_found_snapshot());
+    }
 
     let mut snapshot = QuotaSnapshot::default();
     apply_subscriptions(&mut snapshot, &subscriptions, previous);
@@ -207,6 +272,34 @@ pub async fn fetch_snapshot(
         }
     }
     Ok(snapshot)
+}
+
+/// 两个计费响应里是否带了任何可识别的额度字段。
+fn has_billing_data(subscriptions: &Value, credits: &Value) -> bool {
+    let subscription_fields = pick_subscription(subscriptions).is_some_and(|sub| {
+        ["planId", "currentPeriodStart", "currentPeriodEnd"]
+            .iter()
+            .any(|key| sub.get(key).is_some())
+    });
+    let credit_fields = credits.get("credits").is_some_and(|value| {
+        ["monthlyCredits", "purchasedCredits", "freeCredits"]
+            .iter()
+            .any(|key| value.get(key).is_some())
+    }) || credits.get("windowLimits").is_some_and(|value| {
+        ["fiveHour", "weekly"]
+            .iter()
+            .any(|key| value.get(key).is_some())
+    });
+    subscription_fields || credit_fields
+}
+
+/// 计费接口没有额度数据时的终态快照；旧百分比不保留。
+fn not_found_snapshot() -> QuotaSnapshot {
+    QuotaSnapshot {
+        failure: Some(FAILURE_NOT_FOUND.to_string()),
+        updated_at: Some(chrono::Utc::now().timestamp()),
+        ..QuotaSnapshot::default()
+    }
 }
 
 fn endpoint(
@@ -237,8 +330,8 @@ async fn get_json(client: &Client, url: &Url, headers: &HeaderMap) -> Result<Val
         .send()
         .await
         .map_err(|_| FetchError::Transport)?;
-    // 即使调用方传入跟随重定向的客户端，也拒绝跨源响应。
-    if !same_origin(url, &response.url()) {
+    // 即使调用方传入跟随重定向的客户端，也拒绝跨源或越出只读路径的响应。
+    if !response_allowed(url, &response.url()) {
         return Err(FetchError::Transport);
     }
     if let Some(error) = classify_status(response.status().as_u16()) {
@@ -248,6 +341,17 @@ async fn get_json(client: &Client, url: &Url, headers: &HeaderMap) -> Result<Val
         .json::<Value>()
         .await
         .map_err(|_| FetchError::Transport)
+}
+
+fn allowed_response_url(url: &Url) -> bool {
+    is_production_host(url) || (url.scheme() == "http" && is_loopback_host(url))
+}
+
+/// 响应必须落在允许的地址、与请求同源，且路径是四个只读接口之一。
+fn response_allowed(requested: &Url, actual: &Url) -> bool {
+    same_origin(requested, actual)
+        && allowed_response_url(actual)
+        && [WHOAMI_PATH, SUBSCRIPTIONS_PATH, CREDITS_PATH, USAGE_PATH].contains(&actual.path())
 }
 
 fn same_origin(requested: &Url, actual: &Url) -> bool {
@@ -270,15 +374,17 @@ fn pick_subscription(value: &Value) -> Option<&Value> {
     value.is_object().then_some(value)
 }
 
+/// 窗口滚动时接口可能省略整个窗口或 cap/used；此时沿用旧重置时间，百分比写 None。
+/// 连重置时间也拿不到时才整行留 None。
 fn parse_window(value: Option<&Value>, previous: Option<&QuotaWindow>) -> Option<QuotaWindow> {
-    let value = value?;
-    let used_percent = used_cap_percent(number(value.get("used")), number(value.get("cap")))?;
+    let used_percent = value
+        .and_then(|value| used_cap_percent(number(value.get("used")), number(value.get("cap"))));
     let resets_at = value
-        .get("resetAt")
+        .and_then(|value| value.get("resetAt"))
         .and_then(parse_reset_at)
         .or_else(|| previous.and_then(|window| window.resets_at));
-    Some(QuotaWindow {
-        used_percent: Some(used_percent),
+    (used_percent.is_some() || resets_at.is_some()).then_some(QuotaWindow {
+        used_percent,
         resets_at,
     })
 }
@@ -319,7 +425,7 @@ mod tests {
     fn classify_status_splits_auth_rate_limit_redirect_and_success() {
         assert_eq!(classify_status(200), None);
         assert_eq!(classify_status(204), None);
-        assert_eq!(classify_status(404), None);
+        assert_eq!(classify_status(404), Some(FetchError::Transport));
         assert_eq!(classify_status(401), Some(FetchError::Auth));
         assert_eq!(classify_status(403), Some(FetchError::Auth));
         assert_eq!(classify_status(429), Some(FetchError::RateLimited(429)));
@@ -355,7 +461,7 @@ mod tests {
 
     #[test]
     fn build_headers_sets_auth_and_cli_identifiers() {
-        let headers = build_headers("test-key");
+        let headers = build_headers("test-key").unwrap();
         assert_eq!(
             headers.get("authorization").unwrap().to_str().unwrap(),
             "Bearer test-key"
@@ -530,16 +636,28 @@ mod tests {
     }
 
     #[test]
-    fn apply_credits_leaves_window_none_when_cap_or_used_missing() {
+    fn apply_credits_keeps_reset_at_without_a_percentage() {
         let value = json!({"windowLimits": {
             "fiveHour": {"used": 3, "cap": null, "resetAt": 1700007200},
             "weekly": {"used": 20, "resetAt": 1700007200}
         }});
         let mut snapshot = QuotaSnapshot::default();
         apply_credits(&mut snapshot, &value, &QuotaSnapshot::default());
-        // 没有可信的内置窗口上限，不从百分比反推，也不编数字。
-        assert_eq!(snapshot.five_hour, None);
-        assert_eq!(snapshot.weekly, None);
+        // 没有可信的内置窗口上限，百分比写 None；重置时间仍可用，倒计时继续走。
+        assert_eq!(
+            snapshot.five_hour,
+            Some(QuotaWindow {
+                used_percent: None,
+                resets_at: Some(1700007200)
+            })
+        );
+        assert_eq!(
+            snapshot.weekly,
+            Some(QuotaWindow {
+                used_percent: None,
+                resets_at: Some(1700007200)
+            })
+        );
     }
 
     #[test]
@@ -617,5 +735,123 @@ mod tests {
         let mut snapshot = QuotaSnapshot::default();
         apply_usage(&mut snapshot, &json!({"error": "boom"}));
         assert_eq!(snapshot.usage, None);
+    }
+
+    #[test]
+    fn classify_status_fails_every_non_2xx_code() {
+        assert_eq!(classify_status(200), None);
+        assert_eq!(classify_status(204), None);
+        assert_eq!(classify_status(299), None);
+        for code in [100, 302, 400, 402, 404, 418, 600] {
+            assert_eq!(
+                classify_status(code),
+                Some(FetchError::Transport),
+                "code {code}"
+            );
+        }
+        assert_eq!(classify_status(401), Some(FetchError::Auth));
+        assert_eq!(classify_status(403), Some(FetchError::Auth));
+        assert_eq!(classify_status(429), Some(FetchError::RateLimited(429)));
+        assert_eq!(classify_status(503), Some(FetchError::RateLimited(503)));
+    }
+
+    #[test]
+    fn allowed_base_accepts_production_and_loopback_only() {
+        assert!(allowed_base(BASE_URL));
+        assert!(allowed_base("http://127.0.0.1:9012"));
+        assert!(allowed_base("http://localhost:8080"));
+        assert!(allowed_base("http://[::1]:1234"));
+        assert!(is_loopback_base("http://127.0.0.1:9012"));
+        assert!(is_loopback_base("http://localhost:8080"));
+        assert!(!is_loopback_base(BASE_URL));
+        for base in [
+            "https://attacker.example",
+            "http://attacker.example",
+            "https://api.commandcode.ai.evil.com",
+            "https://api.commandcode.ai@evil.com",
+            "http://user:pass@127.0.0.1:9012",
+            "https://127.0.0.1:9012",
+            "https://api.commandcode.ai/evil",
+            "file:///etc/passwd",
+            "",
+            "not a url",
+        ] {
+            assert!(!allowed_base(base), "base {base}");
+        }
+    }
+
+    #[test]
+    fn build_headers_rejects_keys_that_cannot_form_a_header() {
+        let headers = build_headers("test-key").unwrap();
+        assert_eq!(
+            headers.get("authorization").unwrap().to_str().unwrap(),
+            "Bearer test-key"
+        );
+        for bad in ["", "bad\nkey", "bad\rkey", "bad\0key"] {
+            assert_eq!(
+                build_headers(bad).unwrap_err(),
+                FetchError::InvalidKey,
+                "key {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_credits_drops_sums_that_overflow_to_infinity() {
+        let big = f64::MAX;
+        let value = json!({"credits": {
+            "monthlyCredits": big,
+            "purchasedCredits": big,
+            "freeCredits": big
+        }});
+        let mut snapshot = QuotaSnapshot::default();
+        apply_credits(&mut snapshot, &value, &QuotaSnapshot::default());
+        assert_eq!(snapshot.monthly_credits_remaining, Some(big));
+        assert_eq!(snapshot.credits_remaining, None);
+        assert_eq!(snapshot.credits_extra, None);
+    }
+
+    #[test]
+    fn missing_windows_still_keep_previous_reset_at() {
+        let previous = QuotaSnapshot {
+            five_hour: Some(QuotaWindow {
+                used_percent: Some(10),
+                resets_at: Some(1000),
+            }),
+            weekly: Some(QuotaWindow {
+                used_percent: Some(5),
+                resets_at: Some(2000),
+            }),
+            ..QuotaSnapshot::default()
+        };
+        let mut snapshot = QuotaSnapshot::default();
+        apply_credits(
+            &mut snapshot,
+            &json!({"credits": {"monthlyCredits": 50}}),
+            &previous,
+        );
+        assert_eq!(
+            snapshot.five_hour,
+            Some(QuotaWindow {
+                used_percent: None,
+                resets_at: Some(1000)
+            })
+        );
+        assert_eq!(
+            snapshot.weekly,
+            Some(QuotaWindow {
+                used_percent: None,
+                resets_at: Some(2000)
+            })
+        );
+
+        // 窗口存在但既算不出百分比也没有重置时间时，整行保持 None。
+        let mut snapshot = QuotaSnapshot::default();
+        apply_credits(
+            &mut snapshot,
+            &json!({"windowLimits": {"fiveHour": {"used": 3}}}),
+            &QuotaSnapshot::default(),
+        );
+        assert_eq!(snapshot.five_hour, None);
     }
 }

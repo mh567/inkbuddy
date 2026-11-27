@@ -244,7 +244,8 @@ final class HostService: ObservableObject {
         let bundlePlugins = Bundle.main.bundleURL
             .appendingPathComponent("Contents/Resources/plugins", isDirectory: true)
 
-        // 每次启动都用 bundle 里的版本覆盖，保证 app 升级后插件同步更新。
+        // 二进制与辅助文件每次启动都用 bundle 里的版本覆盖，保证 app 升级后插件同步更新。
+        // plugin.toml 里存着用户改过的启用状态，只在首次安装时复制。
         // 按目录枚举，bundle 里加了插件不用改这段。
         let bundled = (try? fileManager.contentsOfDirectory(
             at: bundlePlugins,
@@ -263,11 +264,18 @@ final class HostService: ObservableObject {
             }
             for file in files {
                 let target = dst.appendingPathComponent(file.lastPathComponent)
+                let isManifest = file.lastPathComponent == "plugin.toml"
+                if isManifest && fileManager.fileExists(atPath: target.path) {
+                    continue
+                }
                 try? fileManager.removeItem(at: target)
                 do {
                     try fileManager.copyItem(at: file, to: target)
                 } catch {
                     NSLog("InkBuddy: 复制插件文件失败 \(file.lastPathComponent): \(error.localizedDescription)")
+                }
+                if isManifest && name == "command-code" {
+                    applyCommandCodeDefaultOn(at: target)
                 }
             }
             if name == "lyrics" {
@@ -290,6 +298,23 @@ final class HostService: ObservableObject {
         refresh_ms = 500
         """
         try? config.write(to: homeURL.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)
+    }
+
+    /// command-code 清单首次落地时，按用户本机是否留有 cmd 登录态写 default_on。
+    /// 打包机有没有 cmd 说明不了用户机器的状态，所以放在 app 启动时判定。
+    private func applyCommandCodeDefaultOn(at url: URL) {
+        let auth = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent(".commandcode/auth.json")
+        let loggedIn = fileManager.fileExists(atPath: auth.path)
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return }
+        var lines = text.components(separatedBy: "\n")
+        for index in lines.indices {
+            if lines[index].trimmingCharacters(in: .whitespaces).hasPrefix("default_on") {
+                lines[index] = "default_on = \(loggedIn)"
+            }
+        }
+        try? lines.joined(separator: "\n")
+            .write(to: url, atomically: true, encoding: .utf8)
     }
 
     /// 从旧的 ~/.inkbuddy/cache 迁移歌词缓存，避免升级后缓存丢失

@@ -142,13 +142,9 @@ timeout_ms = 8000
 args = []
 EOF
 
-# command-code 读的是本机 Command Code CLI 保存的登录态。没装 cmd 时开着它，
-# 裸页面会一直挂着一行未登录提示，所以打包时按有没有 cmd 决定默认值。
-if command -v cmd >/dev/null 2>&1 || [ -x "$HOME/.local/bin/cmd" ]; then
-  COMMAND_CODE_DEFAULT_ON=true
-else
-  COMMAND_CODE_DEFAULT_ON=false
-fi
+# command-code 读的是用户机器上 Command Code CLI 保存的登录态。打包机有没有 cmd
+# 说明不了用户机器的状态，bundle 清单先写 false，app 启动时按本机登录态改写。
+COMMAND_CODE_DEFAULT_ON=false
 
 cat > "$RESDIR/plugins/command-code/plugin.toml" <<EOF
 [plugin]

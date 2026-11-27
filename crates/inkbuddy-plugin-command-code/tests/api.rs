@@ -1,7 +1,9 @@
 //! 本地假 HTTP server 驱动的取数集成测试；不访问 api.commandcode.ai。
 
 use inkbuddy_plugin_command_code::api::{build_client, fetch_snapshot, FetchError};
-use inkbuddy_plugin_command_code::model::{QuotaSnapshot, QuotaWindow, UsageSummary};
+use inkbuddy_plugin_command_code::model::{
+    QuotaSnapshot, QuotaWindow, UsageSummary, FAILURE_NOT_FOUND,
+};
 use reqwest::redirect::Policy;
 use reqwest::Client;
 use serde_json::json;
@@ -637,4 +639,192 @@ async fn redirect_following_client_cannot_take_key_out_of_origin() {
     );
     source.handle.abort();
     target.handle.abort();
+}
+
+#[tokio::test]
+async fn fetch_rejects_base_outside_allowlist_without_sending_key() {
+    let server = FakeServer::start(static_routes()).await;
+    // 带 userinfo 的 loopback 地址不在允许集合内，请求根本不会发出。
+    let hostile = server.base.replacen("http://", "http://user:pass@", 1);
+    let client = build_client();
+    let error = fetch_snapshot(&client, &hostile, "test-key", &QuotaSnapshot::default())
+        .await
+        .unwrap_err();
+    assert_eq!(error, FetchError::Transport);
+    assert!(server.requests().is_empty(), "key 被发到了被覆盖的地址");
+    server.handle.abort();
+
+    // 远程域名同样在发请求前被拒绝。
+    let error = fetch_snapshot(
+        &build_client(),
+        "https://attacker.example",
+        "test-key",
+        &QuotaSnapshot::default(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error, FetchError::Transport);
+}
+
+#[tokio::test]
+async fn empty_billing_responses_produce_not_found_snapshot() {
+    let server = FakeServer::start(Arc::new(|_| (200, vec![], "{}".to_string()))).await;
+    let client = build_client();
+    let snapshot = fetch_snapshot(&client, &server.base, "test-key", &QuotaSnapshot::default())
+        .await
+        .unwrap();
+    assert_eq!(snapshot.failure.as_deref(), Some(FAILURE_NOT_FOUND));
+    assert!(snapshot.plan.is_none());
+    assert!(snapshot.five_hour.is_none());
+    assert!(snapshot.weekly.is_none());
+    assert!(snapshot.monthly.is_none());
+    assert!(snapshot.updated_at.is_some());
+    // 终态直接返回，不再请求用量接口。
+    assert_eq!(server.requests().len(), 3);
+    server.handle.abort();
+}
+
+#[tokio::test]
+async fn partial_billing_data_does_not_trigger_not_found() {
+    let server = FakeServer::start(Arc::new(|path| {
+        let route = path.split('?').next().unwrap_or(path);
+        match route {
+            "/alpha/whoami" => (200, vec![], "{}".to_string()),
+            "/alpha/billing/subscriptions" => (
+                200,
+                vec![],
+                json!([{"planId": "GOAT", "status": "active"}]).to_string(),
+            ),
+            "/alpha/billing/credits" => (200, vec![], "{}".to_string()),
+            _ => (404, vec![], "{}".to_string()),
+        }
+    }))
+    .await;
+    let client = build_client();
+    let snapshot = fetch_snapshot(&client, &server.base, "test-key", &QuotaSnapshot::default())
+        .await
+        .unwrap();
+    assert!(snapshot.failure.is_none());
+    assert_eq!(snapshot.plan.as_deref(), Some("GOAT"));
+    assert!(snapshot.five_hour.is_none());
+    server.handle.abort();
+}
+
+#[tokio::test]
+async fn invalid_key_is_rejected_before_any_request() {
+    let server = FakeServer::start(static_routes()).await;
+    let client = build_client();
+    let error = fetch_snapshot(&client, &server.base, "bad\nkey", &QuotaSnapshot::default())
+        .await
+        .unwrap_err();
+    assert_eq!(error, FetchError::InvalidKey);
+    assert!(server.requests().is_empty());
+    server.handle.abort();
+}
+
+#[tokio::test]
+async fn client_error_status_stops_fetch() {
+    let server = FakeServer::start(Arc::new(|path| {
+        if path.starts_with("/alpha/billing/subscriptions") {
+            (400, vec![], "{}".to_string())
+        } else {
+            static_routes()(path)
+        }
+    }))
+    .await;
+    let client = build_client();
+    let error = fetch_snapshot(&client, &server.base, "test-key", &QuotaSnapshot::default())
+        .await
+        .unwrap_err();
+    assert_eq!(error, FetchError::Transport);
+    server.handle.abort();
+}
+
+#[tokio::test]
+async fn missing_windows_keep_previous_reset_at() {
+    let previous = QuotaSnapshot {
+        five_hour: Some(QuotaWindow {
+            used_percent: Some(10),
+            resets_at: Some(1700009999),
+        }),
+        weekly: Some(QuotaWindow {
+            used_percent: Some(5),
+            resets_at: Some(1700008888),
+        }),
+        ..QuotaSnapshot::default()
+    };
+    let server = FakeServer::start(Arc::new(|path| {
+        let route = path.split('?').next().unwrap_or(path);
+        match route {
+            "/alpha/whoami" => (200, vec![], "{}".to_string()),
+            "/alpha/billing/subscriptions" => (
+                200,
+                vec![],
+                json!([{
+                    "planId": "GOAT",
+                    "status": "active",
+                    "currentPeriodStart": 1700000000
+                }])
+                .to_string(),
+            ),
+            "/alpha/billing/credits" => (
+                200,
+                vec![],
+                json!({"credits": {
+                    "monthlyCredits": 50,
+                    "purchasedCredits": 10,
+                    "freeCredits": 2
+                }})
+                .to_string(),
+            ),
+            _ => static_routes()(path),
+        }
+    }))
+    .await;
+    let client = build_client();
+    let snapshot = fetch_snapshot(&client, &server.base, "test-key", &previous)
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.five_hour,
+        Some(QuotaWindow {
+            used_percent: None,
+            resets_at: Some(1700009999)
+        })
+    );
+    assert_eq!(
+        snapshot.weekly,
+        Some(QuotaWindow {
+            used_percent: None,
+            resets_at: Some(1700008888)
+        })
+    );
+    assert!(snapshot.failure.is_none());
+    server.handle.abort();
+}
+
+#[tokio::test]
+async fn same_origin_redirect_to_disallowed_path_is_rejected() {
+    let server = FakeServer::start(Arc::new(|path| {
+        if path.starts_with("/alpha/whoami") {
+            (
+                302,
+                vec![("Location".to_string(), "/alpha/evil".to_string())],
+                "".to_string(),
+            )
+        } else {
+            (200, vec![], "{}".to_string())
+        }
+    }))
+    .await;
+    // 调用方传入跟随重定向的客户端，同源重定向到只读路径之外也要拒绝。
+    let client = Client::builder()
+        .redirect(Policy::limited(5))
+        .build()
+        .unwrap();
+    let error = fetch_snapshot(&client, &server.base, "test-key", &QuotaSnapshot::default())
+        .await
+        .unwrap_err();
+    assert_eq!(error, FetchError::Transport);
+    server.handle.abort();
 }
