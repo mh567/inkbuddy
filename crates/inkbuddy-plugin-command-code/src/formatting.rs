@@ -4,6 +4,7 @@ use crate::model::{normalize_plan, plan_credit_pool};
 
 /// 把 0..=100 的百分比四舍五入到最近的 5%，返回对应的进度条 class。
 /// 超出范围的值钳到 0 或 100。
+/// 调用方拿到 `Option<u32>` 的 `None` 时渲染成 `--` 或空条；有具体百分比时才传给本函数。
 pub fn width_class(used_percent: u32) -> &'static str {
     const CLASSES: [&str; 21] = [
         "q-0", "q-5", "q-10", "q-15", "q-20", "q-25", "q-30", "q-35", "q-40", "q-45", "q-50",

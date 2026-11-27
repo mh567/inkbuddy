@@ -57,7 +57,7 @@ base URL `https://api.commandcode.ai`，认证头 `Authorization: Bearer <key>`�
 
 三个 `resetAt` 形态都要处理：毫秒时间戳、秒时间戳、ISO 8601 字符串。窗口滚动的一瞬间接口可能省略 `resetAt`，此时沿用旧快照的时间，让倒计时继续走，不要把空窗口显示成坏数据。
 
-进度条百分比：`5小时 = used / cap * 100`、`本周 = used / cap * 100`、`本月 = (池子 - 剩余) / 池子 * 100`，四舍五入到最近的 5%，钳在 0–100。Command Code 的 credit 不等于美元，对全额额度模型 1 credit 约等于 1 美元用量，高额度模型按倍率折算，所以页面只写 credit 和百分比，不换算成美元。
+进度条百分比：`5小时 = used / cap * 100`、`本周 = used / cap * 100`、`本月 = (池子 - monthlyCredits) / 池子 * 100`，四舍五入到最近的 5%，钳在 0–100。月行只算套餐额度，顶部显示的剩余 credit 是 monthlyCredits、purchasedCredits、freeCredits 三项之和，额外购买和赠送的 credit 不进月度百分比。Command Code 的 credit 不等于美元，对全额额度模型 1 credit 约等于 1 美元用量，高额度模型按倍率折算，所以页面只写 credit 和百分比，不换算成美元。
 
 ## 进程模型
 

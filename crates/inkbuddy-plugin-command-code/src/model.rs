@@ -3,8 +3,8 @@
 /// 一个额度窗口（5 小时、本周或本月）；百分比与重置时间共用结构。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct QuotaWindow {
-    /// 已用百分比，0..=100。
-    pub used_percent: u32,
+    /// 已用百分比，0..=100；无法可信换算时为 `None`，由展示层降级显示，不填假数字。
+    pub used_percent: Option<u32>,
     /// 重置时间（Unix 秒）。
     pub resets_at: Option<i64>,
 }
@@ -28,8 +28,10 @@ pub struct QuotaSnapshot {
     pub five_hour: Option<QuotaWindow>,
     pub weekly: Option<QuotaWindow>,
     pub monthly: Option<QuotaWindow>,
-    /// 剩余 credit 总额：monthlyCredits + purchasedCredits + freeCredits。
+    /// 剩余 credit 总额：monthlyCredits + purchasedCredits + freeCredits，供顶部展示。
     pub credits_remaining: Option<f64>,
+    /// 套餐 credit 剩余：仅取接口的 credits.monthlyCredits 单项，供月行百分比使用；额外购买与赠送 credit 归 credits_extra。
+    pub monthly_credits_remaining: Option<f64>,
     /// 额外 credit：purchasedCredits + freeCredits。
     pub credits_extra: Option<f64>,
     /// 本期请求数、花费与 token 数。
@@ -169,7 +171,7 @@ mod tests {
     #[test]
     fn snapshot_types_default_to_empty() {
         let window = QuotaWindow::default();
-        assert_eq!(window.used_percent, 0);
+        assert_eq!(window.used_percent, None);
         assert_eq!(window.resets_at, None);
 
         let usage = UsageSummary::default();
@@ -183,6 +185,7 @@ mod tests {
         assert_eq!(snapshot.weekly, None);
         assert_eq!(snapshot.monthly, None);
         assert_eq!(snapshot.credits_remaining, None);
+        assert_eq!(snapshot.monthly_credits_remaining, None);
         assert_eq!(snapshot.credits_extra, None);
         assert_eq!(snapshot.usage, None);
         assert_eq!(snapshot.updated_at, None);
@@ -192,13 +195,14 @@ mod tests {
     #[test]
     fn snapshot_types_support_clone_and_equality() {
         let window = QuotaWindow {
-            used_percent: 35,
+            used_percent: Some(35),
             resets_at: Some(1_700_000_000),
         };
         let snapshot = QuotaSnapshot {
             plan: Some("GOAT".to_string()),
             five_hour: Some(window.clone()),
             credits_remaining: Some(62.4),
+            monthly_credits_remaining: Some(50.0),
             credits_extra: Some(12.4),
             usage: Some(UsageSummary {
                 total_count: Some(18),

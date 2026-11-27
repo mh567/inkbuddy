@@ -2,5 +2,7 @@
 //!
 //! 凭据读取、接口取数、协议循环与页面渲染由后续任务接入。
 
+pub mod api;
+pub mod auth;
 pub mod formatting;
 pub mod model;
