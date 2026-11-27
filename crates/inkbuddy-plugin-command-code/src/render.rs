@@ -4,13 +4,13 @@
 //! 全部走 `q-0`..`q-100` 预设 class，图标写在 `web/ink.html` 的样式表里。
 
 use crate::formatting::{escape_html, plan_label, reset_countdown, width_class};
-use crate::model::{QuotaSnapshot, QuotaWindow, FAILURE_NOT_FOUND, LOGIN_REQUIRED};
+use crate::model::{QuotaSnapshot, QuotaWindow, FAILURE_NOT_FOUND, INVALID_KEY, LOGIN_REQUIRED};
 
 /// 渲染完整的额度看板；快照未就绪或失败时降级为提示块。
 pub fn render_html(snapshot: &QuotaSnapshot, now: i64) -> String {
-    // 未登录与找不到额度数据是终态：旧百分比会误导用户，整块换成提示。
+    // 未登录、凭据格式不对、找不到额度数据都是终态：整块换成提示。
     if let Some(failure) = snapshot.failure.as_deref() {
-        if failure == LOGIN_REQUIRED || failure == FAILURE_NOT_FOUND {
+        if failure == LOGIN_REQUIRED || failure == FAILURE_NOT_FOUND || failure == INVALID_KEY {
             return render_notice(failure);
         }
     }
@@ -62,13 +62,22 @@ pub fn render_notice(message: &str) -> String {
 }
 
 fn render_row(label: &str, window: Option<&QuotaWindow>, now: i64) -> String {
+    let resets_at = window.and_then(|w| w.resets_at);
     let (class, percent, reset) = match window.and_then(|w| w.used_percent) {
         Some(p) => (
             width_class(p),
             format!("{p}%"),
-            reset_countdown(window.and_then(|w| w.resets_at), now),
+            reset_countdown(resets_at, now),
         ),
-        None => ("q-0", "--".to_string(), "暂无数据".to_string()),
+        // 算不出百分比时百分比列写 --；重置时间已知就让倒计时继续走。
+        None => (
+            "q-0",
+            "--".to_string(),
+            match resets_at {
+                Some(_) => reset_countdown(resets_at, now),
+                None => "暂无数据".to_string(),
+            },
+        ),
     };
     format!(
         "  <div class=\"quota-row\">\n    <span class=\"quota-label\">{}</span>\n    <span class=\"quota-bar\"><span class=\"quota-fill {}\"></span></span>\n    <span class=\"quota-pct\">{}</span>\n    <span class=\"quota-reset\">{}</span>\n  </div>\n",
@@ -164,15 +173,33 @@ mod tests {
             resets_at: Some(NOW + 3 * 3600),
         });
         let html = render_html(&snapshot, NOW);
-        // 本周行降级为空条与 --，不写入 0% 这类假数据。
+        // 本周行降级为空条与 --，不写入 0% 这类假数据；重置时间已知，倒计时继续走。
         assert!(html.contains("本周"), "{html}");
         assert!(html.contains("--"), "{html}");
-        assert!(html.contains("暂无数据"), "{html}");
+        assert!(html.contains("3小时0分后重置"), "{html}");
+        assert!(!html.contains("暂无数据"), "{html}");
         assert!(!html.contains("0%"), "{html}");
         assert_eq!(html.matches("q-0").count(), 1, "{html}");
         // 另外两行照常显示。
         assert!(html.contains("55%"), "{html}");
         assert!(html.contains("11%"), "{html}");
+    }
+
+    #[test]
+    fn none_percent_without_reset_time_shows_placeholder_text() {
+        let mut snapshot = sample_snapshot();
+        snapshot.weekly = Some(QuotaWindow {
+            used_percent: None,
+            resets_at: None,
+        });
+        let html = render_html(&snapshot, NOW);
+        let weekly_row = html
+            .split("  <div class=\"quota-row\">\n")
+            .find(|row| row.contains("本周"))
+            .expect("weekly row");
+        assert!(weekly_row.contains("--"), "{weekly_row}");
+        assert!(weekly_row.contains("暂无数据"), "{weekly_row}");
+        assert!(!weekly_row.contains("后重置"), "{weekly_row}");
     }
 
     #[test]
@@ -209,7 +236,7 @@ mod tests {
     #[test]
     fn month_row_uses_precomputed_percent_without_recomputing() {
         let mut snapshot = sample_snapshot();
-        // api.rs 已按月池算出 35%；render 层直接展示，不再从顶部 credit 换算。
+        // api.rs 已按月池算出 35%；render 层直接展示这个数字。
         snapshot.monthly = Some(QuotaWindow {
             used_percent: Some(35),
             resets_at: Some(NOW + 2 * 24 * 3600),
@@ -254,6 +281,16 @@ mod tests {
         assert!(html.contains("额度数据未找到"), "{html}");
         assert!(!html.contains("quota-row"), "{html}");
         assert!(!html.contains("55%"), "{html}");
+    }
+
+    #[test]
+    fn invalid_key_replaces_board_with_notice() {
+        let mut snapshot = sample_snapshot();
+        snapshot.failure = Some(INVALID_KEY.to_string());
+        let html = render_html(&snapshot, NOW);
+        assert!(html.contains("quota-notice"), "{html}");
+        assert!(html.contains("凭据格式不对"), "{html}");
+        assert!(!html.contains("quota-row"), "{html}");
     }
 
     #[test]

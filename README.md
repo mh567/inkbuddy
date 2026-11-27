@@ -64,7 +64,7 @@ http://<ip>:9012/?plugins=command-code       # 只显示 Command Code 额度
 http://<ip>:9012/?plugins=antigravity-quota  # 只显示反重力额度
 ```
 
-不带参数时显示所有 `default_on = true` 的插件（歌词，以及装了 Codex CLI 的机器上的 AI 额度、装了 cmd CLI 的机器上的 Command Code 额度、装了反重力的机器上的反重力额度）。显示内容优先跟随当前视图（见下文「视图」）；没有选中视图时退到 URL 参数，再退到 `default_on`。选择放在 URL 里。
+不带参数时显示所有 `default_on = true` 的插件（歌词，以及装了 Codex CLI 的机器上的 AI 额度、本机留有 Command Code 凭据时启用的 Command Code 额度、装了反重力的机器上的反重力额度）。显示内容优先跟随当前视图（见下文「视图」）；没有选中视图时退到 URL 参数，再退到 `default_on`。选择放在 URL 里。
 
 视图生效时每个插件渲染在自己的区域里，字号按区域大小自动缩放（可用宽度占比与高度装得下内容两个约束取小），缩放用的宽高比来自设备浏览器每次轮询上报的真实视口尺寸。每个区域四周留白（上下 3vh、左右 4vw），内容不贴墨水屏边缘；缩放按扣掉留白后的可用宽高算，内容多时字号变小。
 

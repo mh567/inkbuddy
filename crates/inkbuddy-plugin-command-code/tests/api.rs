@@ -7,6 +7,7 @@ use inkbuddy_plugin_command_code::model::{
 use reqwest::redirect::Policy;
 use reqwest::Client;
 use serde_json::json;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -679,7 +680,7 @@ async fn empty_billing_responses_produce_not_found_snapshot() {
     assert!(snapshot.weekly.is_none());
     assert!(snapshot.monthly.is_none());
     assert!(snapshot.updated_at.is_some());
-    // 终态直接返回，不再请求用量接口。
+    // 终态直接返回，这一轮只发出前三个请求。
     assert_eq!(server.requests().len(), 3);
     server.handle.abort();
 }
@@ -736,7 +737,53 @@ async fn client_error_status_stops_fetch() {
     let error = fetch_snapshot(&client, &server.base, "test-key", &QuotaSnapshot::default())
         .await
         .unwrap_err();
-    assert_eq!(error, FetchError::Transport);
+    assert_eq!(error, FetchError::Client(400));
+    server.handle.abort();
+}
+
+#[tokio::test]
+async fn not_found_terminal_clears_old_data_and_recovers() {
+    // 第一轮四个接口都返回空对象，第二轮返回正常数据。
+    let whoami_calls = Arc::new(AtomicUsize::new(0));
+    let ok = static_routes();
+    let server = FakeServer::start(Arc::new(move |path| {
+        let route = path.split('?').next().unwrap_or(path);
+        let round = if route == "/alpha/whoami" {
+            whoami_calls.fetch_add(1, Ordering::SeqCst)
+        } else {
+            whoami_calls.load(Ordering::SeqCst).saturating_sub(1)
+        };
+        if round == 0 {
+            (200, vec![], "{}".to_string())
+        } else {
+            ok(path)
+        }
+    }))
+    .await;
+    let client = build_client();
+    let previous = QuotaSnapshot {
+        plan: Some("GOAT".to_string()),
+        five_hour: Some(QuotaWindow {
+            used_percent: Some(50),
+            resets_at: Some(1_700_000_000),
+        }),
+        ..QuotaSnapshot::default()
+    };
+    let first = fetch_snapshot(&client, &server.base, "test-key", &previous)
+        .await
+        .unwrap();
+    assert_eq!(first.failure.as_deref(), Some(FAILURE_NOT_FOUND));
+    assert!(first.plan.is_none());
+    assert!(first.five_hour.is_none());
+    assert!(first.weekly.is_none());
+    assert!(first.monthly.is_none());
+
+    let second = fetch_snapshot(&client, &server.base, "test-key", &first)
+        .await
+        .unwrap();
+    assert!(second.failure.is_none());
+    assert_eq!(second.plan.as_deref(), Some("GOAT"));
+    assert_eq!(second.five_hour.and_then(|w| w.used_percent), Some(21));
     server.handle.abort();
 }
 

@@ -20,7 +20,7 @@ struct PluginInfo: Identifiable, Codable {
     let enabled: Bool
     let defaultOn: Bool
     let running: Bool
-    /// 插件提供的子样式。老 host 没有这个字段时按空数组处理。
+    /// 插件提供的子样式，缺省为空数组。
     var variants: [PluginVariant]
 
     enum CodingKeys: String, CodingKey {
@@ -70,7 +70,7 @@ struct ViewRegion: Codable, Equatable, Identifiable {
 
     var id: String { plugin }
 
-    /// 旧调用点（菜单预览的竖排区域）不需要子样式。
+    /// 菜单预览的竖排区域用这个构造器，variant 取默认值。
     init(plugin: String, x: Double, y: Double, w: Double, h: Double, variant: String? = nil) {
         self.plugin = plugin
         self.x = x
@@ -245,8 +245,8 @@ final class HostService: ObservableObject {
             .appendingPathComponent("Contents/Resources/plugins", isDirectory: true)
 
         // 二进制与辅助文件每次启动都用 bundle 里的版本覆盖，保证 app 升级后插件同步更新。
-        // plugin.toml 里存着用户改过的启用状态，只在首次安装时复制。
-        // 按目录枚举，bundle 里加了插件不用改这段。
+        // plugin.toml 每次启动用 bundle 版本打底，用户改过的 default_on / enabled 保留。
+        // 按目录枚举，bundle 里新增的插件由这段自动带到运行时目录。
         let bundled = (try? fileManager.contentsOfDirectory(
             at: bundlePlugins,
             includingPropertiesForKeys: [.isDirectoryKey]
@@ -264,8 +264,8 @@ final class HostService: ObservableObject {
             }
             for file in files {
                 let target = dst.appendingPathComponent(file.lastPathComponent)
-                let isManifest = file.lastPathComponent == "plugin.toml"
-                if isManifest && fileManager.fileExists(atPath: target.path) {
+                if file.lastPathComponent == "plugin.toml" {
+                    syncManifest(bundle: file, target: target, plugin: name)
                     continue
                 }
                 try? fileManager.removeItem(at: target)
@@ -273,9 +273,6 @@ final class HostService: ObservableObject {
                     try fileManager.copyItem(at: file, to: target)
                 } catch {
                     NSLog("InkBuddy: 复制插件文件失败 \(file.lastPathComponent): \(error.localizedDescription)")
-                }
-                if isManifest && name == "command-code" {
-                    applyCommandCodeDefaultOn(at: target)
                 }
             }
             if name == "lyrics" {
@@ -300,21 +297,41 @@ final class HostService: ObservableObject {
         try? config.write(to: homeURL.appendingPathComponent("config.toml"), atomically: true, encoding: .utf8)
     }
 
-    /// command-code 清单首次落地时，按用户本机是否留有 cmd 登录态写 default_on。
-    /// 打包机有没有 cmd 说明不了用户机器的状态，所以放在 app 启动时判定。
-    private func applyCommandCodeDefaultOn(at url: URL) {
-        let auth = fileManager.homeDirectoryForCurrentUser
-            .appendingPathComponent(".commandcode/auth.json")
-        let loggedIn = fileManager.fileExists(atPath: auth.path)
-        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return }
-        var lines = text.components(separatedBy: "\n")
-        for index in lines.indices {
-            if lines[index].trimmingCharacters(in: .whitespaces).hasPrefix("default_on") {
-                lines[index] = "default_on = \(loggedIn)"
-            }
+    /// 清单每次启动用 bundle 版本写入，名字、命令路径、超时等字段随 app 升级更新。
+    /// default_on 与 enabled 是用户可改的运行时开关，沿用目标文件里已有的值。
+    /// command-code 首次落地时按本机凭据判定 default_on。
+    private func syncManifest(bundle: URL, target: URL, plugin: String) {
+        guard let bundled = try? String(contentsOf: bundle, encoding: .utf8) else { return }
+        let exists = fileManager.fileExists(atPath: target.path)
+        let existing: String?
+        if exists {
+            // 文件存在却读不出来时直接收手，保留用户改过的开关。
+            guard let text = try? String(contentsOf: target, encoding: .utf8) else { return }
+            existing = text
+        } else {
+            existing = nil
         }
-        try? lines.joined(separator: "\n")
-            .write(to: url, atomically: true, encoding: .utf8)
+        let text = ManifestEditing.resolved(
+            bundle: bundled,
+            existing: existing,
+            plugin: plugin,
+            hasCredentials: commandCodeHasCredentials(),
+            runtimeKeys: ["default_on", "enabled"]
+        )
+        try? text.write(to: target, atomically: true, encoding: .utf8)
+    }
+
+    /// 判定本机是否有 Command Code 凭据，口径与插件 auth.rs 一致。
+    private func commandCodeHasCredentials() -> Bool {
+        let env = ProcessInfo.processInfo.environment
+        let auth = ManifestEditing.commandCodeAuthPath(
+            env: env,
+            homeDirectory: fileManager.homeDirectoryForCurrentUser
+        )
+        return ManifestEditing.hasCommandCodeCredentials(
+            env: env,
+            authJSON: try? Data(contentsOf: auth)
+        )
     }
 
     /// 从旧的 ~/.inkbuddy/cache 迁移歌词缓存，避免升级后缓存丢失

@@ -7,7 +7,7 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::api::{self, FetchError};
-use crate::model::{QuotaSnapshot, FAILURE_NOT_FOUND, FAILURE_READ, LOGIN_REQUIRED};
+use crate::model::{QuotaSnapshot, FAILURE_NOT_FOUND, FAILURE_READ, INVALID_KEY, LOGIN_REQUIRED};
 
 /// shutdown 时等待后台任务收尾的上限。
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -130,13 +130,21 @@ fn auth_snapshot() -> QuotaSnapshot {
     }
 }
 
+/// apiKey 含非法字符是终态：整块换成凭据格式提示。
+fn invalid_key_snapshot() -> QuotaSnapshot {
+    QuotaSnapshot {
+        failure: Some(INVALID_KEY.to_string()),
+        ..QuotaSnapshot::default()
+    }
+}
+
 /// 取数失败：保留旧快照，仅更新提示文案。
 fn failed_snapshot(previous: &QuotaSnapshot, message: String) -> QuotaSnapshot {
     let mut snapshot = previous.clone();
-    // 登录提示与「额度数据未找到」都是终态，后续传输失败不改写它们。
+    // 三种终态都不被后续传输失败改写。
     if matches!(
         snapshot.failure.as_deref(),
-        Some(LOGIN_REQUIRED) | Some(FAILURE_NOT_FOUND)
+        Some(LOGIN_REQUIRED) | Some(FAILURE_NOT_FOUND) | Some(INVALID_KEY)
     ) {
         return snapshot;
     }
@@ -144,11 +152,11 @@ fn failed_snapshot(previous: &QuotaSnapshot, message: String) -> QuotaSnapshot {
     snapshot
 }
 
-/// 取数失败时更新等待节奏：限流与传输失败都退避，凭据问题保持正常间隔。
+/// 取数失败时更新等待节奏：限流与传输失败退避，凭据问题与请求被拒绝保持正常间隔。
 fn on_fetch_error(state: &mut PollState, error: &FetchError, base: Duration) {
     match error {
         FetchError::RateLimited(_) | FetchError::Transport => state.on_failure(base),
-        FetchError::Auth | FetchError::InvalidKey => state.on_success(),
+        FetchError::Auth | FetchError::InvalidKey | FetchError::Client(_) => state.on_success(),
     }
 }
 
@@ -184,7 +192,11 @@ async fn run(
                     }
                     FetchError::InvalidKey => {
                         eprintln!("command-code: apiKey 含非法字符，无法构造认证头");
-                        auth_snapshot()
+                        invalid_key_snapshot()
+                    }
+                    FetchError::Client(code) => {
+                        eprintln!("command-code: 请求被拒绝，状态码 {code}");
+                        failed_snapshot(&previous, format!("额度读取失败（HTTP {code}）"))
                     }
                     FetchError::RateLimited(code) => {
                         // 日志只写状态码，凭据留在进程内存里。
@@ -346,6 +358,17 @@ mod tests {
         assert_eq!(state, PollState::Normal);
         on_fetch_error(&mut state, &FetchError::InvalidKey, base);
         assert_eq!(state, PollState::Normal);
+        on_fetch_error(&mut state, &FetchError::Client(400), base);
+        assert_eq!(state, PollState::Normal);
+    }
+
+    #[test]
+    fn invalid_key_snapshot_uses_its_own_terminal_text() {
+        let snapshot = invalid_key_snapshot();
+        assert_eq!(snapshot.failure.as_deref(), Some(INVALID_KEY));
+        assert!(snapshot.five_hour.is_none());
+        let still_invalid = failed_snapshot(&snapshot, FAILURE_READ.to_string());
+        assert_eq!(still_invalid.failure.as_deref(), Some(INVALID_KEY));
     }
 
     #[tokio::test]

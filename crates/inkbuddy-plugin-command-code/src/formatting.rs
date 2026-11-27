@@ -110,7 +110,12 @@ pub fn month_percent(plan: Option<&str>, credits_remaining: Option<f64>) -> Opti
     if !remaining.is_finite() {
         return None;
     }
-    Some(round_clamp_percent((pool - remaining) / pool * 100.0))
+    let percent = (pool - remaining) / pool * 100.0;
+    // 极大的有限值会让减法或乘法溢出成 inf，钳位后变成假的 0%。
+    if !percent.is_finite() {
+        return None;
+    }
+    Some(round_clamp_percent(percent))
 }
 
 /// 计算 `used / cap * 100`，四舍五入并钳在 0..=100。
@@ -369,6 +374,8 @@ mod tests {
         assert_eq!(month_percent(Some("mystery"), Some(10.0)), None);
         assert_eq!(month_percent(Some("GOAT"), Some(f64::NAN)), None);
         assert_eq!(month_percent(Some("GOAT"), Some(f64::INFINITY)), None);
+        // 有限的极大值会在换算里溢出，同样写 None 而不是假的 0%。
+        assert_eq!(month_percent(Some("GOAT"), Some(f64::MAX)), None);
     }
 
     #[test]

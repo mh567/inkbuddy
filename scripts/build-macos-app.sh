@@ -44,7 +44,8 @@ EOF
 
 echo "==> 编译 Swift 界面"
 swiftc -O app/Sources/main.swift app/Sources/AppDelegate.swift app/Sources/AppState.swift \
-    app/Sources/HostService.swift app/Sources/SettingsView.swift app/Sources/Updater.swift \
+    app/Sources/HostService.swift app/Sources/ManifestEditing.swift \
+    app/Sources/SettingsView.swift app/Sources/Updater.swift \
     app/Sources/MenuPreviewController.swift app/Sources/ViewEditor.swift \
     app/Sources/EditorPreview.swift \
     -o "$APP/Contents/MacOS/$APP_NAME"
@@ -143,7 +144,7 @@ args = []
 EOF
 
 # command-code 读的是用户机器上 Command Code CLI 保存的登录态。打包机有没有 cmd
-# 说明不了用户机器的状态，bundle 清单先写 false，app 启动时按本机登录态改写。
+# 说明不了用户机器的状态，bundle 清单先写 false，app 启动时按本机凭据改写。
 COMMAND_CODE_DEFAULT_ON=false
 
 cat > "$RESDIR/plugins/command-code/plugin.toml" <<EOF

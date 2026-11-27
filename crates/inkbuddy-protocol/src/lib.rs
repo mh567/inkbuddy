@@ -10,11 +10,12 @@
 //!
 //! The host sends a [`Request`] line and reads exactly one [`Response`] line
 //! with the matching `id`. Non-response stdout lines are ignored; diagnostics
-//! go to stderr. Every request carrying an `id` gets exactly one response
-//! line, including unknown methods and invalid fields; otherwise the host
-//! waits until its deadline. A line that is not valid JSON or has no `id`
-//! is skipped by the plugin, since the host pairs replies by `id` and there
-//! is nothing to echo. Hosts send well-formed requests with an `id`.
+//! go to stderr. The host pairs replies by `id` and waits until its deadline.
+//! A plugin answers a request it can parse with one response line, including
+//! a failure line for unknown methods and invalid fields. Unparseable lines
+//! and lines without an `id` are skipped by most plugins; some emit a single
+//! unpaired failure response for a line without an `id`. Hosts send
+//! well-formed requests with an `id`.
 //!
 //! Both sides cap a single line at 1 MiB. `id` is a monotonically increasing
 //! `u64` and stays below 2^53 so JSON implementations in other languages can
@@ -147,7 +148,7 @@ pub struct PluginInfo {
     pub description: String,
     pub protocol: u32,
     /// 该插件提供的子样式。空列表表示不可切换样式。
-    /// 老插件不返回这个字段，反序列化时按空列表处理。
+    /// 插件省略这个字段时，反序列化按空列表处理。
     pub variants: Vec<VariantInfo>,
 }
 
@@ -191,8 +192,8 @@ pub enum Block {
     /// Both are optional. Any plugin can use them; the host does not know
     /// any plugin's class names.
     Html { html: String },
-    /// Unknown block type from a newer or third-party plugin. The host skips
-    /// that block and keeps the rest of the frame.
+    /// A block type outside the host's known set. The host skips that block
+    /// and keeps the rest of the frame.
     #[serde(other)]
     Unknown,
 }
@@ -212,7 +213,7 @@ pub enum Emphasis {
     Reading,
 }
 
-/// An unknown emphasis string from a third-party plugin falls back to Normal,
+/// An emphasis string outside the host's known values falls back to Normal,
 /// keeping the rest of the `RenderResult` deserializable.
 fn de_emphasis<'de, D>(de: D) -> Result<Emphasis, D::Error>
 where

@@ -1,6 +1,6 @@
 # Command Code 额度插件（inkbuddy-plugin-command-code）
 
-在墨水屏上显示本机 Command Code 账号的套餐和额度用量。插件 id 为 `command-code`，安装后的清单在 `plugins/command-code/plugin.toml`。`scripts/install.sh` 按安装机器上有没有 `cmd` 写 `default_on`：检测到就写 `true`，随展示页一起显示；没检测到就写 `false`。app bundle 里的清单先写 `false`，app 启动时按本机 `~/.commandcode/auth.json` 是否存在改写；清单只在首次安装时从 bundle 复制，之后保留用户的修改。两种情况下都可以用 `?plugins=command-code` 参数，或把 `default_on` 改成 `true` 来启用。
+在墨水屏上显示本机 Command Code 账号的套餐和额度用量。插件 id 为 `command-code`，安装后的清单在 `plugins/command-code/plugin.toml`。`scripts/install.sh` 按安装机器上有没有 `cmd` 写 `default_on`：检测到就写 `true`，随展示页一起显示；没检测到就写 `false`。app bundle 里的清单先写 `false`，app 首次启动时按本机凭据判定：环境变量 `COMMAND_CODE_API_KEY` 有非空白值，或 `~/.commandcode/auth.json` 顶层能解析出非空白字符串 `apiKey`，就写 `true`。清单每次启动用 bundle 版本打底，用户改过的 `default_on` 与 `enabled` 保留，其余字段随 app 升级更新。两种情况下都可以用 `?plugins=command-code` 参数，或把 `default_on` 改成 `true` 来启用。
 
 ## 显示内容
 
@@ -13,11 +13,11 @@
 
 套餐名识别 Go、GOAT、Pro、Max、Ultra、Teams Pro；接口返回其他 `planId` 时直接显示原始值。进度条按 5% 取整，填充宽度由 `q-0` 到 `q-100` 共 21 档预设 class 控制。
 
-月度行只按套餐自带的 credit 池计算百分比。顶部显示的剩余 credit 是套餐剩余 credit、购买 credit 和赠送 credit 三项之和，额外购买和赠送的部分只进入顶部总额，算作套餐外的余量。5 小时与周窗口的上限取接口返回的 `cap`，`cap` 或 `used` 缺失时该行百分比显示 `--`；重置时间已知时倒计时照常。倒计时不足 1 小时按分钟写，不超过 24 小时按「X 小时 X 分」写，超过 24 小时按「X 天 X 小时」写，整天只写「X 天」。
+月度行只按套餐自带的 credit 池计算百分比。顶部显示的剩余 credit 是套餐剩余 credit、购买 credit 和赠送 credit 三项之和，额外购买和赠送的部分只进入顶部总额，算作套餐外的余量。5 小时与周窗口的百分比按接口返回的 `used` 和 `cap` 换算，`cap` 或 `used` 缺失时该行显示 `--` 和空进度条；重置时间已知时倒计时继续走，重置时间也取不到时显示「暂无数据」。倒计时不足 1 小时按分钟写，不超过 24 小时按「X 小时 X 分」写，超过 24 小时按「X 天 X 小时」写，整天只写「X 天」。
 
 ## 数据来源
 
-凭据来自本机 cmd CLI 已保存的登录态：优先读环境变量 `COMMAND_CODE_API_KEY`，为空时读 `~/.commandcode/auth.json` 顶层的 `apiKey` 字段。文件里的其他令牌由 CLI 自己管理，插件只取 `apiKey` 这一项。key 只在插件进程内用于请求鉴权，插件进程退出后不落盘。
+凭据来自本机 cmd CLI 已保存的登录态：优先读环境变量 `COMMAND_CODE_API_KEY`，为空时读 `~/.commandcode/auth.json` 顶层的 `apiKey` 字段。文件里的其他令牌由 CLI 自己管理，插件只取 `apiKey` 这一项。key 留在插件进程内存里用于构造认证头，日志只记录状态码。
 
 插件向 `api.commandcode.ai` 发四个只读 GET，认证头是 `Authorization: Bearer <key>`，另带 CLI 标识头 `x-command-code-version` 和 `x-cli-environment`：
 
@@ -26,15 +26,15 @@
 3. `GET /alpha/billing/credits` 取剩余 credit 与 5 小时、周窗口的用量和重置时间。
 4. `GET /alpha/usage/summary` 取本期请求数、花费与 token 数，存进快照供后续使用。
 
-第 2、3 个请求并发发出，第 4 个请求等第 2 个拿到本期起始时间后再发。首轮取数立即执行，之后每 60 秒一轮。遇到限流、服务端错误或网络失败按 2 倍、4 倍、8 倍退避，上限 30 分钟；成功一次回到 60 秒。
+第 2、3 个请求并发发出，第 4 个请求等第 2 个拿到本期起始时间后再发。首轮取数立即执行，之后每 60 秒一轮。遇到限流、服务端错误或网络失败按 2 倍、4 倍、8 倍退避，上限 30 分钟；成功一次回到 60 秒。其他 4xx 属于请求被拒绝，保持 60 秒间隔。
 
 宿主的 `render` 读内存快照并直接返回；首次 `render` 时快照尚未就绪，最多等 3 秒。插件返回的 `refresh_ms` 是 30000，让倒计时保持准确，实际取数由内部的 60 秒定时器驱动。
 
 ## 配置
 
-`COMMAND_CODE_API_KEY` 的优先级高于 `~/.commandcode/auth.json`，设置后沿用这个 key，适合无 CLI 的场景。凭据由本机 CLI 登录态提供，插件进程启动时读取一次，运行时没有登录窗口和密码输入。本机先装好 cmd CLI 并登录一次，登录态会写入 `~/.commandcode/auth.json`，插件据此取数。命令行重新登录后要重启插件进程，新的登录态才会被读到。
+`COMMAND_CODE_API_KEY` 的优先级高于 `~/.commandcode/auth.json`，设置后沿用这个 key，适合无 CLI 的场景。凭据由本机 CLI 登录态提供，插件进程启动时读取一次。本机先装好 cmd CLI 并登录一次，登录态会写入 `~/.commandcode/auth.json`，插件据此取数。命令行重新登录后要重启插件进程，新的登录态才会被读到。
 
-`COMMAND_CODE_BASE_URL` 是测试用的接口地址覆盖项：测试进程把它指向本地假 HTTP server，走的是假 key，请求留在本机。这个值只接受 `http://127.0.0.1`、`http://localhost` 或 `http://[::1]` 加端口；写成其他地址时插件改用生产地址。日常使用保持未设置。
+`COMMAND_CODE_BASE_URL` 是测试用的接口地址覆盖项：测试进程把它指向本地假 HTTP server，走的是假 key，请求留在本机。这个值只接受 `http` 形式的本机地址：`127.0.0.0/8` 段、`localhost`（含大小写写法）或 `[::1]`，端口可带可不带；写成其他地址时插件改用生产地址。日常使用保持未设置。
 
 插件配置项就是清单里的 `plugin.toml`：
 
@@ -46,19 +46,20 @@ timeout_ms = 8000
 args = []
 ```
 
-`default_on` 决定不带 `?plugins=` 参数时这块出不出现，仓库里的清单写 `true`，安装脚本按本机有没有 `cmd` 覆盖它。app 首次安装时按本机登录态改写，之后保留用户修改。`timeout_ms` 建议 8000：首轮取数含四个请求，留出余量。`args` 保持为空。
+`default_on` 决定不带 `?plugins=` 参数时这块出不出现，仓库里的清单写 `true`，安装脚本按本机有没有 `cmd` 覆盖它。app 首次启动时按本机凭据改写，之后每次启动用 bundle 清单打底时保留用户改过的 `default_on` 与 `enabled`。`timeout_ms` 建议 8000：首轮取数含四个请求，留出余量。`args` 保持为空。
 
 ## 失败提示
 
 | 情况 | 页面显示 |
 | --- | --- |
 | 本机没有登录态或 key | 「Command Code 未登录，请先运行 cmd login」 |
+| `apiKey` 含非法字符 | 「Command Code 凭据格式不对，请检查 COMMAND_CODE_API_KEY」 |
 | 计费接口没有额度数据 | 「额度数据未找到」 |
 | 读取失败但已有旧数据 | 看板照旧，看板下方按距上次成功更新显示「刚刚更新」「更新于 X 分钟前」或「更新于 X 小时前」 |
-| 读取失败且没有旧数据 | 「额度读取失败」 |
+| 读取失败且没有旧数据 | 「额度读取失败」；带状态码的失败写成「额度读取失败（HTTP 400）」「额度读取失败（HTTP 429）」 |
 | 快照尚未就绪 | 「正在读取额度…」 |
 
-未登录与找不到额度数据是终态，整块看板换成对应提示文字。单项字段缺失时那一行显示 `--` 和「暂无数据」，其余行照常；窗口重置时间已知时倒计时继续走。
+未登录、凭据格式不对、找不到额度数据都是终态，整块看板换成对应提示文字。单项字段缺失时那一行显示 `--` 和空进度条；重置时间已知就显示倒计时，重置时间也取不到时显示「暂无数据」。其余行照常。
 
 ## 请求边界
 

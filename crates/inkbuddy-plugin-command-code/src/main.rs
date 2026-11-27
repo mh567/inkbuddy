@@ -110,7 +110,7 @@ fn parse_request_line(line: &str) -> ParsedRequest {
         eprintln!("忽略缺少 id 的请求行");
         return ParsedRequest::Ignore;
     };
-    // 先取原始 method（缺失记 <missing>），失败文案带上它便于宿主定位版本差异。
+    // 先取原始 method（缺失记 <missing>），失败文案带上它便于宿主定位请求。
     let method = value
         .get("method")
         .and_then(serde_json::Value::as_str)

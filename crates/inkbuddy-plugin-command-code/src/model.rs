@@ -123,6 +123,8 @@ pub const LOGIN_REQUIRED: &str = "Command Code 未登录，请先运行 cmd logi
 pub const FAILURE_READ: &str = "额度读取失败";
 /// 接口没有返回可用额度数据时的提示。
 pub const FAILURE_NOT_FOUND: &str = "额度数据未找到";
+/// apiKey 含非法字符、无法构造认证头时的终态提示。
+pub const INVALID_KEY: &str = "Command Code 凭据格式不对，请检查 COMMAND_CODE_API_KEY";
 
 #[cfg(test)]
 mod tests {
@@ -225,5 +227,9 @@ mod tests {
         assert_eq!(LOGIN_REQUIRED, "Command Code 未登录，请先运行 cmd login");
         assert_eq!(FAILURE_READ, "额度读取失败");
         assert_eq!(FAILURE_NOT_FOUND, "额度数据未找到");
+        assert_eq!(
+            INVALID_KEY,
+            "Command Code 凭据格式不对，请检查 COMMAND_CODE_API_KEY"
+        );
     }
 }

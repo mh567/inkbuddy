@@ -168,7 +168,7 @@ mod tests {
             api_key_from(getter_with(None), Some("/home/test".to_string()), |_| None),
             None
         );
-        // HOME 缺失时不再拼路径，也不读文件。
+        // HOME 缺失时直接返回 None，文件读取闭包保持未调用。
         assert_eq!(
             api_key_from(getter_with(None), None, |_| {
                 panic!("HOME 缺失时不应读文件")

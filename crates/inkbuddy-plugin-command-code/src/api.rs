@@ -32,6 +32,8 @@ pub enum FetchError {
     InvalidKey,
     /// 429/5xx：限流或服务端临时错误，携带原始状态码。
     RateLimited(u16),
+    /// 其他 4xx：请求被拒绝，重试拿不到不同结果。
+    Client(u16),
     /// 超时、网络错误、地址不在允许范围、重定向或响应无法解析。
     Transport,
 }
@@ -64,11 +66,13 @@ pub fn build_headers(key: &str) -> Result<HeaderMap, FetchError> {
 }
 
 /// 把 HTTP 状态码归类为取数错误；只有 2xx 算拿到数据。
+/// 其他 4xx 单独归类，避免偶发的请求错误触发网络故障的指数退避。
 pub fn classify_status(code: u16) -> Option<FetchError> {
     match code {
         200..=299 => None,
         401 | 403 => Some(FetchError::Auth),
         429 | 500..=599 => Some(FetchError::RateLimited(code)),
+        400..=499 => Some(FetchError::Client(code)),
         _ => Some(FetchError::Transport),
     }
 }
@@ -174,7 +178,7 @@ pub fn apply_subscriptions(snapshot: &mut QuotaSnapshot, value: &Value, previous
     }
 }
 
-/// credit 与两个滚动窗口写入快照；算不出百分比时写 `None`，不推算上限，有重置时间则沿用。
+/// credit 与两个滚动窗口写入快照；百分比按 `used` 和 `cap` 换算，有重置时间则沿用。
 pub fn apply_credits(snapshot: &mut QuotaSnapshot, value: &Value, previous: &QuotaSnapshot) {
     if let Some(credits) = value.get("credits") {
         let monthly = number(credits.get("monthlyCredits"));
@@ -422,10 +426,10 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn classify_status_splits_auth_rate_limit_redirect_and_success() {
+    fn classify_status_splits_auth_client_rate_limit_and_success() {
         assert_eq!(classify_status(200), None);
         assert_eq!(classify_status(204), None);
-        assert_eq!(classify_status(404), Some(FetchError::Transport));
+        assert_eq!(classify_status(404), Some(FetchError::Client(404)));
         assert_eq!(classify_status(401), Some(FetchError::Auth));
         assert_eq!(classify_status(403), Some(FetchError::Auth));
         assert_eq!(classify_status(429), Some(FetchError::RateLimited(429)));
@@ -742,10 +746,17 @@ mod tests {
         assert_eq!(classify_status(200), None);
         assert_eq!(classify_status(204), None);
         assert_eq!(classify_status(299), None);
-        for code in [100, 302, 400, 402, 404, 418, 600] {
+        for code in [100, 302, 600] {
             assert_eq!(
                 classify_status(code),
                 Some(FetchError::Transport),
+                "code {code}"
+            );
+        }
+        for code in [400, 402, 404, 418] {
+            assert_eq!(
+                classify_status(code),
+                Some(FetchError::Client(code)),
                 "code {code}"
             );
         }
@@ -778,6 +789,55 @@ mod tests {
         ] {
             assert!(!allowed_base(base), "base {base}");
         }
+    }
+
+    #[test]
+    fn allowed_base_handles_host_scheme_and_origin_edge_cases() {
+        // 大小写与显式默认端口等价。
+        assert!(allowed_base("https://API.COMMANDCODE.AI"));
+        assert!(allowed_base("https://api.commandcode.ai:443"));
+        // 尾点域名、非默认端口、用户名、查询、片段都落在允许集合之外。
+        for base in [
+            "https://api.commandcode.ai.",
+            "https://api.commandcode.ai:8443",
+            "https://api.commandcode.ai.evil.com",
+            "http://user@127.0.0.1:9012",
+            "http://127.0.0.1:9012?x=1",
+            "http://127.0.0.1:9012#frag",
+            "http://127.0.0.1:9012/alpha/whoami",
+            // 形近域名：西里尔字母 а、punycode 尾点、生产域名配 http。
+            "https://аpi.commandcode.ai",
+            "https://xn--pi-8o0a.commandcode.ai",
+            "https://api.commandcode.ai%2e.evil.com",
+            "http://api.commandcode.ai",
+        ] {
+            assert!(!allowed_base(base), "base {base}");
+        }
+        // 本机地址的常见写法仍可覆盖到假 server。
+        assert!(is_loopback_base("http://127.0.0.2:9012"));
+        assert!(is_loopback_base("http://127.0.0.1"));
+        assert!(is_loopback_base("http://LOCALHOST:9012"));
+        assert!(is_loopback_base("http://localhost"));
+        assert!(is_loopback_base("http://[0:0:0:0:0:0:0:1]:9012"));
+        assert!(is_loopback_base("http://[::1]"));
+        // 十进制 IPv4 规范化后仍指向本机。
+        assert!(is_loopback_base("http://2130706433:9012"));
+        // IPv4-mapped IPv6 与尾点 localhost 当前按非 loopback 处理，会回退生产地址。
+        assert!(!is_loopback_base("http://[::ffff:127.0.0.1]:9012"));
+        assert!(!is_loopback_base("http://localhost.:9012"));
+        // https 的本机地址与生产域名的非 443 端口都落在允许集合之外。
+        assert!(!is_loopback_base("https://127.0.0.1:9012"));
+        assert!(!is_production_base("https://api.commandcode.ai:8443"));
+    }
+
+    #[test]
+    fn parse_window_without_value_or_previous_reset_is_none() {
+        assert_eq!(parse_window(None, None), None);
+        assert_eq!(parse_window(Some(&json!({"used": 3})), None), None);
+        assert_eq!(
+            parse_window(Some(&json!({"used": 3, "cap": null})), None),
+            None
+        );
     }
 
     #[test]
