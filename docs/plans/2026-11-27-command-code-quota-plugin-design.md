@@ -35,7 +35,7 @@ base URL `https://api.commandcode.ai`，认证头 `Authorization: Bearer <key>`�
 
 每轮取数按依赖顺序发 4 个 GET：
 
-1. `GET /alpha/whoami` — 账号与组织 id。失败就直接判为鉴权失败，不再请求后面的接口。
+1. `GET /alpha/whoami` — 账号与组织 id。失败就判为鉴权失败，取数在这一步结束。
 2. `GET /alpha/billing/subscriptions` — `planId`、`status`、`currentPeriodStart`、`currentPeriodEnd`。组织账号带 `?orgId=`。
 3. `GET /alpha/billing/credits` — `credits.monthlyCredits`、`purchasedCredits`、`freeCredits`，以及 `windowLimits.fiveHour` / `windowLimits.weekly`。组织账号带 `?orgId=`。
 4. `GET /alpha/usage/summary?since=<currentPeriodStart>` — 本期请求数、花费、token 数。失败只影响用量统计，不影响额度显示。
@@ -61,7 +61,7 @@ base URL `https://api.commandcode.ai`，认证头 `Authorization: Bearer <key>`�
 
 ## 进程模型
 
-宿主把插件作为长驻子进程启动，多次 `render` 复用同一进程。插件内部起一个后台任务定时取数，不需要再启动 CLI 子进程。
+宿主把插件作为长驻子进程启动，多次 `render` 复用同一进程。插件内部起一个后台任务定时取数，请求由插件进程内的 HTTP 客户端发出。
 
 ```
 inkbuddy 宿主

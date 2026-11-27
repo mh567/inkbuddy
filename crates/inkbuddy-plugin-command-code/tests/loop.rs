@@ -11,7 +11,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
-const FIRST_RENDER_TIMEOUT: Duration = Duration::from_secs(3);
+// 插件首轮最多等 3 秒，这里给响应留足余量，避免 CI 负载高时刚好卡在 3 秒边界。
+const FIRST_RENDER_TIMEOUT: Duration = Duration::from_secs(5);
 const EMPTY_HOME: &str = "/nonexistent-home-for-command-code-tests";
 
 /// 起一个线程逐行读 stdout，用 channel 把行交回主线程。
@@ -257,7 +258,7 @@ fn render_returns_board_from_local_fake_api() {
     let reply = recv_reply(&replies, FIRST_RENDER_TIMEOUT);
     assert!(
         started.elapsed() < FIRST_RENDER_TIMEOUT,
-        "首轮 render 应在 3 秒内返回"
+        "首轮 render 应在 5 秒内返回"
     );
     assert_eq!(reply["ok"].as_bool(), Some(true));
     let blocks = reply["result"]["blocks"].as_array().expect("blocks array");

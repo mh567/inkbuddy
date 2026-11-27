@@ -331,7 +331,7 @@ async fn get_json(client: &Client, url: &Url, headers: &HeaderMap) -> Result<Val
         .await
         .map_err(|_| FetchError::Transport)?;
     // 即使调用方传入跟随重定向的客户端，也拒绝跨源或越出只读路径的响应。
-    if !response_allowed(url, &response.url()) {
+    if !response_allowed(url, response.url()) {
         return Err(FetchError::Transport);
     }
     if let Some(error) = classify_status(response.status().as_u16()) {
