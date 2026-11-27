@@ -23,6 +23,10 @@ const POLL_INTERVAL: Duration = Duration::from_secs(60);
 const FIRST_RENDER_WAIT: Duration = Duration::from_secs(3);
 /// 页面刷新间隔，只用来让倒计时保持准确；取数由服务定时器驱动。
 const REFRESH_MS: u64 = 30_000;
+/// 还没有任何数据时的刷新间隔。
+///
+/// 走命令行版时报一次要 6 秒左右，首帧等不到，先用短间隔让页面早点换上新数字。
+const REFRESH_PENDING_MS: u64 = 2_000;
 
 /// 插件运行状态：额度服务与「是否已经等过首轮」。
 struct Board {
@@ -38,15 +42,20 @@ impl Board {
         }
     }
 
-    /// 首次 render 等首轮数据，之后只读快照。
-    async fn render(&mut self) -> String {
+    /// 首次 render 等首轮数据，之后只读快照；同时给出页面刷新间隔。
+    async fn render(&mut self) -> (String, u64) {
         let snapshot: Snapshot = if self.served_first {
             self.service.snapshot().borrow().clone()
         } else {
             self.served_first = true;
             self.service.wait_first(FIRST_RENDER_WAIT).await
         };
-        render_html(&snapshot, unix_now())
+        let refresh = if snapshot.updated_at.is_none() && snapshot.failure.is_none() {
+            REFRESH_PENDING_MS
+        } else {
+            REFRESH_MS
+        };
+        (render_html(&snapshot, unix_now()), refresh)
     }
 }
 
@@ -106,10 +115,10 @@ async fn handle_request(req: Request, board: &mut Board) -> Response {
             }
         }
         Method::Render => {
-            let html = board.render().await;
+            let (html, refresh_ms) = board.render().await;
             let result = RenderResult {
                 blocks: vec![Block::Html { html }],
-                refresh_ms: Some(REFRESH_MS),
+                refresh_ms: Some(refresh_ms),
             };
             Response::success(req.id, &result)
         }

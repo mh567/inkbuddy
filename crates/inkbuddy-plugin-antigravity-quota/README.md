@@ -14,15 +14,25 @@
 
 ## 数据来源
 
-数据来自本机正在运行的反重力语言服务器，全程只走回环地址，不经过 Google 服务器，也不需要账号令牌。
+额度优先从本机正在运行的反重力语言服务器读，请求只发往回环地址；语言服务器自己会按需向 Google 取额度，和在 IDE 里看额度是同一回事，插件不额外登录、也不碰账号令牌。
 
 1. 端口和 CSRF 令牌：用 `/bin/ps -A -ww -o pid=,command=` 找 `language_server` 进程，从命令行里取 `--csrf_token`、`--extension_server_port`、`--http_server_port`、`--https_server_port`。端口是随机分配的，所以每轮都要重新读。
 2. 额度：`POST http://127.0.0.1:<port>/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary`，返回 `groups[].buckets[]`，每个桶带 `bucketId`（`gemini-5h`、`gemini-weekly`、`3p-5h`、`3p-weekly`）、`window`、`remainingFraction`、`resetTime`。
 3. 套餐名：`POST .../GetUserStatus`，取 `userStatus.planStatus.planInfo.planName`。这条读不到不影响额度显示。
 
-`ps` 没找到进程时，退到日志里记录的端口：`~/Library/Logs/Antigravity/language_server.log`、`~/.gemini/antigravity/log/`、`~/.gemini/antigravity-cli/log/` 里最新的那份，只读末尾 64 KiB。日志里的端口没有配套令牌，适合命令行版反重力这类不校验令牌的实例。
+`ps` 没找到进程时，退到日志里记录的端口：`~/Library/Logs/Antigravity/language_server.log`、`~/.gemini/antigravity/log/`、`~/.gemini/antigravity-cli/log/` 里最新的那份，只读末尾 64 KiB。
 
 没有 TLS 依赖：请求带 `Connection: close`，明文 HTTP 读到 EOF 就算响应结束。只监听 HTTPS 的版本会读不到，目前没遇到过。
+
+### 命令行版
+
+命令行版（`agy`）把语言服务器的 CSRF 令牌留在进程内，命令行、日志、缓存里都没有，从外面读不到。端口应答 401 时，插件改用它自己的命令：
+
+```sh
+agy -p "/usage" --log-file <临时文件>
+```
+
+输出四行，制表符分列：分组、窗口、剩余百分比、重置时间。这条命令会自己起一个语言服务器，一次约 6 秒，所以只在「有端口应答却读不出」时才走，轮询间隔也改成 5 分钟。`--log-file` 把日志指到临时文件，`~/.gemini/antigravity-cli/log/` 不会每轮多出一份。这条路的输出里没有套餐名，顶部写「未知套餐」。
 
 ## 反重力开着或关着
 
@@ -30,13 +40,14 @@
 
 | 情况 | 页面 | 什么时候变 |
 | --- | --- | --- |
-| 反重力开着，插件也在跑 | 实时数字 | 每 60 秒读一次，读到就落盘 |
+| 反重力开着（IDE），插件也在跑 | 实时数字 | 每 60 秒读一次，读到就落盘 |
+| 反重力开着（命令行版 `agy`） | 实时数字 | 每 5 分钟跑一次 `agy -p "/usage"` |
 | 反重力关掉，插件还在跑 | 上次的数字 + 「反重力未运行 · 更新于 X」 | 每 15 秒重试一次；重新打开反重力后最多 15 秒跟上 |
-| 插件刚启动，反重力开着 | 立刻是新数字 | 启动后第一次读取就在首帧之前做完 |
+| 插件刚启动，反重力开着 | 新数字在一轮取数后出现 | 启动后第一次读取就在首帧之前跑起来 |
 | 插件刚启动，反重力关着 | 立刻是落盘的数字 + 提示 | 不用等满 3 秒 |
 | 插件没在跑（没进视图、宿主退出） | 不更新 | 下次启动的第一件事就是读一次 |
 
-宿主的 `render` 读内存快照并直接返回；首次 `render` 会等第一轮读取结束（成功或失败都算），最多等 3 秒。插件返回的 `refresh_ms` 是 30000，让倒计时保持准确。
+宿主的 `render` 读内存快照并直接返回；首次 `render` 会等第一轮读取结束（成功或失败都算），最多等 3 秒。插件返回的 `refresh_ms` 平时是 30000，让倒计时保持准确；还没有读到任何数字时返回 2000，页面会早点换上新数字。
 
 落盘文件是 `$INKBUDDY_HOME/cache/antigravity-quota/last.json`，没设 `INKBUDDY_HOME` 时是 `~/.inkbuddy/cache/antigravity-quota/last.json`。内容是带 `updated_at` 的快照，先写临时文件再改名，进程中途被杀不会留下半份 JSON；`version` 对不上或文件损坏时当作没有记录。
 
@@ -59,6 +70,7 @@ args = []
 ```sh
 ANTIGRAVITY_QUOTA_PORT=61235 ./target/release/inkbuddy-plugin-antigravity-quota
 # 多端口用逗号分隔；需要令牌时再加 ANTIGRAVITY_QUOTA_CSRF=<token>
+# 命令行版的位置不在默认路径时：ANTIGRAVITY_QUOTA_AGY=/path/to/agy
 ```
 
 ## 失败提示
@@ -66,13 +78,13 @@ ANTIGRAVITY_QUOTA_PORT=61235 ./target/release/inkbuddy-plugin-antigravity-quota
 | 情况 | 页面显示 |
 | --- | --- |
 | 本机没有反重力（既没有 app，也没有 `~/.gemini/antigravity*` 数据目录） | 「未找到 Antigravity」 |
-| 装了但语言服务器没在跑 | 「反重力未运行」 |
-| 端口连上了但读不出额度（令牌过期、接口变了） | 「额度读取失败」 |
+| 装了但语言服务器没在跑，也没有可用的命令行版 | 「反重力未运行」 |
+| 端口连上了但读不出额度，命令行版也读不到（没登录、接口变了） | 「额度读取失败」 |
 | 读取失败但已有旧数据 | 看板照旧，下方按距上次成功更新显示「刚刚更新」「更新于 X 分钟前」或「更新于 X 小时前」 |
 | 读取失败且没有旧数据 | 「额度读取失败」 |
 | 旧数据里某个窗口的重置时间已经过去 | 那一行显示「已重置」，不再显示过期百分比 |
 
-反重力的语言服务器是 IDE 的子进程，关掉 IDE 就读不到额度。插件不会自己拉起它：拉起来也没有登录态。
+插件不直接启动语言服务器：它要 IDE 通过 stdin 发一段握手才会开始监听。命令行版那句 `agy -p "/usage"` 由插件调用，进程随命令结束，不留后台常驻。
 
 ## 单独运行
 
@@ -91,6 +103,7 @@ printf '{"id":1,"method":"describe"}\n{"id":2,"method":"render","params":{}}\n{"
 | --- | --- |
 | `src/main.rs` | 协议循环，持有额度服务，`render` 输出 HTML 块 |
 | `src/discovery.rs` | 从 `ps` 和日志里找端口与 CSRF 令牌 |
+| `src/cli.rs` | 命令行版兜底：找 `agy`，跑 `/usage` 并解析四行输出 |
 | `src/http.rs` | 最小 HTTP/1.1 客户端，只发一次 JSON POST |
 | `src/quota.rs` | 候选端口轮询、两组额度的解析、失败原因判定 |
 | `src/model.rs` | 快照数据结构 |

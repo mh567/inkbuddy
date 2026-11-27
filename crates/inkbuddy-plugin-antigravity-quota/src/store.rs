@@ -64,6 +64,7 @@ pub fn load(path: &Path) -> Option<Snapshot> {
         third_party: stored.third_party,
         updated_at: Some(stored.updated_at),
         failure: None,
+        source: crate::model::Source::default(),
     })
 }
 
@@ -112,6 +113,7 @@ mod tests {
     fn sample(now: i64) -> Snapshot {
         Snapshot {
             plan: Some("Pro".to_string()),
+            source: crate::model::Source::Cli,
             gemini: Group {
                 five_hour: Some(Bucket {
                     used_percent: 24,
@@ -147,6 +149,8 @@ mod tests {
         assert_eq!(loaded.gemini.five_hour.expect("5h").used_percent, 24);
         assert_eq!(loaded.third_party.weekly, None);
         assert_eq!(loaded.failure, None);
+        // 来源不入盘：读回来一律按本地语言服务器算，重启后由第一轮取数重新判定
+        assert_eq!(loaded.source, crate::model::Source::Local);
         std::fs::remove_dir_all(&dir).ok();
     }
 

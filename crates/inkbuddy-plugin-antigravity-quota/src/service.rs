@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::model::Snapshot;
+use crate::model::{Snapshot, Source};
 use crate::quota;
 use crate::store;
 
@@ -18,6 +18,12 @@ use crate::store;
 const MIN_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// 上一次没读到时用这个间隔重试；`ps` 一次十几毫秒，代价可以忽略。
 const RETRY_INTERVAL: Duration = Duration::from_secs(15);
+/// 走命令行版时的轮询间隔。一次要起一个 `agy` 进程，约 6 秒，额度变化也慢。
+const CLI_POLL_INTERVAL: Duration = Duration::from_secs(300);
+/// 一轮取数超过这个时长，说明走了命令行版；失败后按更长的间隔重试。
+const SLOW_ROUND: Duration = Duration::from_secs(3);
+/// 慢路径失败后的重试间隔，避免每 15 秒拉起一次 `agy`。
+const SLOW_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 /// shutdown 时等待后台任务收尾的上限。
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -90,15 +96,23 @@ async fn run(
     // 反重力关着时会一直重试，同一个原因只打一次日志，免得每 15 秒刷一行。
     let mut last_reason: Option<&'static str> = None;
     loop {
-        let delay = match quota::collect().await {
+        let started = tokio::time::Instant::now();
+        let result = quota::collect().await;
+        let slow = started.elapsed() >= SLOW_ROUND;
+        let delay = match result {
             Ok(mut snapshot) => {
                 last_reason = None;
                 snapshot.updated_at = Some(unix_now());
+                let from_cli = snapshot.source == Source::Cli;
                 if let Err(err) = store::save(&cache, &snapshot) {
                     eprintln!("antigravity-quota: 保存额度失败: {err}");
                 }
                 let _ = tx.send_replace(snapshot);
-                poll_interval
+                if from_cli {
+                    CLI_POLL_INTERVAL
+                } else {
+                    poll_interval
+                }
             }
             Err(failure) => {
                 if last_reason != Some(failure.reason) {
@@ -112,7 +126,11 @@ async fn run(
                 let mut snapshot = tx.borrow().clone();
                 snapshot.failure = Some(failure.reason.to_string());
                 let _ = tx.send_replace(snapshot);
-                RETRY_INTERVAL.min(poll_interval)
+                if slow {
+                    SLOW_RETRY_INTERVAL
+                } else {
+                    RETRY_INTERVAL.min(poll_interval)
+                }
             }
         };
 
@@ -156,5 +174,15 @@ mod tests {
             Duration::from_secs(60).max(MIN_POLL_INTERVAL),
             Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn cli_polls_more_slowly_than_the_local_server() {
+        // 命令行版一次要起一个进程，轮询间隔必须比本地 RPC 长
+        assert!(CLI_POLL_INTERVAL > Duration::from_secs(60));
+        assert!(SLOW_RETRY_INTERVAL > RETRY_INTERVAL);
+        // 慢路径的判定要短于一次命令行调用（约 6 秒），也要长于本地 RPC（毫秒级）
+        assert!(SLOW_ROUND < Duration::from_secs(6));
+        assert!(SLOW_ROUND > Duration::from_secs(1));
     }
 }

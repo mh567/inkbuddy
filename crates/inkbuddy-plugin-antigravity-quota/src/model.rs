@@ -30,6 +30,17 @@ impl Group {
     }
 }
 
+/// 数据来源。
+///
+/// `Local` 是本机语言服务器的 RPC，`Cli` 是命令行版 `agy -p "/usage"` 的输出。
+/// 后者一次要起一个进程，轮询间隔按来源区分。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Source {
+    #[default]
+    Local,
+    Cli,
+}
+
 /// 一次取数的完整快照；字段缺失用 `None`，失败原因写入 `failure`。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Snapshot {
@@ -43,6 +54,8 @@ pub struct Snapshot {
     pub updated_at: Option<i64>,
     /// 最近一次取数的失败原因；有旧数据时保留旧数据。
     pub failure: Option<String>,
+    /// 这份快照是从哪条路读到的。
+    pub source: Source,
 }
 
 #[cfg(test)]

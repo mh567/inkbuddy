@@ -119,6 +119,7 @@ mod tests {
     fn sample_snapshot(now: i64) -> Snapshot {
         Snapshot {
             plan: Some("Pro".to_string()),
+            source: crate::model::Source::Local,
             gemini: Group {
                 five_hour: Some(Bucket {
                     used_percent: 24,

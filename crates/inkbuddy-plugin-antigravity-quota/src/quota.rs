@@ -43,17 +43,42 @@ pub const FAILURE_READ: &str = "额度读取失败";
 pub struct Failure {
     pub reason: &'static str,
     pub details: Vec<String>,
+    /// 是否有端口应答过。应答过说明反重力在跑，只是读不出来（命令行版就是这种情况），
+    /// 值得再走一次命令行版的 `/usage`。
+    pub answered: bool,
 }
 
 impl Failure {
-    fn new(reason: &'static str, details: Vec<String>) -> Self {
-        Self { reason, details }
+    fn new(reason: &'static str, details: Vec<String>, answered: bool) -> Self {
+        Self {
+            reason,
+            details,
+            answered,
+        }
     }
 }
 
 /// 取一次额度；失败时返回给用户看的文案。
+///
+/// 先按语言服务器读；有端口应答却读不出来，说明是命令行版（令牌留在进程内），
+/// 改走 `agy -p "/usage"`。一个端口都没应答时不必起进程，直接报「未运行」。
 pub async fn collect() -> Result<Snapshot, Failure> {
-    collect_candidates(discovery::candidates().await).await
+    let failure = match collect_candidates(discovery::candidates().await).await {
+        Ok(snapshot) => return Ok(snapshot),
+        Err(failure) => failure,
+    };
+    if !failure.answered {
+        return Err(failure);
+    }
+
+    match crate::cli::collect().await {
+        Ok(snapshot) => Ok(snapshot),
+        Err(detail) => {
+            let mut details = failure.details;
+            details.push(detail);
+            Err(Failure::new(failure.reason, details, failure.answered))
+        }
+    }
 }
 
 /// 用给定候选端口取一次额度。候选为空时按「装没装」区分提示。
@@ -117,6 +142,7 @@ pub async fn collect_candidates(candidates: Vec<Candidate>) -> Result<Snapshot, 
     Err(Failure::new(
         failure_for(answered, discovery::app_installed()),
         details,
+        answered,
     ))
 }
 
