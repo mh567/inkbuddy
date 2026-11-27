@@ -1,0 +1,12 @@
+[plugin]
+id = "command-code"
+name = "Command Code 额度"
+version = "0.1.0"
+description = "Command Code 套餐与 5 小时、周、月额度用量"
+command = "../../target/release/inkbuddy-plugin-command-code"
+
+[runtime]
+enabled = true
+default_on = true
+timeout_ms = 8000
+args = []
