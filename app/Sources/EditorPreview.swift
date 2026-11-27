@@ -129,9 +129,7 @@ struct InkPreviewCanvas: View {
 
     private func canvas(size: CGSize) -> some View {
         ZStack {
-            Rectangle()
-                .fill(Color.white)
-                .overlay(Rectangle().strokeBorder(Color.black.opacity(0.25), lineWidth: 1))
+            Rectangle().fill(Color.white)
             InkPreviewWebView(frame: frame)
             if regions.isEmpty {
                 Text("画布上还没有扩展")
@@ -147,6 +145,12 @@ struct InkPreviewCanvas: View {
                     chrome(region: region, canvas: size)
                 }
             }
+            // 墨水屏外框画在最上层：WebView 的页面白底铺满，
+            // 描边只有落在它上面才看得见。这圈线表示设备屏幕边界，
+            // 独立于区域辅助线，始终显示。
+            Rectangle()
+                .strokeBorder(Color.black.opacity(0.25), lineWidth: 1)
+                .allowsHitTesting(false)
         }
         .clipped()
     }
