@@ -262,6 +262,54 @@ fn modified_at(path: &Path) -> SystemTime {
         .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
+/// 反重力的活动痕迹：日志与数据目录里最新的修改时间（Unix 秒）。
+///
+/// 用户开始用反重力时，这些文件会立刻被改写（IDE 的 language_server.log、
+/// 命令行每次会话的日志、会话库目录）。反重力没开的时候，服务只盯这个值，
+/// 有变化才去跑一次完整取数，省掉每 15 秒一次的 `ps`。
+pub fn activity_stamp() -> u64 {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return 0;
+    };
+
+    let mut newest = 0;
+    for path in [
+        home.join("Library/Logs/Antigravity/language_server.log"),
+        home.join("Library/Logs/Antigravity/main.log"),
+    ] {
+        newest = newest.max(stamp_of(&path));
+    }
+    for dir in [
+        home.join(".gemini/antigravity-cli/log"),
+        home.join(".gemini/antigravity-cli/conversations"),
+        home.join(".gemini/antigravity/log"),
+        home.join(".gemini/antigravity/conversations"),
+    ] {
+        newest = newest.max(newest_stamp_in(&dir));
+    }
+    newest
+}
+
+/// 单个文件或目录的修改时间；不存在按 0 处理。
+fn stamp_of(path: &Path) -> u64 {
+    modified_at(path)
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
+/// 目录里最新的修改时间（不递归）。
+fn newest_stamp_in(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| stamp_of(&entry.path()))
+        .max()
+        .unwrap_or_default()
+}
+
 /// 读文件最后 `limit` 个字节，日志很大时不整份读进来。
 fn read_tail(path: &Path, limit: u64) -> Option<String> {
     let mut file = std::fs::File::open(path).ok()?;
@@ -444,5 +492,24 @@ mod tests {
         let ports = log_ports(&text);
         assert_eq!(ports.len(), MAX_LOG_PORTS);
         assert_eq!(ports[0], 8);
+    }
+
+    #[test]
+    fn missing_paths_have_no_activity_stamp() {
+        assert_eq!(stamp_of(Path::new("/nonexistent/inkbuddy/never")), 0);
+        assert_eq!(newest_stamp_in(Path::new("/nonexistent/inkbuddy/never")), 0);
+    }
+
+    #[test]
+    fn a_fresh_file_shows_up_as_activity() {
+        let dir = std::env::temp_dir().join(format!("inkbuddy-activity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::write(dir.join("cli.log"), b"x").expect("write file");
+
+        assert!(newest_stamp_in(&dir) > 0);
+        // 目录本身也算一处痕迹
+        assert!(stamp_of(&dir) > 0);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -1,8 +1,10 @@
 //! 后台取数服务：先把上次落盘的快照放出来，再立刻读一次，之后按间隔轮询。
 //!
 //! 读到就写盘并替换快照；读不到就保留旧数据，只更新 `failure`，页面按
-//! 「更新于 X 分钟前」提示。反重力没开时用更短的间隔重试，这样用户随时打开
-//! IDE，最多十几秒后页面就跟上。
+//! 「更新于 X 分钟前」提示。
+//!
+//! 反重力没开时不轮询取数：只每 10 秒看一次日志与会话目录的修改时间，
+//! 有活动才跑一次完整取数并恢复监控。这样不用反重力的时候插件基本不动。
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -10,6 +12,7 @@ use std::time::Duration;
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
+use crate::discovery;
 use crate::model::{Snapshot, Source};
 use crate::quota;
 use crate::store;
@@ -24,6 +27,10 @@ const CLI_POLL_INTERVAL: Duration = Duration::from_secs(300);
 const SLOW_ROUND: Duration = Duration::from_secs(3);
 /// 慢路径失败后的重试间隔，避免每 15 秒拉起一次 `agy`。
 const SLOW_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+/// 待机时多久看一眼活动痕迹。只看几个文件的修改时间，不跑 `ps`。
+const IDLE_TICK: Duration = Duration::from_secs(10);
+/// 待机时也定期全量探一次，防止活动痕迹判定漏掉（日志目录不可读之类）。
+const IDLE_PROBE: Duration = Duration::from_secs(600);
 /// shutdown 时等待后台任务收尾的上限。
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -95,13 +102,32 @@ async fn run(
     let mut announced = false;
     // 反重力关着时会一直重试，同一个原因只打一次日志，免得每 15 秒刷一行。
     let mut last_reason: Option<&'static str> = None;
+    // 待机：反重力没开时只盯活动痕迹，有动静才跑一次完整取数。
+    let mut idle_since: Option<tokio::time::Instant> = None;
+    let mut stamp = discovery::activity_stamp();
     loop {
+        // 待机时每 10 秒看一次日志和会话目录的修改时间；有变化就立刻取数，
+        // 没变化就继续睡，不惊动 `ps`，也不连端口。
+        if let Some(since) = idle_since {
+            tokio::select! {
+                _ = &mut stop => return,
+                _ = tokio::time::sleep(IDLE_TICK) => {}
+            }
+            let now = discovery::activity_stamp();
+            let woke = now != stamp;
+            stamp = now;
+            if !woke && since.elapsed() < IDLE_PROBE {
+                continue;
+            }
+        }
+
         let started = tokio::time::Instant::now();
         let result = quota::collect().await;
         let slow = started.elapsed() >= SLOW_ROUND;
         let delay = match result {
             Ok(mut snapshot) => {
                 last_reason = None;
+                idle_since = None;
                 snapshot.updated_at = Some(unix_now());
                 let from_cli = snapshot.source == Source::Cli;
                 if let Err(err) = store::save(&cache, &snapshot) {
@@ -126,7 +152,17 @@ async fn run(
                 let mut snapshot = tx.borrow().clone();
                 snapshot.failure = Some(failure.reason.to_string());
                 let _ = tx.send_replace(snapshot);
-                if slow {
+
+                let not_running = matches!(
+                    failure.reason,
+                    quota::FAILURE_NOT_RUNNING | quota::FAILURE_NOT_FOUND
+                );
+                if not_running {
+                    // 记下当前痕迹，之后只有更新的活动才会把它叫醒。
+                    idle_since = Some(tokio::time::Instant::now());
+                    stamp = discovery::activity_stamp();
+                    Duration::ZERO
+                } else if slow {
                     SLOW_RETRY_INTERVAL
                 } else {
                     RETRY_INTERVAL.min(poll_interval)
@@ -139,9 +175,11 @@ async fn run(
             let _ = first_done.send(true);
         }
 
-        tokio::select! {
-            _ = &mut stop => return,
-            _ = tokio::time::sleep(delay) => {}
+        if !delay.is_zero() {
+            tokio::select! {
+                _ = &mut stop => return,
+                _ = tokio::time::sleep(delay) => {}
+            }
         }
     }
 }
@@ -174,6 +212,14 @@ mod tests {
             Duration::from_secs(60).max(MIN_POLL_INTERVAL),
             Duration::from_secs(60)
         );
+    }
+
+    #[test]
+    fn idle_ticks_stay_cheap_and_wake_quickly() {
+        // 待机只是看几个文件的修改时间，几秒钟一次也不心疼
+        assert!(IDLE_TICK <= Duration::from_secs(15));
+        // 有活动要立刻恢复监控，不能被兜底探测的周期拖住
+        assert!(IDLE_PROBE > RETRY_INTERVAL);
     }
 
     #[test]
