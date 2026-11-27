@@ -780,6 +780,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "inkbuddy-plugin-command-code"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "inkbuddy-protocol",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "inkbuddy-plugin-lyrics"
 version = "0.1.0"
 dependencies = [

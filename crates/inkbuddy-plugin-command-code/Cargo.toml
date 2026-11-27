@@ -1,0 +1,20 @@
+[package]
+name = "inkbuddy-plugin-command-code"
+description = "First-party inkbuddy plugin: Command Code plan and quota usage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "inkbuddy-plugin-command-code"
+path = "src/main.rs"
+
+[dependencies]
+inkbuddy-protocol = { path = "../inkbuddy-protocol" }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
