@@ -56,7 +56,9 @@ final class EditorPreviewStore: ObservableObject {
             "aspect": aspect
         ]
         request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
-        request.timeoutInterval = 3
+        // 复杂视图首次渲染可能要等插件子进程冷启动（每个最长 8 秒），
+        // 3 秒会静默失败，画布停在加载态直到下一次轮询。
+        request.timeoutInterval = 10
         URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
             guard let data = data,
                   let frame = try? JSONDecoder().decode(PreviewFrame.self, from: data) else {
@@ -214,9 +216,18 @@ struct InkPreviewCanvas: View {
                     .font(.system(size: 12))
                     .foregroundColor(.secondary)
             } else if frame == nil {
-                Text("…")
-                    .font(.system(size: 11))
-                    .foregroundColor(.gray)
+                // 画布还留着上一次的内容，盖一层半透明白 + 转圈，
+                // 切换视图时有明确的「正在加载」，不再像没反应。
+                ZStack {
+                    Color.white.opacity(0.82)
+                    VStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("正在加载…")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                    }
+                }
             }
             if showChrome {
                 ForEach(Array(regions.enumerated()), id: \.offset) { _, region in

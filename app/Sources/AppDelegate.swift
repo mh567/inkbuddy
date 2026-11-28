@@ -93,7 +93,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         } else {
             next = direction > 0 ? 0 : views.count - 1
         }
-        host.switchView(to: views[next].id) { [weak self] in
+        let target = views[next]
+        // 反馈要在点击瞬间出现：名字先换成目标视图、画布先清空，
+        // 网络往返和首次渲染期间都显示「正在加载」。
+        self.preview.prepareSwitch(name: target.name)
+        // 顺手把所有启用的插件拉起来（describe 即懒启动），
+        // 新视图首次渲染就不用等子进程逐个冷启动。
+        host.fetchPlugins()
+        host.switchView(to: target.id) { [weak self] in
             guard let self = self, self.preview.isShown, generation == self.switchGeneration else { return }
             self.preview.setName(self.viewName())
             // 视图已切换，画布立刻换成新布局和它的内容

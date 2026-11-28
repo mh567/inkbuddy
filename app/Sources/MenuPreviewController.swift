@@ -26,7 +26,11 @@ struct MenuPanelView: View {
             HStack(spacing: 6) {
                 Button(action: onPrev) {
                     Image(systemName: "chevron.left")
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.system(size: 12, weight: .semibold))
+                        // 只有图标时点击区跟着图标走，11pt 的箭头几乎点不中；
+                        // 固定一块 32×26 的热区，整块都算按钮。
+                        .frame(width: 32, height: 26)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .help("上一个视图")
@@ -42,13 +46,15 @@ struct MenuPanelView: View {
 
                 Button(action: onNext) {
                     Image(systemName: "chevron.right")
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(width: 32, height: 26)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .help("下一个视图")
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
 
             InkPreviewCanvas(
                 regions: model.regions,
@@ -117,9 +123,9 @@ final class MenuPreviewController: NSObject, NSPopoverDelegate {
         )
         let controller = NSHostingController(rootView: root)
         controller.sizingOptions = []
-        controller.view.frame = NSRect(x: 0, y: 0, width: MenuPanelView.panelWidth, height: 376)
+        controller.view.frame = NSRect(x: 0, y: 0, width: MenuPanelView.panelWidth, height: 384)
         popover.contentViewController = controller
-        popover.contentSize = NSSize(width: MenuPanelView.panelWidth, height: 376)
+        popover.contentSize = NSSize(width: MenuPanelView.panelWidth, height: 384)
         popover.behavior = .transient
         popover.animates = false
         popover.delegate = self
@@ -127,7 +133,7 @@ final class MenuPreviewController: NSObject, NSPopoverDelegate {
 
     /// 在状态栏按钮下方弹出面板并开始取数。
     func show(relativeTo button: NSStatusBarButton) {
-        popover.contentSize = NSSize(width: MenuPanelView.panelWidth, height: 376)
+        popover.contentSize = NSSize(width: MenuPanelView.panelWidth, height: 384)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         startPreview()
     }
@@ -138,6 +144,15 @@ final class MenuPreviewController: NSObject, NSPopoverDelegate {
 
     func popoverDidClose(_ notification: Notification) {
         stopPreview()
+    }
+
+    /// 点击切换后马上调用：名字换成目标视图、画布清空。
+    /// 加载指示立刻出现，不等 POST 返回，也不等新内容算好。
+    func prepareSwitch(name: String) {
+        if model.name != name {
+            model.name = name
+        }
+        store.reset()
     }
 
     /// 视图切换后立刻同步布局与新视图内容，不必等下一次轮询。
