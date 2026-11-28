@@ -131,15 +131,76 @@ pub struct AppState {
     /// Lets a minute-level plugin skip the 500ms render calls that a fast
     /// plugin in the same combined view would otherwise force on it.
     pub render_cache: tokio::sync::Mutex<HashMap<String, (Instant, RenderResult, u64)>>,
-    /// 设备最近一次上报的视口宽高比（f32 bits；0 = 未知）。墨水屏页面每次
-    /// 轮询都会带 vw/vh，控制端的编辑器/预览用它对齐设备真实比例。
-    pub device_aspect: std::sync::atomic::AtomicU32,
-    /// 上报时刻的 Unix 秒。超过时效的上报不再暴露给控制端，
-    /// 防止设备离线后陈旧比例误导编辑器。
-    pub device_aspect_at: std::sync::atomic::AtomicU64,
+    /// 设备表：页面生成的 device id -> 最近一次上报。页面每次轮询都会带
+    /// id 与 vw/vh，控制端的编辑器/预览按设备选择跟随比例；比例留在当次
+    /// 请求里用于帧渲染，全局状态只有这份设备清单。
+    pub devices: tokio::sync::RwLock<HashMap<String, DeviceReport>>,
 }
 
 pub type Shared = Arc<AppState>;
+
+/// 一台设备的最近一次上报。aspect 是该设备实测的视口宽高比（宽/高），
+/// at 是上报时刻的 Unix 秒。
+#[derive(Debug, Clone)]
+pub struct DeviceReport {
+    pub aspect: f32,
+    pub at: u64,
+}
+
+/// 设备表上限：超出后踢掉最久没上报的设备。
+const MAX_DEVICES: usize = 32;
+/// 上报多久以内的设备算在线（/api/health 只暴露这段时间内活跃的设备）。
+const DEVICE_FRESH_SECS: u64 = 60;
+/// 设备表条目保留时长：超过就清掉，长期离线的设备不占内存。
+const DEVICE_RETAIN_SECS: u64 = 86_400;
+/// 比例变化小于这个比例视为抖动：只刷新活跃时间，值保持不变。
+const DEVICE_ASPECT_EPS: f32 = 0.01;
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 设备 id 形态校验：页面生成的是 [A-Za-z0-9-_]，长度上限防滥用。
+fn valid_device_id(id: &str) -> bool {
+    let id = id.trim();
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// 记录一次设备上报。同设备比例变化小于 1% 时只刷新活跃时间，
+/// 控制端跟随的画布比例不会跟着微跳。
+async fn record_device_report(state: &Shared, id: Option<&str>, aspect: f32) {
+    let Some(id) = id else { return };
+    if !valid_device_id(id) {
+        return;
+    }
+    let now = unix_secs();
+    let mut devices = state.devices.write().await;
+    // 长期离线的设备清掉，设备表只保留最近活跃的条目。
+    devices.retain(|_, r| now.saturating_sub(r.at) < DEVICE_RETAIN_SECS);
+    if devices.len() >= MAX_DEVICES && !devices.contains_key(id) {
+        if let Some(oldest) = devices.iter().min_by_key(|(_, r)| r.at).map(|(k, _)| k.clone()) {
+            devices.remove(&oldest);
+        }
+    }
+    match devices.get_mut(id) {
+        Some(report) => {
+            if (report.aspect - aspect).abs() / report.aspect >= DEVICE_ASPECT_EPS {
+                report.aspect = aspect;
+            }
+            report.at = now;
+        }
+        None => {
+            devices.insert(id.to_string(), DeviceReport { aspect, at: now });
+        }
+    }
+}
 
 /// 扩展是否参与渲染：被扫描到、自己声明可用、且用户没有停用。
 fn is_enabled(set: &PluginSet, disabled: &[String], id: &str) -> bool {
@@ -191,6 +252,9 @@ pub struct FrameQuery {
     /// 缺失时按正方形屏幕估算。
     pub vw: Option<f32>,
     pub vh: Option<f32>,
+    /// 页面生成的设备标识：host 按它维护设备表，控制端据此选择
+    /// 跟随哪台设备的实测比例。缺失时只渲染帧，不更新设备表。
+    pub id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -612,20 +676,12 @@ async fn get_frame(State(state): State<Shared>, Query(q): Query<FrameQuery>) -> 
     }
 
     let display = state.display.read().await.clone();
-    // 宽高比 = 视口宽/高。墨水屏页面每次轮询都会带上；拿不到时按正方形估算。
+    // 宽高比 = 视口宽/高，只用于本次帧渲染的字号缩放，写进全局状态的
+    // 只有按设备 id 归档的设备表条目。拿不到时按正方形估算。
     let aspect = match (q.vw, q.vh) {
         (Some(w), Some(h)) if w > 1.0 && h > 1.0 => {
             let a = (w / h).clamp(0.3, 4.0);
-            state
-                .device_aspect
-                .store(a.to_bits(), std::sync::atomic::Ordering::Relaxed);
-            state.device_aspect_at.store(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            record_device_report(&state, q.id.as_deref(), a).await;
             a
         }
         _ => 1.0,
@@ -797,25 +853,30 @@ async fn set_enabled(
 
 async fn get_health(State(state): State<Shared>) -> impl IntoResponse {
     let count = state.plugins.read().await.order.len();
-    // 设备比例只在 60 秒内上报过才暴露：设备离线后陈旧值不应
-    // 继续影响编辑器的画布方向。
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let bits = state.device_aspect.load(std::sync::atomic::Ordering::Relaxed);
-    let at = state.device_aspect_at.load(std::sync::atomic::Ordering::Relaxed);
-    let aspect = if bits != 0 && at > 0 && now.saturating_sub(at) < 60 {
-        Some(f32::from_bits(bits))
-    } else {
-        None
-    };
+    // 只暴露 60 秒内上报过的设备：设备离线后陈旧比例不应继续
+    // 出现在控制端的跟随列表里。
+    let now = unix_secs();
+    let mut rows: Vec<(String, f32, u64)> = state
+        .devices
+        .read()
+        .await
+        .iter()
+        .filter(|(_, r)| now.saturating_sub(r.at) < DEVICE_FRESH_SECS)
+        .map(|(id, r)| (id.clone(), r.aspect, r.at))
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let devices: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(id, aspect, seen)| {
+            serde_json::json!({ "id": id, "aspect": aspect, "seen": seen })
+        })
+        .collect();
     let body = serde_json::json!({
         "status": "ok",
         "plugins": count,
         "protocol": inkbuddy_protocol::PROTOCOL_VERSION,
-        // 设备实测宽高比（宽/高）；设备还没轮询过时为 null。
-        "aspect": aspect,
+        // 在线设备清单：id、实测宽高比（宽/高）、上报时刻的 Unix 秒。
+        "devices": devices,
     });
     ([(header::CACHE_CONTROL, "no-store")], Json(body))
 }
@@ -1042,6 +1103,16 @@ mod tests {
     }
 
     #[test]
+    fn device_ids_are_shape_checked() {
+        assert!(valid_device_id("abc123-XY_9"));
+        assert!(!valid_device_id(""));
+        assert!(!valid_device_id("   "));
+        assert!(!valid_device_id("a/b"));
+        assert!(!valid_device_id(&"x".repeat(65)));
+        assert!(valid_device_id(&"x".repeat(64)));
+    }
+
+    #[test]
     fn title_injection_is_escaped() {
         let escaped = html_escape("</title><script>alert(1)</script>");
         assert!(!escaped.contains("<script>"));
@@ -1128,7 +1199,7 @@ mod tests {
         // 留白写在区块规则里，数值必须与 render::REGION_PAD_* 一致，
         // 否则缩放按不含留白的内容框算，内容又压回边缘。
         let gutter = format!(
-            "padding: {}vh {}vw",
+            "padding: calc({} * var(--uh)) calc({} * var(--uw))",
             crate::render::REGION_PAD_Y,
             crate::render::REGION_PAD_X
         );

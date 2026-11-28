@@ -191,6 +191,12 @@ struct SettingsView: View {
     /// 待确认停用的扩展（alert 确认后真正调用停用接口）
     @ObservedObject private var pending = PendingUninstall()
 
+    /// 在线设备摘要行：台数与各自实测比例。
+    static func deviceSummary(_ devices: [DeviceReport]) -> String {
+        let aspects = devices.map { String(format: "%.2f", $0.aspect) }.joined(separator: " / ")
+        return "\(devices.count) 台在线 · 比例 \(aspects)（60 秒内上报）"
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -208,6 +214,7 @@ struct SettingsView: View {
         .onAppear {
             host.fetchPlugins()
             host.fetchViews()
+            host.refreshDevices()
             updater.check()
         }
         .alert(
@@ -345,15 +352,15 @@ struct SettingsView: View {
                     }
                 )
 
-                if let aspect = host.deviceAspect {
+                if !host.devices.isEmpty {
                     Divider().padding(.leading, 54).padding(.trailing, Theme.rowInset)
                     SettingRow(
                         leading: {
                             IconTile(symbol: "ruler", tone: .brand)
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("设备视口比例")
+                                Text("在线设备")
                                     .font(.system(size: 12, weight: .medium))
-                                Text(String(format: "%.3f · 墨水屏上报", aspect))
+                                Text(Self.deviceSummary(host.devices))
                                     .font(.system(size: 11))
                                     .foregroundColor(.secondary)
                             }

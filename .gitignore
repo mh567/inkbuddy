@@ -9,6 +9,7 @@
 /my-plugins/
 # macOS app bundle build output
 /dist/
+/build-app/
 *.app/
 # Editor and macOS cruft
 .idea/

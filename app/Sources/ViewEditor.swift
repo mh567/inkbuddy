@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 
 /// 区域互斥的最小间隙（百分比）：推开后留一点缝，浮点比较才稳定。
 private let regionGap = 0.01
@@ -542,7 +543,8 @@ extension ViewRegion {
 /// 视图的编辑都发生在这个窗口，设置窗口的视图页只负责列表和应用。
 struct ViewEditorView: View {
     @ObservedObject var model: ViewEditorModel
-    let host: HostService
+    /// ObservedObject：设备清单与跟随目标变化时重算跟随逻辑。
+    @ObservedObject var host: HostService
     /// 内嵌实时预览的内容缓存，随编辑拖拽实时刷新。
     let previewStore: EditorPreviewStore
     /// 预览位的 WebView，由窗口控制器持有，跨开关复用。
@@ -577,7 +579,18 @@ struct ViewEditorView: View {
                 .pickerStyle(.menu)
                 .labelsHidden()
                 .frame(width: 96)
-                .help("画布宽高比：打开编辑器时自动同步设备实测比例；也可手动选择，重启后仍记住")
+                .help("画布宽高比：手动选择后重启仍记住；跟随设备时每秒对齐所选设备的实测比例")
+                Picker("跟随", selection: $host.followDeviceId) {
+                    Text("不跟随").tag(String?.none)
+                    ForEach(host.devices) { device in
+                        Text("跟随 \(Self.shortDeviceId(device.id)) · \(String(format: "%.2f", device.aspect))")
+                            .tag(Optional(device.id))
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .frame(width: 132)
+                .help("跟随某台在线设备的实测宽高比；设备离线时画布保持当前值")
                 Button("取消") { ViewEditorWindowController.shared.close() }
                     .buttonStyle(.borderless)
                     .controlSize(.regular)
@@ -612,6 +625,29 @@ struct ViewEditorView: View {
             }
         }
         .frame(minWidth: 800, minHeight: 540)
+        // 每秒刷新设备清单并对齐跟随目标：设备离线/恢复、比例变化都在
+        // 这里生效。与预览轮询同节奏，设备表请求本身只是一次 /api/health。
+        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+            host.refreshDevices()
+            if let target = host.followTarget {
+                model.applyDeviceAspect(target.aspect)
+            }
+        }
+        // 手动改比例（Picker 里选一个值）时退出跟随，否则下一秒会被
+        // 设备值盖回去。跟随同步写入的值恰好等于目标比例，走不进这个分支。
+        .onChange(of: model.canvasAspect) { _, newValue in
+            if let target = host.followTarget, abs(target.aspect - newValue) < 0.0005 {
+                return
+            }
+            if host.followDeviceId != nil {
+                host.followDeviceId = nil
+            }
+        }
+    }
+
+    /// 设备 id 展示为前 6 位：随机串太长，顶栏放下下。
+    private static func shortDeviceId(_ id: String) -> String {
+        String(id.prefix(6))
     }
 
     private var canSave: Bool {
@@ -1200,12 +1236,8 @@ final class ViewEditorWindowController {
             }
         }
         model.load(view)
-        // 预览与墨水屏同源：优先用设备实测宽高比，打开时再同步一次最新值。
-        // model 是控制器持有的单例，闭包里显式写 self 无循环引用风险。
-        model.applyDeviceAspect(host.deviceAspect)
-        host.refreshDeviceAspect { aspect in
-            self.model.applyDeviceAspect(aspect)
-        }
+        // 画布比例保持上次的手选值；要跟随设备时由顶部「跟随」选择器
+        // 明确指定，选择后每秒对齐那台设备的实测比例。
         let hosting = NSHostingView(rootView: ViewEditorView(model: model, host: host, previewStore: previewStore, previewHolder: previewHolder))
         window.contentView = hosting
         window.setContentSize(NSSize(width: 860, height: 580))

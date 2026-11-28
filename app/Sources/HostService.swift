@@ -103,9 +103,17 @@ struct ViewsState: Codable {
     var views: [SavedView]
 }
 
-/// /api/health 的负载：设备实测宽高比，设备未轮询过时为 null。
+/// /api/health 里的一台在线设备：页面生成的设备 id、实测视口宽高比
+/// （宽/高）、上次上报时刻的 Unix 秒。
+struct DeviceReport: Identifiable, Decodable, Equatable {
+    let id: String
+    let aspect: Double
+    let seen: Double
+}
+
+/// /api/health 的负载：60 秒内上报过的设备清单。
 private struct HealthInfo: Decodable {
-    let aspect: Double?
+    let devices: [DeviceReport]?
 }
 
 /// 管理内嵌的 Rust host 进程。host 通过 INKBUDDY_HOME 读取配置、插件和缓存，
@@ -118,16 +126,28 @@ final class HostService: ObservableObject {
     @Published private(set) var statusText = "服务未启动"
     @Published var plugins: [PluginInfo] = []
     @Published var viewsState: ViewsState = ViewsState(current: nil, views: [])
-    /// 设备最近一次上报的视口宽高比（宽/高）。nil = 设备还没轮询过。
-    @Published private(set) var deviceAspect: Double?
+    /// 60 秒内上报过的设备清单。每台设备各自的比例互不覆盖，
+    /// 控制端明确选择某台后跟随它。nil 等价于空列表。
+    @Published private(set) var devices: [DeviceReport] = []
+    /// 编辑器/菜单预览跟随的设备 id；nil = 画布用手选比例。
+    /// 持久化到 UserDefaults，重启后仍记住。
+    @Published var followDeviceId: String? {
+        didSet {
+            if let id = followDeviceId {
+                UserDefaults.standard.set(id, forKey: "followDeviceId")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "followDeviceId")
+            }
+        }
+    }
     @Published var port: Int {
         didSet {
             UserDefaults.standard.set(port, forKey: "hostPort")
             refreshAddress()
         }
     }
-    /// 设备比例请求序号，旧响应到达时丢弃。
-    private var aspectSeq = 0
+    /// 设备清单请求序号，旧响应到达时丢弃。
+    private var devicesSeq = 0
     private var process: Process?
     private var lanHost = "127.0.0.1"
     private let fileManager = FileManager.default
@@ -141,6 +161,7 @@ final class HostService: ObservableObject {
     private init() {
         let defaults = UserDefaults.standard
         port = defaults.object(forKey: "hostPort") as? Int ?? 9012
+        followDeviceId = defaults.string(forKey: "followDeviceId")
     }
 
     // MARK: - 生命周期
@@ -356,7 +377,7 @@ final class HostService: ObservableObject {
                 if let http = response as? HTTPURLResponse, http.statusCode == 200, let data = data {
                     self.statusText = "运行中"
                     if let health = try? JSONDecoder().decode(HealthInfo.self, from: data) {
-                        self.deviceAspect = health.aspect
+                        self.devices = health.devices ?? []
                     }
                 } else {
                     self.statusText = "服务未响应，请检查端口"
@@ -365,23 +386,29 @@ final class HostService: ObservableObject {
         }.resume()
     }
 
-    /// 拉取设备实测宽高比，完成后主线程回调。编辑器打开时同步一次，
-    /// 保证预览的字号缩放行为与墨水屏完全一致（同一 aspect 参与 fit 计算）。
-    func refreshDeviceAspect(completion: ((Double?) -> Void)? = nil) {
+    /// 拉取在线设备清单，完成后主线程回调。编辑器与菜单预览用它
+    /// 刷新设备列表并跟随所选设备的实测比例。
+    func refreshDevices(completion: (([DeviceReport]) -> Void)? = nil) {
         guard let url = URL(string: "http://127.0.0.1:\(port)/api/health") else { return }
-        aspectSeq += 1
-        let seq = aspectSeq
+        devicesSeq += 1
+        let seq = devicesSeq
         var request = URLRequest(url: url)
         request.timeoutInterval = 2
         URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
-            let aspect = data.flatMap { try? JSONDecoder().decode(HealthInfo.self, from: $0).aspect }
+            let devices = (data.flatMap { try? JSONDecoder().decode(HealthInfo.self, from: $0).devices }) ?? []
             DispatchQueue.main.async {
-                // 设备比例是全局共享状态，旧响应晚到会把新值覆盖回去。
-                guard let self = self, seq == self.aspectSeq else { return }
-                self.deviceAspect = aspect
-                completion?(aspect)
+                // 设备清单是全局共享状态，旧响应晚到会把新列表覆盖回去。
+                guard let self = self, seq == self.devicesSeq else { return }
+                self.devices = devices
+                completion?(devices)
             }
         }.resume()
+    }
+
+    /// 当前跟随目标：所选设备仍在在线清单里时返回它的上报；
+    /// 设备离线时返回 nil，调用方保持当前值。
+    var followTarget: DeviceReport? {
+        devices.first { $0.id == followDeviceId }
     }
 
     private func detectLANHost() -> String {

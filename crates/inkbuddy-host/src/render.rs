@@ -354,14 +354,16 @@ pub struct Frame {
 }
 
 /// 区域内容四周的留白。与 web/ink.html 里 `.frame-canvas .plugin-section`
-/// 的 `padding: 3vh 4vw` 对应：竖排布局有 #wrap 的留白，区域布局没有，
+/// 的 `padding: calc(3 * var(--uh)) calc(4 * var(--uw))`（非旋转时等于
+/// 3vh 4vw）对应：竖排布局有 #wrap 的留白，区域布局没有，
 /// 就加在区块自己身上。单位分别是屏幕高度、宽度的百分比。
 /// 缩放按扣掉留白后的可用高度与宽度算：空间不够时缩小字号，内容不压回边缘。
 pub(crate) const REGION_PAD_Y: f32 = 3.0;
 pub(crate) const REGION_PAD_X: f32 = 4.0;
 
 /// 区域内容的缩放系数：宽度与高度两个约束取较小值。
-/// - 宽度：字号以 vw 定义，可用宽度占屏幕的比例决定文字相对区域的填充比例。
+/// - 宽度：字号以 calc(N * var(--uw)) 定义（非旋转时等于 vw），可用宽度
+///   占屏幕的比例决定文字相对区域的填充比例。
 ///   可用宽度扣掉左右留白，换行位置因此与留白前一致。
 /// - 高度：内容装不下时自动缩小。`content_vh` 是内容按基准字号需要的
 ///   高度（屏幕高度的百分比，已含宽高比换算），fit = 可用高度 / 内容高度；
@@ -454,6 +456,8 @@ fn css_safe_id(id: &str) -> bool {
 /// 这是接入规范的一部分：插件只要用标准块/行类型输出内容，
 /// 缩放就自动生效，插件自身不需要处理尺寸。区域都要留白，
 /// 缩放必然小于 1，所以每个区域都会有一组规则。
+/// 尺寸走页面的 --uw/--uh 单位（非旋转时等于 vw/vh），设备手动旋转后
+/// 这些覆盖值随内容坐标系一起对调，字号仍然相对内容宽高。
 /// text_mode（纯文本显示模式）下标题块用更大的基准字号，与页面 CSS 一致。
 fn section_overrides(plugin: &str, scale: f32, text_mode: bool) -> String {
     let m = |v: f32| fmt_pct(v * scale);
@@ -462,30 +466,36 @@ fn section_overrides(plugin: &str, scale: f32, text_mode: bool) -> String {
     // HTML 块里的自定义样式用这个变量跟着区域一起缩放。
     css.push_str(&format!("{sel} {{ --ink-scale: {}; }}", fmt_pct(scale)));
     css.push_str(&format!(
-        "{sel} .line-primary {{ font-size: {}vw; margin: {}vh 0; }}",
+        "{sel} .line-primary {{ font-size: calc({} * var(--uw)); margin: calc({} * var(--uh)) 0; }}",
         m(6.2),
         m(2.5)
     ));
-    css.push_str(&format!("{sel} .line-normal {{ font-size: {}vw; }}", m(5.0)));
     css.push_str(&format!(
-        "{sel} .line-muted {{ font-size: {}vw; min-height: {}vw; }}",
+        "{sel} .line-normal {{ font-size: calc({} * var(--uw)); }}",
+        m(5.0)
+    ));
+    css.push_str(&format!(
+        "{sel} .line-muted {{ font-size: calc({} * var(--uw)); min-height: calc({} * var(--uw)); }}",
         m(5.0),
         m(7.0)
     ));
     css.push_str(&format!(
-        "{sel} .line-reading {{ font-size: {}vw; margin: {}vh 0 {}vh; }}",
+        "{sel} .line-reading {{ font-size: calc({} * var(--uw)); margin: calc({} * var(--uh)) 0 calc({} * var(--uh)); }}",
         m(4.6),
         m(-2.4),
         m(1.8)
     ));
-    css.push_str(&format!("{sel} .kv {{ font-size: {}vw; }}", m(4.0)));
     css.push_str(&format!(
-        "{sel} .block + .block {{ margin-top: {}vh; }}",
+        "{sel} .kv {{ font-size: calc({} * var(--uw)); }}",
+        m(4.0)
+    ));
+    css.push_str(&format!(
+        "{sel} .block + .block {{ margin-top: calc({} * var(--uh)); }}",
         m(2.0)
     ));
     let title = if text_mode { 5.0 } else { 3.8 };
     css.push_str(&format!(
-        "{sel} .block-text p {{ font-size: {}vw; }}",
+        "{sel} .block-text p {{ font-size: calc({} * var(--uw)); }}",
         m(title)
     ));
     css
@@ -811,10 +821,10 @@ mod tests {
         let layout = vec![Region { plugin: "clock".into(), x: 0.0, y: 0.0, w: 50.0, h: 50.0, variant: None }];
         let normal = render_frame(&parts, 500, Some(&layout));
         let text = render_frame_with_mode(&parts, 500, Some(&layout), true, 1.0);
-        // 50% 宽的区域扣掉左右留白是 42%：3.8vw × 0.42 ≈ 1.6vw（常规），
-        // 5vw × 0.42 = 2.1vw（纯文本模式）。
-        assert!(normal.html.contains(".block-text p { font-size: 1.6vw;"));
-        assert!(text.html.contains(".block-text p { font-size: 2.1vw;"));
+        // 50% 宽的区域扣掉左右留白是 42%：3.8 × 0.42 ≈ 1.6（常规），
+        // 5 × 0.42 = 2.1（纯文本模式）。单位是页面的 --uw（非旋转时等于 vw）。
+        assert!(normal.html.contains(".block-text p { font-size: calc(1.6 * var(--uw));"));
+        assert!(text.html.contains(".block-text p { font-size: calc(2.1 * var(--uw));"));
     }
 
     #[test]
@@ -908,12 +918,12 @@ mod tests {
         assert!(frame.html.contains("left:0%;top:0%;width:60%;height:100%"));
         assert!(frame.html.contains("left:60%;top:0%;width:40%;height:100%"));
         // 字号覆盖由服务端算好直接输出（60 宽 → 可用 52%，40 宽 → 可用 32%）：
-        // 6.2vw × 0.52 = 3.22vw，6.2vw × 0.32 = 1.98vw。
+        // 6.2 × 0.52 = 3.22，6.2 × 0.32 = 1.98，单位是页面的 --uw。
         assert!(frame.html.contains(
-            ".frame-canvas section[data-plugin=\"lyrics\"] .line-primary { font-size: 3.22vw;"
+            ".frame-canvas section[data-plugin=\"lyrics\"] .line-primary { font-size: calc(3.22 * var(--uw));"
         ));
         assert!(frame.html.contains(
-            ".frame-canvas section[data-plugin=\"clock\"] .line-primary { font-size: 1.98vw;"
+            ".frame-canvas section[data-plugin=\"clock\"] .line-primary { font-size: calc(1.98 * var(--uw));"
         ));
         // 同一份系数也下发给 HTML 块的自定义样式
         assert!(frame.html.contains("--ink-scale: 0.52;"));

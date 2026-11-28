@@ -118,8 +118,7 @@ async fn main() -> Result<()> {
         plugin_dirs: dirs,
         last_scan: tokio::sync::Mutex::new(std::time::Instant::now()),
         render_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-        device_aspect: std::sync::atomic::AtomicU32::new(0),
-        device_aspect_at: std::sync::atomic::AtomicU64::new(0),
+        devices: tokio::sync::RwLock::new(std::collections::HashMap::new()),
     });
     let app = server::router(state.clone());
 
