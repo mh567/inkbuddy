@@ -57,9 +57,13 @@ final class EditorPreviewStore: ObservableObject {
         request.timeoutInterval = 3
         URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
             guard let data = data,
-                  let frame = try? JSONDecoder().decode(PreviewFrame.self, from: data) else { return }
+                  let frame = try? JSONDecoder().decode(PreviewFrame.self, from: data) else {
+                return
+            }
             DispatchQueue.main.async {
-                guard let self = self, seq == self.requestSeq else { return }
+                guard let self = self, seq == self.requestSeq else {
+                    return
+                }
                 // 文档相同时不更新，避免 WebView 重载导致预览闪一下。
                 if self.frame?.signature != frame.signature {
                     self.frame = frame
@@ -72,27 +76,99 @@ final class EditorPreviewStore: ObservableObject {
 /// AppKit 包装：把 host 生成的页面交给 WebKit 渲染。
 /// 这是预览与墨水屏一致的根源——两边跑的是同一份 HTML 和同一份 CSS，
 /// 控制端不再自己复刻字号、块间距和 HTML 块样式。
+///
+/// 只有第一帧走 `loadHTMLString`，之后换成在文档内替换 `#frame`。
+/// 整页重载会把 WebView 清成白页再重绘，菜单展开期间 WebKit 不重绘，
+/// 白页就会一直停在那里；替换 DOM 不会清空图层，画面不会闪。
 private struct InkPreviewWebView: NSViewRepresentable {
     let frame: PreviewFrame?
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    final class Coordinator {
+    final class Coordinator: NSObject, WKNavigationDelegate {
         var signature: String = ""
+        /// 是否已经载入过整页；载入过之后只替换 `#frame`。
+        var loaded = false
+        weak var web: WKWebView?
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        }
+
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            loaded = false
+        }
+
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            loaded = false
+        }
+
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            loaded = false
+            signature = ""
+        }
     }
 
     func makeNSView(context: Context) -> WKWebView {
         let web = WKWebView()
         web.allowsBackForwardNavigationGestures = false
         web.allowsMagnification = false
+        web.navigationDelegate = context.coordinator
+        context.coordinator.web = web
         return web
     }
 
     func updateNSView(_ web: WKWebView, context: Context) {
-        guard let frame = frame else { return }
+        guard let frame = frame else {
+            // 取数被清空（菜单关掉等）：下次拿到内容时强制刷新一次，
+            // 免得签名相同就跳过，画布停在空白上。
+            context.coordinator.signature = ""
+            return
+        }
         guard context.coordinator.signature != frame.signature else { return }
         context.coordinator.signature = frame.signature
+
+        guard context.coordinator.loaded else {
+            web.loadHTMLString(frame.html, baseURL: nil)
+            context.coordinator.loaded = true
+            return
+        }
+
+        // 文档已经在，替换内容区即可，不重载整页。
+        guard let payload = Self.jsString(frame.html) else { return }
+        let script = """
+        (function () {
+          var next = new DOMParser().parseFromString(\(payload), 'text/html');
+          var incoming = next.getElementById('frame');
+          var current = document.getElementById('frame');
+          if (!incoming || !current) { return false; }
+          current.replaceWith(document.importNode(incoming, true));
+          if (next.body) { document.body.className = next.body.className; }
+          return true;
+        })()
+        """
+        let coordinator = context.coordinator
+        web.evaluateJavaScript(script) { result, _ in
+            // 出错或页面里找不到 #frame 时退回整页重载，下次重新走载入分支。
+            if !(result as? Bool ?? false) {
+                Self.reload(web, coordinator: coordinator, frame: frame)
+            }
+        }
+    }
+
+    /// 整页重载：替换 DOM 走不通时的兜底，并重新记下当前签名。
+    private static func reload(_ web: WKWebView, coordinator: Coordinator, frame: PreviewFrame) {
+        coordinator.signature = frame.signature
+        coordinator.loaded = true
         web.loadHTMLString(frame.html, baseURL: nil)
+    }
+
+    /// 把一段文本编码成可以嵌进 JS 的字面量。
+    private static func jsString(_ text: String) -> String? {
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: text,
+            options: .fragmentsAllowed
+        ) else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 }
 
