@@ -67,16 +67,6 @@ final class ViewEditorModel: ObservableObject {
     @Published var regions: [ViewRegion] = []
     /// 画布上选中的区域下标
     @Published var selected: Int?
-    /// 画布宽高比（宽/高）。区域是百分比定位，切换比例时排版结果直接
-    /// 对应实际设备；默认 16:9，可切换到墨水屏常见的竖屏比例。
-    /// 持久化到 UserDefaults：升级或重启后仍记住上次选择。
-    @Published var canvasAspect: Double =
-        UserDefaults.standard.object(forKey: "editorCanvasAspect") as? Double ?? 16.0 / 9.0 {
-        didSet {
-            UserDefaults.standard.set(canvasAspect, forKey: "editorCanvasAspect")
-        }
-    }
-
     /// 手势起始时的区域快照。DragGesture 的 translation 是从手势开始的
     /// 累计值，若每次 onChanged 都叠加到「当前区域」，位移会被重复积分，
     /// 拖拽越拖越快。因此手势开始时记一次快照，之后都从快照算绝对位置。
@@ -140,26 +130,6 @@ final class ViewEditorModel: ObservableObject {
         ("3:4", 3.0 / 4.0),
         ("9:16", 9.0 / 16.0),
     ]
-
-    /// 下拉框选项：画布比例来自设备实测时不在常用列表里，动态补一个
-    /// 「设备 x.xx」项，避免选中值没有对应 tag 显示为空。
-    var aspectPickerOptions: [(String, Double)] {
-        if Self.aspectOptions.contains(where: { abs($0.1 - canvasAspect) < 0.005 }) {
-            return Self.aspectOptions
-        }
-        return [("设备 \(String(format: "%.2f", canvasAspect))", canvasAspect)]
-            + Self.aspectOptions
-    }
-
-    /// 用设备实测的宽高比覆盖画布比例。服务端字号缩放用的就是设备上报的
-    /// 这个值，编辑器/预览对齐它后，预览缩多少、墨水屏就缩多少。
-    /// 设备还没轮询过（nil）时保持手选值。
-    func applyDeviceAspect(_ aspect: Double?) {
-        guard let aspect = aspect, aspect > 0.1 else { return }
-        if abs(canvasAspect - aspect) > 0.001 {
-            canvasAspect = aspect
-        }
-    }
 
     var isNew: Bool { viewId == "new" }
 
@@ -571,26 +541,7 @@ struct ViewEditorView: View {
                         .font(.system(size: 11))
                         .foregroundColor(.green)
                 }
-                Picker("比例", selection: $model.canvasAspect) {
-                    ForEach(Array(model.aspectPickerOptions.enumerated()), id: \.offset) { _, option in
-                        Text(option.0).tag(option.1)
-                    }
-                }
-                .pickerStyle(.menu)
-                .labelsHidden()
-                .frame(width: 96)
-                .help("画布宽高比：手动选择后重启仍记住；跟随设备时每秒对齐所选设备的实测比例")
-                Picker("跟随", selection: $host.followDeviceId) {
-                    Text("不跟随").tag(String?.none)
-                    ForEach(host.devices) { device in
-                        Text("跟随 \(device.displayLabel)")
-                            .tag(Optional(device.id))
-                    }
-                }
-                .pickerStyle(.menu)
-                .labelsHidden()
-                .frame(width: 132)
-                .help("跟随某台在线设备的实测宽高比；设备离线时画布保持当前值")
+                canvasRatioMenu
                 Button("取消") { ViewEditorWindowController.shared.close() }
                     .buttonStyle(.borderless)
                     .controlSize(.regular)
@@ -625,22 +576,47 @@ struct ViewEditorView: View {
             }
         }
         .frame(minWidth: 800, minHeight: 540)
-        // 每秒刷新设备清单并对齐跟随目标：设备离线/恢复、比例变化都在
-        // 这里生效。与预览轮询同节奏，设备表请求本身只是一次 /api/health。
+        .onAppear { host.refreshDevices() }
         .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
             host.refreshDevices()
-            if let target = host.followTarget {
-                model.applyDeviceAspect(target.aspect)
-            }
         }
-        // 手动改比例（Picker 里选一个值）时退出跟随，否则下一秒会被
-        // 设备值盖回去。跟随同步写入的值恰好等于目标比例，走不进这个分支。
-        .onChange(of: model.canvasAspect) { _, newValue in
-            if let target = host.followTarget, abs(target.aspect - newValue) < 0.0005 {
-                return
+    }
+
+    private var canvasRatioMenu: some View {
+        Menu {
+            Section("跟随设备") {
+                if host.followDeviceId != nil && host.followTarget == nil {
+                    Button(host.canvasRatioLabel) {}.disabled(true)
+                } else if host.devices.isEmpty {
+                    Button("暂无在线设备") {}.disabled(true)
+                }
+                ForEach(host.devices) { device in
+                    ratioOption(device.displayLabel, selected: host.followDeviceId == device.id) {
+                        host.followDevice(device)
+                    }
+                }
             }
-            if host.followDeviceId != nil {
-                host.followDeviceId = nil
+            Section("手动预设") {
+                ForEach(ViewEditorModel.aspectOptions, id: \.0) { title, aspect in
+                    ratioOption(title, selected: host.followDeviceId == nil && host.canvasAspect == aspect) {
+                        host.selectManualAspect(aspect)
+                    }
+                }
+            }
+        } label: {
+            Text("画布比例 · \(host.canvasRatioLabel)")
+                .lineLimit(1)
+        }
+        .fixedSize()
+        .help("选择要跟随的设备，或为编辑器和菜单栏预览固定一个比例")
+    }
+
+    private func ratioOption(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            if selected {
+                Label(title, systemImage: "checkmark")
+            } else {
+                Text(title)
             }
         }
     }
@@ -820,7 +796,7 @@ struct ViewEditorView: View {
 
     /// 画布按设定的宽高比适配可用空间（与实时预览一致）。
     private func fittedCanvasSize(in available: CGSize) -> CGSize {
-        let aspect = CGFloat(max(model.canvasAspect, 0.1))
+        let aspect = CGFloat(max(host.canvasAspect, 0.1))
         var w = available.width
         var h = w / aspect
         if h > available.height {
@@ -1142,7 +1118,7 @@ struct ViewEditorView: View {
             Text("实时预览")
                 .font(.system(size: 12, weight: .medium))
                 .foregroundColor(.secondary)
-            EditorPreviewView(model: model, store: previewStore, holder: previewHolder)
+            EditorPreviewView(model: model, host: host, store: previewStore, holder: previewHolder)
         }
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color(NSColor.controlBackgroundColor)))
@@ -1231,8 +1207,6 @@ final class ViewEditorWindowController {
             }
         }
         model.load(view)
-        // 画布比例保持上次的手选值；要跟随设备时由顶部「跟随」选择器
-        // 明确指定，选择后每秒对齐那台设备的实测比例。
         let hosting = NSHostingView(rootView: ViewEditorView(model: model, host: host, previewStore: previewStore, previewHolder: previewHolder))
         window.contentView = hosting
         window.setContentSize(NSSize(width: 860, height: 580))

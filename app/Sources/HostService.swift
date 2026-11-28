@@ -111,10 +111,10 @@ struct DeviceReport: Identifiable, Decodable, Equatable {
     let seen: Double
 
     var displayLabel: String {
-        "\(id.prefix(6)) · \(aspectLabel)"
+        "\(id.prefix(6)) · \(Self.formatAspect(aspect))"
     }
 
-    private var aspectLabel: String {
+    static func formatAspect(_ aspect: Double) -> String {
         guard (0.25...4.0).contains(aspect) else { return "比例未知" }
 
         // 从最小分母开始，优先显示误差在 0.5% 内的简单整数比。
@@ -138,7 +138,7 @@ private struct HealthInfo: Decodable {
 /// 管理内嵌的 Rust host 进程。host 通过 INKBUDDY_HOME 读取配置、插件和缓存，
 /// 全部放在 app 专属的 Application Support 目录，和旧项目解耦。
 final class HostService: ObservableObject {
-    static let shared = HostService()
+    static let shared = HostService(defaults: .standard)
 
     @Published private(set) var running = false
     @Published private(set) var lanAddress = ""
@@ -148,14 +148,16 @@ final class HostService: ObservableObject {
     /// 60 秒内上报过的设备清单。每台设备各自的比例互不覆盖，
     /// 控制端明确选择某台后跟随它。nil 等价于空列表。
     @Published private(set) var devices: [DeviceReport] = []
-    /// 编辑器/菜单预览跟随的设备 id；nil = 画布用手选比例。
-    /// 持久化到 UserDefaults，重启后仍记住。
-    @Published var followDeviceId: String? {
+    /// 编辑器和菜单栏预览共用的比例；跟随设备离线时保留最后一次上报值。
+    @Published private(set) var canvasAspect: Double {
+        didSet { defaults.set(canvasAspect, forKey: "editorCanvasAspect") }
+    }
+    @Published private(set) var followDeviceId: String? {
         didSet {
             if let id = followDeviceId {
-                UserDefaults.standard.set(id, forKey: "followDeviceId")
+                defaults.set(id, forKey: "followDeviceId")
             } else {
-                UserDefaults.standard.removeObject(forKey: "followDeviceId")
+                defaults.removeObject(forKey: "followDeviceId")
             }
         }
     }
@@ -170,6 +172,7 @@ final class HostService: ObservableObject {
     private var process: Process?
     private var lanHost = "127.0.0.1"
     private let fileManager = FileManager.default
+    private let defaults: UserDefaults
 
     private var appSupport: URL {
         let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -177,10 +180,14 @@ final class HostService: ObservableObject {
     }
     private var homeURL: URL { appSupport }
 
-    private init() {
-        let defaults = UserDefaults.standard
+    init(defaults: UserDefaults) {
+        self.defaults = defaults
+        let savedDevice = defaults.string(forKey: "followDeviceId")
+        // 旧版可能只在菜单栏预览中收到跟随设备的比例。
+        let menuAspect = savedDevice == nil ? nil : defaults.object(forKey: "menuPreviewAspect") as? Double
         port = defaults.object(forKey: "hostPort") as? Int ?? 9012
-        followDeviceId = defaults.string(forKey: "followDeviceId")
+        followDeviceId = savedDevice
+        canvasAspect = defaults.object(forKey: "editorCanvasAspect") as? Double ?? menuAspect ?? 16.0 / 9.0
     }
 
     // MARK: - 生命周期
@@ -231,10 +238,11 @@ final class HostService: ObservableObject {
             lanHost = detectLANHost()
             lanAddress = buildAddress(host: lanHost)
             // 等端口就绪后探测状态并拉取扩展/视图列表
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.8) { [weak self] in
-                self?.probe()
-                self?.fetchPlugins()
-                self?.fetchViews()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                guard let self, self.process === task else { return }
+                self.probe()
+                self.fetchPlugins()
+                self.fetchViews()
             }
         } catch {
             statusText = "服务启动失败：\(error.localizedDescription)"
@@ -266,6 +274,8 @@ final class HostService: ObservableObject {
     func stop() {
         process?.terminate()
         process = nil
+        devicesSeq += 1
+        updateDevices([])
         running = false
         statusText = "服务已停止"
     }
@@ -388,15 +398,17 @@ final class HostService: ObservableObject {
     // MARK: - 状态探测
 
     private func probe() {
+        let seq = devicesSeq
+        let probedProcess = process
         var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/api/health")!)
         request.timeoutInterval = 2
         URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
             DispatchQueue.main.async {
-                guard let self = self else { return }
+                guard let self, self.process === probedProcess else { return }
                 if let http = response as? HTTPURLResponse, http.statusCode == 200, let data = data {
                     self.statusText = "运行中"
-                    if let health = try? JSONDecoder().decode(HealthInfo.self, from: data) {
-                        self.devices = health.devices ?? []
+                    if seq == self.devicesSeq, let health = try? JSONDecoder().decode(HealthInfo.self, from: data) {
+                        self.updateDevices(health.devices ?? [])
                     }
                 } else {
                     self.statusText = "服务未响应，请检查端口"
@@ -418,7 +430,7 @@ final class HostService: ObservableObject {
             DispatchQueue.main.async {
                 // 设备清单是全局共享状态，旧响应晚到会把新列表覆盖回去。
                 guard let self = self, seq == self.devicesSeq else { return }
-                self.devices = devices
+                self.updateDevices(devices)
                 completion?(devices)
             }
         }.resume()
@@ -428,6 +440,30 @@ final class HostService: ObservableObject {
     /// 设备离线时返回 nil，调用方保持当前值。
     var followTarget: DeviceReport? {
         devices.first { $0.id == followDeviceId }
+    }
+
+    var canvasRatioLabel: String {
+        if let device = followTarget { return "跟随 \(device.displayLabel)" }
+        let ratio = DeviceReport.formatAspect(canvasAspect)
+        if let id = followDeviceId { return "\(id.prefix(6)) · \(ratio)（离线）" }
+        return "手动 \(ratio)"
+    }
+
+    func selectManualAspect(_ aspect: Double) {
+        followDeviceId = nil
+        canvasAspect = aspect
+    }
+
+    func followDevice(_ device: DeviceReport) {
+        followDeviceId = device.id
+        canvasAspect = followTarget?.aspect ?? device.aspect
+    }
+
+    func updateDevices(_ reports: [DeviceReport]) {
+        devices = reports
+        if let aspect = followTarget?.aspect, canvasAspect != aspect {
+            canvasAspect = aspect
+        }
     }
 
     private func detectLANHost() -> String {

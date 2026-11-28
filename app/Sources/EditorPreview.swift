@@ -315,6 +315,7 @@ struct InkPreviewCanvas: View {
 /// 渲染交给 InkPreviewCanvas，与菜单栏共用同一套页面。
 struct EditorPreviewView: View {
     @ObservedObject var model: ViewEditorModel
+    @ObservedObject var host: HostService
     @ObservedObject var store: EditorPreviewStore
     let holder: PreviewWebViewHolder
 
@@ -324,7 +325,7 @@ struct EditorPreviewView: View {
         InkPreviewCanvas(
             regions: model.regions,
             frame: store.frame,
-            aspect: model.canvasAspect,
+            aspect: host.canvasAspect,
             holder: holder
         )
         .padding(10)
@@ -332,10 +333,11 @@ struct EditorPreviewView: View {
         .onReceive(model.$regions.debounce(for: .milliseconds(250), scheduler: DispatchQueue.main)) { _ in
             fetchNow()
         }
+        .onChange(of: host.canvasAspect) { _, _ in fetchNow() }
         .onReceive(timer) { _ in fetchNow() }
     }
 
     private func fetchNow() {
-        store.fetch(regions: model.regions, aspect: model.canvasAspect)
+        store.fetch(regions: model.regions, aspect: host.canvasAspect)
     }
 }

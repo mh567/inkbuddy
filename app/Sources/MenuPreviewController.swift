@@ -1,17 +1,9 @@
 import AppKit
 import SwiftUI
 
-/// 弹出面板的预览状态：当前视图的区域几何、画布宽高比、视图名。
+/// 弹出面板的预览状态：当前视图的区域几何和视图名。
 final class MenuPreviewModel: ObservableObject {
     @Published var regions: [ViewRegion] = []
-    /// 画布宽高比。未跟随设备时保持上次的值（持久化）；跟随目标变化时
-    /// 由轮询刷新。
-    @Published var aspect: Double =
-        UserDefaults.standard.object(forKey: "menuPreviewAspect") as? Double ?? 16.0 / 9.0 {
-        didSet {
-            UserDefaults.standard.set(aspect, forKey: "menuPreviewAspect")
-        }
-    }
     @Published var name: String = "未选择视图"
 }
 
@@ -50,6 +42,7 @@ private struct HoverButtonStyle: ButtonStyle {
 /// /api/preview/html 生成的页面。这里只负责头部、底部按钮和轮询生命周期。
 struct MenuPanelView: View {
     @ObservedObject var model: MenuPreviewModel
+    @ObservedObject var host: HostService
     @ObservedObject var store: EditorPreviewStore
     let holder: PreviewWebViewHolder
 
@@ -96,7 +89,7 @@ struct MenuPanelView: View {
             InkPreviewCanvas(
                 regions: model.regions,
                 frame: store.frame,
-                aspect: model.aspect,
+                aspect: host.canvasAspect,
                 holder: holder,
                 showChrome: false
             )
@@ -163,6 +156,7 @@ final class MenuPreviewController: NSObject, NSPopoverDelegate {
         super.init()
         let root = MenuPanelView(
             model: model,
+            host: HostService.shared,
             store: store,
             holder: previewHolder,
             onPrev: { [weak self] in self?.onPrev?() },
@@ -226,9 +220,6 @@ final class MenuPreviewController: NSObject, NSPopoverDelegate {
         let timer = Timer(timeInterval: 1, target: self, selector: #selector(poll), userInfo: nil, repeats: true)
         RunLoop.main.add(timer, forMode: .common)
         pollTimer = timer
-        // 与编辑器一致：跟随所选设备的实测比例（跟随目标在 HostService
-        // 里全局共享）。先拉一次设备清单，之后每秒轮询都会刷新。
-        HostService.shared.refreshDevices()
     }
 
     /// 面板关闭时调用：停掉轮询、清空缓存，并把 WebView 里的页面卸掉。
@@ -249,18 +240,6 @@ final class MenuPreviewController: NSObject, NSPopoverDelegate {
         let regions: [ViewRegion] = current?.regions ?? stackedRegions(from: host)
         if model.regions != regions {
             model.regions = regions
-        }
-        // 跟随目标：明确选中的设备在线时优先；未选设备且只有一台在线时
-        // 自动跟随它（单设备场景约等于自动对齐），多台在线时不猜，保持
-        // 当前值，画布比例稳定。明确选中的设备离线时同样保持当前值。
-        let target: DeviceReport?
-        if host.followDeviceId != nil {
-            target = host.followTarget
-        } else {
-            target = host.devices.count == 1 ? host.devices.first : nil
-        }
-        if let target = target, model.aspect != target.aspect {
-            model.aspect = target.aspect
         }
     }
 
@@ -283,8 +262,9 @@ final class MenuPreviewController: NSObject, NSPopoverDelegate {
 
     @objc private func poll() {
         guard isActive else { return }
-        HostService.shared.refreshDevices()
+        let host = HostService.shared
+        host.refreshDevices()
         syncLayout()
-        store.fetch(regions: model.regions, aspect: model.aspect)
+        store.fetch(regions: model.regions, aspect: host.canvasAspect)
     }
 }
