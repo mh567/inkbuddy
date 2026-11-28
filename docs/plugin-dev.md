@@ -35,8 +35,8 @@ description = "显示当前时间"
 command = "./my-clock"        # 相对路径按 plugin.toml 所在目录解析
 
 [runtime]
-enabled = true
-default_on = false            # 访问页面时不带参数，默认不显示
+enabled = true                # 设为 false 时这款插件在本机不可用，设置窗口显示「已停用」
+default_on = false            # 宿主首次启动按它决定默认启用与否；false 的进停用列表
 timeout_ms = 2000
 args = []
 ```
@@ -149,6 +149,11 @@ args = []
 
 这是自定义标记的入口。`html` 插入页面前会经过白名单净化：只保留 `div/span/p/b/i/em/strong/br/ul/li/code/pre/h1-h3` 这类有限标签，属性里只允许 `class`，剥离所有 `on*` 事件属性以及 `script`、`iframe`、`javascript:`，白名单外的标签转义成普通文本。自定义脚本和内联样式无法透传，只在确实需要自定义标记时使用。
 
+净化器之前，宿主会从标记里读两个约定属性，读完即剥离，它们不会出现在页面上：
+
+- 根元素上的 `data-ink-height`：内容按基准字号需要的高度，单位是「正方形屏幕下的 vh」。不声明时宿主按 0 估算，矮区域里字号不会缩小，内容可能被相邻区域压住。额度类插件分别声明了 17、23、41，可以当参考。
+- 叶子元素上的 `data-ink-role`：`primary|normal|muted|reading`，控制端结构化预览里这一行的视觉权重，缺省按 `muted`。
+
 ## 内容缩放规范
 
 视图模式下，每个插件占一个屏幕区域，区域里的内容由主程序自动等比缩放，插件不需要（也不应该）自己处理尺寸：
@@ -167,7 +172,7 @@ http://<mac-ip>:9012/?plugins=lyrics
 http://<mac-ip>:9012/?plugins=lyrics,clock
 ```
 
-不带参数时使用所有 `default_on = true` 的插件。显示内容优先跟随当前视图（见仓库 README「视图」）；没有选中视图时按 URL 参数组合。选择放在 URL 里，浏览器无需保存状态，同一台主机可以给不同墨水屏设备配不同组合。
+不带参数时使用所有启用的插件（按扫描顺序竖排等分）。显示内容优先跟随当前视图（见仓库 README「视图」）；没有选中视图时按 URL 参数组合。选择放在 URL 里，浏览器无需保存状态，同一台主机可以给不同墨水屏设备配不同组合。
 
 ## 最小可用插件（Python）
 

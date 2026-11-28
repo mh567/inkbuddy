@@ -189,6 +189,7 @@ pub enum Block {
     ///   "vh on a square screen" units, used to scale content into a region.
     /// - `data-ink-role="primary|normal|muted|reading"` on a leaf element:
     ///   visual weight of that line in the structured text preview.
+    ///
     /// Both are optional. Any plugin can use them; the host does not know
     /// any plugin's class names.
     Html { html: String },

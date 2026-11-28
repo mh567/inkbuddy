@@ -32,6 +32,8 @@ final class EditorPreviewStore: ObservableObject {
     func fetch(regions: [ViewRegion], aspect: Double) {
         guard !regions.isEmpty,
               let url = URL(string: "http://127.0.0.1:\(port)/api/preview/html") else {
+            // 没有区域就作废在途请求：晚到的响应不该把刚清空的画布又填回去。
+            requestSeq += 1
             DispatchQueue.main.async { self.frame = nil }
             return
         }

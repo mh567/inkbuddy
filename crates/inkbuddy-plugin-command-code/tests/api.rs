@@ -127,7 +127,7 @@ async fn serve_one(
     let (status, extra, body) = responder(&path);
     let mut response = format!(
         "HTTP/1.1 {status} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-        body.as_bytes().len()
+        body.len()
     );
     for (key, value) in extra {
         response.push_str(&format!("{key}: {value}\r\n"));

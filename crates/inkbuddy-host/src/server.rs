@@ -215,7 +215,7 @@ struct PluginSummary {
     name: String,
     version: String,
     description: String,
-    /// 用户开关：不在停用列表里就是启用。停用的扩展不渲染、子进程也停掉。
+    /// 会不会渲染：没被用户停用，且清单允许。停用的扩展不渲染、子进程也停掉。
     enabled: bool,
     /// manifest 里的构建级开关；为 false 时这款扩展在本机不可用。
     available: bool,
@@ -710,7 +710,9 @@ async fn get_plugins(State(state): State<Shared>) -> impl IntoResponse {
         };
         out.push(PluginSummary {
             id,
-            enabled: true,
+            // describe 过就说明不在停用列表里；这里再看一眼清单开关，
+            // 让「已停用」在界面上始终等于「不会渲染」。
+            enabled: m.runtime.enabled,
             available: m.runtime.enabled,
             name: i
                 .as_ref()

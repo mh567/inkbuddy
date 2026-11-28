@@ -204,9 +204,10 @@ mod tests {
     fn stylesheet_defines_antigravity_icon() {
         let css = include_str!("../../../web/ink.html");
         assert!(css.contains(".quota-mark-ag"), "missing .quota-mark-ag");
+        // 反色靠通配的 body.invert .quota-mark，不需要每个图标单写一条。
         assert!(
-            css.contains("body.invert .quota-mark-ag"),
-            "missing body.invert .quota-mark-ag"
+            css.contains("body.invert .quota-mark { filter: invert(1); }"),
+            "missing invert rule for quota marks"
         );
     }
 
