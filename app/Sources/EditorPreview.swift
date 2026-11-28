@@ -84,56 +84,73 @@ final class EditorPreviewStore: ObservableObject {
 /// 只有第一帧走 `loadHTMLString`，之后换成在文档内替换 `#frame`。
 /// 整页重载会把 WebView 清成白页再重绘，菜单展开期间 WebKit 不重绘，
 /// 白页就会一直停在那里；替换 DOM 不会清空图层，画面不会闪。
-private struct InkPreviewWebView: NSViewRepresentable {
-    let frame: PreviewFrame?
+/// 每个预览位一个长寿命 WebView：懒创建、跨开关复用。
+///
+/// 站点的渲染状态（已载入的签名）也放在这里，视图重新挂载后可以直接
+/// 继续走文档内替换，不必整页重载。站点关闭时调用 unload() 把页面卸掉，
+/// WebContent 进程的占用会从 ~120 MB 掉回 ~11 MB——之前面板每开一次就
+/// 新建一个 WebView，旧的 WebContent 进程不回收，空闲进程越攒越多。
+final class PreviewWebViewHolder: NSObject, WKNavigationDelegate {
+    /// 全站共享一份配置。macOS 12 起 WebKit 自动按 app 复用进程，
+    /// 进程池 API 已废弃；共享配置主要是让偏好设置只有一份。
+    private static let sharedConfiguration = WKWebViewConfiguration()
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
-
-    final class Coordinator: NSObject, WKNavigationDelegate {
-        var signature: String = ""
-        /// 是否已经载入过整页；载入过之后只替换 `#frame`。
-        var loaded = false
-        weak var web: WKWebView?
-
-        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        }
-
-        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-            loaded = false
-        }
-
-        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-            loaded = false
-        }
-
-        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-            loaded = false
-            signature = ""
-        }
-    }
-
-    func makeNSView(context: Context) -> WKWebView {
-        let web = WKWebView()
+    private(set) lazy var webView: WKWebView = {
+        let web = WKWebView(frame: .zero, configuration: Self.sharedConfiguration)
         web.allowsBackForwardNavigationGestures = false
         web.allowsMagnification = false
-        web.navigationDelegate = context.coordinator
-        context.coordinator.web = web
+        web.navigationDelegate = self
         return web
+    }()
+
+    /// 已载入内容的签名；空串表示当前没有有效内容，下一帧走整页载入。
+    var signature: String = ""
+    /// 是否已载入过整页；载入过之后只替换 `#frame`。
+    var loaded = false
+
+    /// 站点关闭时卸载内容，释放 WebContent 里的页面内存。
+    func unload() {
+        signature = ""
+        loaded = false
+        webView.loadHTMLString("<!DOCTYPE html><html><body></body></html>", baseURL: nil)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        loaded = false
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        loaded = false
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        loaded = false
+        signature = ""
+    }
+}
+
+private struct InkPreviewWebView: NSViewRepresentable {
+    let holder: PreviewWebViewHolder
+    let frame: PreviewFrame?
+
+    func makeNSView(context: Context) -> WKWebView {
+        // 复用 holder 里的同一个 WebView，重挂载不再新建 WebContent 进程。
+        holder.webView
     }
 
     func updateNSView(_ web: WKWebView, context: Context) {
         guard let frame = frame else {
             // 取数被清空（菜单关掉等）：下次拿到内容时强制刷新一次，
             // 免得签名相同就跳过，画布停在空白上。
-            context.coordinator.signature = ""
+            holder.signature = ""
             return
         }
-        guard context.coordinator.signature != frame.signature else { return }
-        context.coordinator.signature = frame.signature
+        guard holder.signature != frame.signature else { return }
+        holder.signature = frame.signature
 
-        guard context.coordinator.loaded else {
+        guard holder.loaded else {
             web.loadHTMLString(frame.html, baseURL: nil)
-            context.coordinator.loaded = true
+            holder.loaded = true
             return
         }
 
@@ -150,19 +167,18 @@ private struct InkPreviewWebView: NSViewRepresentable {
           return true;
         })()
         """
-        let coordinator = context.coordinator
         web.evaluateJavaScript(script) { result, _ in
             // 出错或页面里找不到 #frame 时退回整页重载，下次重新走载入分支。
             if !(result as? Bool ?? false) {
-                Self.reload(web, coordinator: coordinator, frame: frame)
+                Self.reload(web, holder: holder, frame: frame)
             }
         }
     }
 
     /// 整页重载：替换 DOM 走不通时的兜底，并重新记下当前签名。
-    private static func reload(_ web: WKWebView, coordinator: Coordinator, frame: PreviewFrame) {
-        coordinator.signature = frame.signature
-        coordinator.loaded = true
+    private static func reload(_ web: WKWebView, holder: PreviewWebViewHolder, frame: PreviewFrame) {
+        holder.signature = frame.signature
+        holder.loaded = true
         web.loadHTMLString(frame.html, baseURL: nil)
     }
 
@@ -182,6 +198,8 @@ struct InkPreviewCanvas: View {
     let regions: [ViewRegion]
     let frame: PreviewFrame?
     let aspect: Double
+    /// 本预览位的 WebView；由调用方持有，跨开关复用。
+    let holder: PreviewWebViewHolder
 
     /// 是否画出区域边框与扩展名标签。编辑器里用来对照编辑画布，菜单栏里关掉。
     var showChrome: Bool = true
@@ -210,7 +228,7 @@ struct InkPreviewCanvas: View {
     private func canvas(size: CGSize) -> some View {
         ZStack {
             Rectangle().fill(Color.white)
-            InkPreviewWebView(frame: frame)
+            InkPreviewWebView(holder: holder, frame: frame)
             if regions.isEmpty {
                 Text("画布上还没有扩展")
                     .font(.system(size: 12))
@@ -284,6 +302,7 @@ struct InkPreviewCanvas: View {
 struct EditorPreviewView: View {
     @ObservedObject var model: ViewEditorModel
     @ObservedObject var store: EditorPreviewStore
+    let holder: PreviewWebViewHolder
 
     private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -291,7 +310,8 @@ struct EditorPreviewView: View {
         InkPreviewCanvas(
             regions: model.regions,
             frame: store.frame,
-            aspect: model.canvasAspect
+            aspect: model.canvasAspect,
+            holder: holder
         )
         .padding(10)
         .onAppear(perform: fetchNow)

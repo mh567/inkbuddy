@@ -44,6 +44,7 @@ private struct HoverButtonStyle: ButtonStyle {
 struct MenuPanelView: View {
     @ObservedObject var model: MenuPreviewModel
     @ObservedObject var store: EditorPreviewStore
+    let holder: PreviewWebViewHolder
 
     var onPrev: () -> Void
     var onNext: () -> Void
@@ -89,6 +90,7 @@ struct MenuPanelView: View {
                 regions: model.regions,
                 frame: store.frame,
                 aspect: model.aspect,
+                holder: holder,
                 showChrome: false
             )
             .frame(height: 300)
@@ -136,6 +138,8 @@ final class MenuPreviewController: NSObject, NSPopoverDelegate {
     private let popover = NSPopover()
     private let store = EditorPreviewStore(port: HostService.shared.port)
     private let model = MenuPreviewModel()
+    /// 面板的预览 WebView：长寿命，跨开关复用，关闭时只卸内容。
+    private let previewHolder = PreviewWebViewHolder()
 
     private var pollTimer: Timer?
     /// 面板是否处于预览周期：异步响应回来时据此判断是否已过期。
@@ -153,6 +157,7 @@ final class MenuPreviewController: NSObject, NSPopoverDelegate {
         let root = MenuPanelView(
             model: model,
             store: store,
+            holder: previewHolder,
             onPrev: { [weak self] in self?.onPrev?() },
             onNext: { [weak self] in self?.onNext?() },
             onSettings: { [weak self] in self?.onSettings?() },
@@ -221,12 +226,15 @@ final class MenuPreviewController: NSObject, NSPopoverDelegate {
         }
     }
 
-    /// 面板关闭时调用：停掉轮询并清空缓存，避免下次打开闪现旧内容。
+    /// 面板关闭时调用：停掉轮询、清空缓存，并把 WebView 里的页面卸掉。
+    /// 不销毁 WebView 本身（下次打开接着用），但 WebContent 里的页面内存
+    /// 会随之释放，空闲时占用从 ~120 MB 掉回 ~11 MB。
     private func stopPreview() {
         isActive = false
         pollTimer?.invalidate()
         pollTimer = nil
         store.reset()
+        previewHolder.unload()
     }
 
     /// 重读 host 当前的视图与插件状态。

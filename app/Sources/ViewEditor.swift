@@ -470,6 +470,8 @@ struct ViewEditorView: View {
     let host: HostService
     /// 内嵌实时预览的内容缓存，随编辑拖拽实时刷新。
     let previewStore: EditorPreviewStore
+    /// 预览位的 WebView，由窗口控制器持有，跨开关复用。
+    let previewHolder: PreviewWebViewHolder
 
     private let paletteWidth: CGFloat = 190
 
@@ -1034,7 +1036,7 @@ struct ViewEditorView: View {
             Text("实时预览")
                 .font(.system(size: 12, weight: .medium))
                 .foregroundColor(.secondary)
-            EditorPreviewView(model: model, store: previewStore)
+            EditorPreviewView(model: model, store: previewStore, holder: previewHolder)
         }
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color(NSColor.controlBackgroundColor)))
@@ -1094,6 +1096,8 @@ final class ViewEditorWindowController {
     private let model = ViewEditorModel()
     /// 内嵌实时预览的内容缓存：预览画在编辑窗口右侧，不再单独开窗。
     private let previewStore = EditorPreviewStore(port: HostService.shared.port)
+    /// 预览的 WebView：长寿命复用，关窗时卸载内容而不是销毁视图。
+    private let previewHolder = PreviewWebViewHolder()
 
     /// 打开编辑器。view 为 nil 时新建。同时关掉上一次的预览窗口，
     /// 避免上一个视图的预览留在屏幕上。
@@ -1127,7 +1131,7 @@ final class ViewEditorWindowController {
         host.refreshDeviceAspect { aspect in
             self.model.applyDeviceAspect(aspect)
         }
-        let hosting = NSHostingView(rootView: ViewEditorView(model: model, host: host, previewStore: previewStore))
+        let hosting = NSHostingView(rootView: ViewEditorView(model: model, host: host, previewStore: previewStore, previewHolder: previewHolder))
         window.contentView = hosting
         window.setContentSize(NSSize(width: 860, height: 580))
         NSApp.setActivationPolicy(.regular)
@@ -1149,5 +1153,6 @@ final class ViewEditorWindowController {
             window?.contentView = NSView()
         }
         previewStore.reset()
+        previewHolder.unload()
     }
 }
