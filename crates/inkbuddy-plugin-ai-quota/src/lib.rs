@@ -2,9 +2,11 @@
 //!
 //! 协议循环与页面渲染由后续任务接入。
 
+pub mod activity;
 pub mod app_server;
 pub mod formatting;
 pub mod locate;
 pub mod model;
 pub mod render;
 pub mod rpc;
+pub mod store;

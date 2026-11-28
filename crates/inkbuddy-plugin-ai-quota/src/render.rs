@@ -6,6 +6,11 @@
 use crate::formatting::{escape_html, plan_label, reset_countdown, width_class};
 use crate::model::{QuotaSnapshot, QuotaWindow};
 
+/// 数据年龄超过这个秒数就附「更新于」提示，与浅眠/失败标记无关。
+/// 覆盖重启后首帧直接渲染缓存快照的情况：缓存里的数据看起来像实时的，
+/// 实际可能是几天前读到的。与浅眠判定窗口同长。
+const STALE_AFTER_SECS: i64 = 600;
+
 /// 渲染完整的额度看板；快照未就绪或失败时降级为提示块。
 pub fn render_html(snapshot: &QuotaSnapshot, now: i64) -> String {
     // 登出与找不到 CLI 是终态：此时旧百分比会误导用户，整块换成提示。
@@ -44,7 +49,12 @@ pub fn render_html(snapshot: &QuotaSnapshot, now: i64) -> String {
     out.push_str(&render_row("本周", snapshot.weekly.as_ref(), now));
     out.push_str("</div>");
 
-    if snapshot.failure.is_some() {
+    // 有失败原因、处于浅眠或数据已经太旧时提示数据的新旧：浅眠期间
+    // 监控暂停，重启后首帧直接用缓存，数字都是上次读到的，倒计时仍在走。
+    let stale = snapshot.failure.is_some()
+        || snapshot.idle
+        || now.saturating_sub(updated_at) >= STALE_AFTER_SECS;
+    if stale {
         out.push_str(&format!(
             "\n<div class=\"quota-stale\">{}</div>",
             escape_html(&stale_text(updated_at, now))
@@ -114,6 +124,7 @@ mod tests {
             reset_credits: Some(2),
             updated_at: Some(now),
             failure: None,
+            idle: false,
         }
     }
 
@@ -214,6 +225,37 @@ mod tests {
         assert!(html.contains("Codex 未登录"), "{html}");
         assert!(!html.contains("quota-row"), "{html}");
         assert!(!html.contains("更新于"), "{html}");
+    }
+
+    #[test]
+    fn idle_snapshot_keeps_rows_and_shows_age_without_failure() {
+        // 浅眠时监控暂停但没有错误：看板照常显示，附「更新于」提示。
+        let now = 1_700_000_000_i64;
+        let mut snapshot = sample_snapshot();
+        snapshot.updated_at = Some(now - 7 * 60);
+        snapshot.idle = true;
+        let html = render_html(&snapshot, now);
+        assert!(html.contains("quota-row"), "{html}");
+        assert!(html.contains("更新于 7 分钟前"), "{html}");
+        assert_eq!(snapshot.failure, None);
+    }
+
+    #[test]
+    fn old_cached_data_shows_age_even_when_active() {
+        // 重启后首帧直接渲染缓存快照：数据太旧时要附「更新于」提示，
+        // 即使既没浅眠也没失败，否则旧数字看起来像实时数据。
+        let now = 1_700_000_000_i64;
+        let mut snapshot = sample_snapshot();
+        snapshot.updated_at = Some(now - 25 * 3600);
+        snapshot.idle = false;
+        snapshot.failure = None;
+        let html = render_html(&snapshot, now);
+        assert!(html.contains("quota-row"), "{html}");
+        assert!(html.contains("更新于 25 小时前"), "{html}");
+
+        // 阈值以内的新数据不带提示。
+        snapshot.updated_at = Some(now - 60);
+        assert!(!render_html(&snapshot, now).contains("更新于"));
     }
 
     #[test]

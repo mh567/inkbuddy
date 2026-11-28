@@ -150,6 +150,8 @@ macOS 菜单栏 app 的视图编辑窗口：左侧从已启用的扩展添加区
 | `command-code` | Command Code 套餐与 5 小时、周、月额度用量 | [crates/inkbuddy-plugin-command-code/README.md](crates/inkbuddy-plugin-command-code/README.md) |
 | `antigravity-quota` | Antigravity 的 Gemini、Claude/GPT 两组 5 小时与周额度，读本机语言服务器 | [crates/inkbuddy-plugin-antigravity-quota/README.md](crates/inkbuddy-plugin-antigravity-quota/README.md) |
 
+额度类插件在对应的 AI 没被使用时会自动休眠：额度只在服务端重置时变化，持续监控没有意义。休眠期间插件收掉 app-server 子进程（或不再探测语言服务器），只看本地活动痕迹；页面继续显示上次的额度数字并附「更新于 X 分钟前」，开始使用或定时器到期（服务端额度重置）时自动恢复监控。各插件的判定与唤醒条件见各自的说明文件。
+
 ## 写自己的插件
 
 插件是独立可执行程序，用 stdin/stdout 上的行分隔 JSON 和主程序通信，可以用任何语言写，插件进程崩溃后下一次请求会自动拉起。完整协议、内容模型、Python 最小示例见 [docs/plugin-dev.md](docs/plugin-dev.md)。

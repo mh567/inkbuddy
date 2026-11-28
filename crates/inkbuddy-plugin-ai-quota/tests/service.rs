@@ -150,10 +150,23 @@ async fn shutdown_quickly(service: QuotaService) {
     );
 }
 
+/// 每个测试独立的落盘路径，避免互相覆盖，也不碰真实的 `~/.inkbuddy`。
+/// 计数器保证同 tag 的并发测试也拿到不同路径：集成测试默认多线程
+/// 跑在同一进程里，pid 相同，只靠 tag 区分会撞到同一个文件。
+fn cache_path(tag: &str) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "inkbuddy-ai-quota-cache-{}-{seq}-{}",
+        tag,
+        std::process::id()
+    ))
+}
+
 #[tokio::test]
 async fn service_reads_plan_windows_and_credits() {
     let fake = fake_codex("normal");
-    let service = QuotaService::start(fake.bin.clone(), Duration::from_secs(30));
+    let service = QuotaService::start(fake.bin.clone(), Duration::from_secs(30), cache_path("t"));
 
     let snapshot = service.wait_first(Duration::from_secs(5)).await;
 
@@ -174,7 +187,7 @@ async fn service_reads_plan_windows_and_credits() {
 #[tokio::test]
 async fn service_applies_rate_limit_notification_without_polling() {
     let fake = fake_codex("notify");
-    let service = QuotaService::start(fake.bin.clone(), Duration::from_secs(30));
+    let service = QuotaService::start(fake.bin.clone(), Duration::from_secs(30), cache_path("t"));
 
     let first = service.wait_first(Duration::from_secs(5)).await;
     assert_eq!(first.weekly.as_ref().map(|w| w.used_percent), Some(51));
@@ -200,7 +213,7 @@ async fn service_applies_rate_limit_notification_without_polling() {
 #[tokio::test]
 async fn service_reports_unauthenticated_account() {
     let fake = fake_codex("unauthenticated");
-    let service = QuotaService::start(fake.bin.clone(), Duration::from_secs(30));
+    let service = QuotaService::start(fake.bin.clone(), Duration::from_secs(30), cache_path("t"));
 
     let snapshot = service.wait_first(Duration::from_secs(3)).await;
     assert_eq!(snapshot.failure.as_deref(), Some(LOGIN_REQUIRED));
@@ -211,7 +224,7 @@ async fn service_reports_unauthenticated_account() {
 #[tokio::test]
 async fn service_reports_auth_error_as_login_required() {
     let fake = fake_codex("auth_error");
-    let service = QuotaService::start(fake.bin.clone(), Duration::from_secs(30));
+    let service = QuotaService::start(fake.bin.clone(), Duration::from_secs(30), cache_path("t"));
 
     let snapshot = service.wait_first(Duration::from_secs(3)).await;
     assert_eq!(snapshot.failure.as_deref(), Some(LOGIN_REQUIRED));
@@ -222,7 +235,7 @@ async fn service_reports_auth_error_as_login_required() {
 #[tokio::test]
 async fn service_ignores_noise_lines() {
     let fake = fake_codex("noise");
-    let service = QuotaService::start(fake.bin.clone(), Duration::from_secs(30));
+    let service = QuotaService::start(fake.bin.clone(), Duration::from_secs(30), cache_path("t"));
 
     let snapshot = service.wait_first(Duration::from_secs(5)).await;
 
@@ -237,7 +250,7 @@ async fn service_ignores_noise_lines() {
 #[tokio::test]
 async fn service_rejects_server_request_with_method_not_found() {
     let fake = fake_codex("server_request");
-    let service = QuotaService::start(fake.bin.clone(), Duration::from_secs(30));
+    let service = QuotaService::start(fake.bin.clone(), Duration::from_secs(30), cache_path("t"));
 
     // 假服务只有在收到 -32601 时才会把 plan 改成 reject-ok；
     // 看到 reject-ok 才能证明服务确实回了「方法不支持」而不是只没崩。
@@ -266,7 +279,7 @@ async fn service_rejects_server_request_with_method_not_found() {
 #[tokio::test]
 async fn service_notices_logout_while_running() {
     let fake = fake_codex("logout");
-    let service = QuotaService::start(fake.bin.clone(), Duration::from_secs(5));
+    let service = QuotaService::start(fake.bin.clone(), Duration::from_secs(5), cache_path("logout"));
 
     let first = service.wait_first(Duration::from_secs(5)).await;
     assert_eq!(first.plan.as_deref(), Some("plus"));
@@ -302,7 +315,7 @@ async fn service_reports_failure_quickly_when_limits_missing() {
     // 只回 account/read、不回额度：首轮不能按 10 秒请求超时空等，
     // 应按 5 秒的 pair 上限尽早给出失败提示。
     let fake = fake_codex("no_limits");
-    let service = QuotaService::start(fake.bin.clone(), Duration::from_secs(30));
+    let service = QuotaService::start(fake.bin.clone(), Duration::from_secs(30), cache_path("t"));
 
     let started = Instant::now();
     let snapshot = service.wait_first(Duration::from_secs(8)).await;
@@ -328,10 +341,38 @@ async fn service_reports_missing_binary() {
     ));
     let missing = dir.join("definitely-missing-codex");
 
-    let service = QuotaService::start(missing, Duration::from_secs(30));
+    let service = QuotaService::start(missing, Duration::from_secs(30), cache_path("missing"));
     let snapshot = service.wait_first(Duration::from_secs(3)).await;
 
     assert_eq!(snapshot.failure.as_deref(), Some("未找到 Codex CLI"));
+
+    shutdown_quickly(service).await;
+}
+
+#[tokio::test]
+async fn unauthenticated_service_marks_itself_idle() {
+    // 未登录转浅眠：快照带上 idle 标记，页面随之显示「更新于 X 分钟前」。
+    let fake = fake_codex("unauthenticated");
+    let service =
+        QuotaService::start(fake.bin.clone(), Duration::from_secs(30), cache_path("idle"));
+
+    let snapshot = service.wait_first(Duration::from_secs(3)).await;
+    assert_eq!(snapshot.failure.as_deref(), Some(LOGIN_REQUIRED));
+
+    let mut rx = service.snapshot();
+    let idle = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if rx.borrow().idle {
+                return true;
+            }
+            if rx.changed().await.is_err() {
+                return false;
+            }
+        }
+    })
+    .await
+    .expect("3 秒内应转入浅眠");
+    assert!(idle);
 
     shutdown_quickly(service).await;
 }

@@ -11,6 +11,7 @@ use inkbuddy_plugin_ai_quota::app_server::{self, QuotaService};
 use inkbuddy_plugin_ai_quota::locate;
 use inkbuddy_plugin_ai_quota::model::QuotaSnapshot;
 use inkbuddy_plugin_ai_quota::render::render_html;
+use inkbuddy_plugin_ai_quota::store;
 use inkbuddy_protocol::{
     Block, Method, PluginInfo, RenderResult, Request, Response, PROTOCOL_VERSION,
 };
@@ -34,7 +35,9 @@ struct Board {
 impl Board {
     fn new() -> Self {
         Self {
-            service: locate::codex_from_env().map(|bin| QuotaService::start(bin, POLL_INTERVAL)),
+            // 服务启动时先把落盘快照放进通道，浅眠或重启期间页面显示上次的数字。
+            service: locate::codex_from_env()
+                .map(|bin| QuotaService::start(bin, POLL_INTERVAL, store::default_path())),
             served_first: false,
         }
     }

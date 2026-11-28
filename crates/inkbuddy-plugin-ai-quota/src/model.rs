@@ -1,7 +1,9 @@
 //! 额度快照的数据结构。
 
+use serde::{Deserialize, Serialize};
+
 /// 一个额度窗口（5 小时或一周）。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuotaWindow {
     /// 已用百分比，0..=100。
     pub used_percent: u32,
@@ -20,6 +22,9 @@ pub struct QuotaSnapshot {
     pub reset_credits: Option<u64>,
     pub updated_at: Option<i64>,
     pub failure: Option<String>,
+    /// 浅眠标记：true 时页面附加「更新于 X 分钟前」，提示监控已暂停。
+    /// 运行时状态，不入盘。
+    pub idle: bool,
 }
 
 #[cfg(test)]

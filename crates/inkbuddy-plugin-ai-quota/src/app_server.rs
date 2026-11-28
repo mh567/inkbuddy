@@ -1,8 +1,10 @@
-//! Codex app-server 客户端：后台握手、读取额度、失败重连，向外发布快照。
+//! Codex app-server 客户端：后台握手、读取额度、失败重连、浅眠，向外发布快照。
 //!
 //! 服务在启动时立刻 spawn 一个 tokio 任务，调用方拿到的是 `watch` 通道，
-//! 不阻塞宿主。任务内部再启动 `codex app-server --listen stdio://`，失败时
-//! 按 1 秒到 30 秒的退避重连，并保留最后一次成功快照。
+//! 不阻塞宿主。任务内部再启动 `codex app-server --listen stdio://`；Codex
+//! 没在用时把子进程收掉进入浅眠，只看本地活动痕迹，有动静或定时器到期
+//! 才重新拉起读一轮。快照每次读到都落盘，浅眠与重启期间页面显示上次
+//! 的数字加「更新于 X 分钟前」。
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -18,6 +20,7 @@ use crate::model::QuotaSnapshot;
 use crate::rpc::{
     apply_account, apply_rate_limits, is_auth_error, parse_message, RpcMessage, LOGIN_REQUIRED,
 };
+use crate::{activity, store};
 
 /// 单次 JSON-RPC 请求的等待上限。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -31,6 +34,17 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const STABLE_SESSION: Duration = Duration::from_secs(30);
 /// 轮询间隔下限，避免 0 或过小的值造成忙循环。
 const MIN_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// 活动痕迹连续多久没变化后进入浅眠：把 app-server 子进程收掉，
+/// 只留插件本体定期看痕迹。10 分钟盖住了两次 Codex 调用之间的思考间隙。
+const IDLE_AFTER: Duration = Duration::from_secs(600);
+/// 浅眠期间检查活动痕迹的间隔。只看几个文件的修改时间，代价可忽略。
+const IDLE_TICK: Duration = Duration::from_secs(10);
+/// 浅眠期间多久主动醒一次读额度：额度重置发生在服务端，本地没活动
+/// 也要周期性读一轮，否则数字停在旧值、倒计时过期。
+const IDLE_WAKE: Duration = Duration::from_secs(1800);
+/// 连续多少轮会话没读到任何数据后转入浅眠：离线等持续故障时
+/// 反复拉起 app-server 纯属浪费，活动痕迹变化或定时唤醒会把它拉起。
+const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 
 const CLIENT_NAME: &str = "inkbuddy-ai-quota";
 const CLIENT_TITLE: &str = "InkBuddy AI Quota";
@@ -66,12 +80,13 @@ pub struct QuotaService {
 }
 
 impl QuotaService {
-    /// 立刻启动后台任务，不阻塞调用方。
-    pub fn start(codex_bin: PathBuf, poll_interval: Duration) -> Self {
+    /// 先把上次落盘的快照放进通道（页面第一帧直接有数字），再启动后台任务。
+    pub fn start(codex_bin: PathBuf, poll_interval: Duration, cache: PathBuf) -> Self {
         let poll_interval = clamp_poll_interval(poll_interval);
-        let (tx, rx) = watch::channel(QuotaSnapshot::default());
+        let cached = store::load(&cache).unwrap_or_default();
+        let (tx, rx) = watch::channel(cached);
         let (stop, stop_rx) = oneshot::channel();
-        let handle = tokio::spawn(run(codex_bin, poll_interval, tx, stop_rx));
+        let handle = tokio::spawn(run(codex_bin, poll_interval, cache, tx, stop_rx));
         Self {
             rx,
             stop: Some(stop),
@@ -185,39 +200,118 @@ fn partial_pair(
 enum SessionEnd {
     /// 收到 stop 信号。
     Stopped,
-    /// 连接结束；`reset_backoff` 表示连接存活 ≥30 秒，用于重置退避。
-    Ended { reset_backoff: bool },
+    /// 连接结束；`reset_backoff` 表示连接存活 ≥30 秒，用于重置退避；
+    /// `succeeded` 表示本轮会话至少成功读到过一次数据。
+    Ended {
+        reset_backoff: bool,
+        succeeded: bool,
+    },
+    /// 进入浅眠：本地没活动，子进程已随会话结束被回收，
+    /// 只等活动痕迹变化或定时器到期。
+    Idle,
+}
+
+/// 浅眠等待的结局。
+enum WakeReason {
+    /// 本地出现新活动痕迹：恢复完整监控。
+    Activity,
+    /// 定时唤醒到期：读一轮额度再睡。
+    Timer,
+    /// 收到 stop 信号。
+    Stopped,
+}
+
+/// 浅眠等待：每 `IDLE_TICK` 看一次活动痕迹，相对入眠时的基线有变化
+/// 就返回；定时器到期也返回。返回时基线由调用方重新采样。
+async fn idle_wait(stop: &mut oneshot::Receiver<()>) -> WakeReason {
+    let baseline = activity::stamp();
+    let entered = Instant::now();
+    loop {
+        tokio::select! {
+            _ = &mut *stop => return WakeReason::Stopped,
+            _ = tokio::time::sleep(IDLE_TICK) => {}
+        }
+        if activity::stamp() != baseline {
+            return WakeReason::Activity;
+        }
+        if entered.elapsed() >= IDLE_WAKE {
+            return WakeReason::Timer;
+        }
+    }
+}
+
+/// 把当前快照标记成浅眠，页面随之显示「更新于 X 分钟前」。
+fn mark_idle(tx: &watch::Sender<QuotaSnapshot>) {
+    let mut snapshot = tx.borrow().clone();
+    snapshot.idle = true;
+    let _ = tx.send_replace(snapshot);
 }
 
 async fn run(
     codex_bin: PathBuf,
     poll_interval: Duration,
+    cache: PathBuf,
     tx: watch::Sender<QuotaSnapshot>,
     mut stop: oneshot::Receiver<()>,
 ) {
     let mut backoff = INITIAL_BACKOFF;
+    let mut brief = false;
+    let mut consecutive_failures = 0u32;
     loop {
-        let reset_backoff = match run_session(&codex_bin, poll_interval, &tx, &mut stop).await {
+        let end = run_session(&codex_bin, poll_interval, &cache, &tx, &mut stop, brief).await;
+        match end {
             SessionEnd::Stopped => return,
-            SessionEnd::Ended { reset_backoff } => reset_backoff,
-        };
-        if reset_backoff {
-            backoff = INITIAL_BACKOFF;
+            SessionEnd::Idle => {
+                brief = false;
+                // 转浅眠前的失败循环已把退避推到封顶；唤醒后的重试
+                // 从最短退避重新开始，否则用户刚回来就要等满 30 秒。
+                backoff = INITIAL_BACKOFF;
+                mark_idle(&tx);
+                match idle_wait(&mut stop).await {
+                    WakeReason::Stopped => return,
+                    // Activity 时 brief 已复位，完整会话重新监控。
+                    WakeReason::Activity => {}
+                    WakeReason::Timer => brief = true,
+                }
+            }
+            SessionEnd::Ended {
+                reset_backoff,
+                succeeded,
+            } => {
+                brief = false;
+                consecutive_failures = if succeeded { 0 } else { consecutive_failures + 1 };
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    consecutive_failures = 0;
+                    mark_idle(&tx);
+                    match idle_wait(&mut stop).await {
+                        WakeReason::Stopped => return,
+                        WakeReason::Activity => {}
+                        WakeReason::Timer => brief = true,
+                    }
+                } else {
+                    if reset_backoff {
+                        backoff = INITIAL_BACKOFF;
+                    }
+                    tokio::select! {
+                        _ = &mut stop => return,
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = next_backoff(backoff);
+                }
+            }
         }
-        tokio::select! {
-            _ = &mut stop => return,
-            _ = tokio::time::sleep(backoff) => {}
-        }
-        backoff = next_backoff(backoff);
     }
 }
 
 async fn run_session(
     codex_bin: &Path,
     poll_interval: Duration,
+    cache: &Path,
     tx: &watch::Sender<QuotaSnapshot>,
     stop: &mut oneshot::Receiver<()>,
+    brief: bool,
 ) -> SessionEnd {
+    let mut succeeded = false;
     let mut command = Command::new(codex_bin);
     command
         .arg("app-server")
@@ -237,9 +331,8 @@ async fn run_session(
             };
             eprintln!("ai-quota: 启动 codex app-server 失败: {err}");
             publish_failure(tx, message);
-            return SessionEnd::Ended {
-                reset_backoff: false,
-            };
+            // 拉不起来本身就该休眠：定时唤醒或活动痕迹变化会再试。
+            return SessionEnd::Idle;
         }
     };
     let started = Instant::now();
@@ -249,6 +342,7 @@ async fn run_session(
         publish_failure(tx, FAILURE_READ);
         return SessionEnd::Ended {
             reset_backoff: is_stable(started.elapsed()),
+            succeeded,
         };
     };
     let Some(stdout) = child.stdout.take() else {
@@ -256,6 +350,7 @@ async fn run_session(
         publish_failure(tx, FAILURE_READ);
         return SessionEnd::Ended {
             reset_backoff: is_stable(started.elapsed()),
+            succeeded,
         };
     };
 
@@ -264,6 +359,7 @@ async fn run_session(
         lines: BufReader::new(stdout).lines(),
         snapshot: tx.borrow().clone(),
         tx,
+        cache: cache.to_path_buf(),
         // 持有 Child 以免 `kill_on_drop` 提前生效；离开作用域即回收子进程。
         _child: child,
     };
@@ -282,6 +378,7 @@ async fn run_session(
             publish_failure(tx, FAILURE_READ);
             return SessionEnd::Ended {
                 reset_backoff: is_stable(started.elapsed()),
+                succeeded,
             };
         }
         RequestOutcome::Stopped => return SessionEnd::Stopped,
@@ -289,6 +386,7 @@ async fn run_session(
             publish_failure(tx, FAILURE_READ);
             return SessionEnd::Ended {
                 reset_backoff: is_stable(started.elapsed()),
+                succeeded,
             };
         }
     }
@@ -296,6 +394,7 @@ async fn run_session(
         publish_failure(tx, FAILURE_READ);
         return SessionEnd::Ended {
             reset_backoff: is_stable(started.elapsed()),
+            succeeded,
         };
     }
 
@@ -312,6 +411,7 @@ async fn run_session(
             publish_failure(tx, FAILURE_READ);
             return SessionEnd::Ended {
                 reset_backoff: is_stable(started.elapsed()),
+                succeeded,
             };
         }
     };
@@ -320,18 +420,19 @@ async fn run_session(
         Ok(value) => {
             apply_account(&mut session.snapshot, &value, unix_now());
             if matches!(value.get("account"), Some(Value::Null)) {
-                // 未登录时不必再读额度；发布失败快照后等用户登录再重连。
+                // 未登录时不必再读额度；转浅眠，登录会改写 auth.json，
+                // 活动痕迹变化会把监控拉起来。
                 session.publish();
-                return SessionEnd::Ended {
-                    reset_backoff: is_stable(started.elapsed()),
-                };
+                return SessionEnd::Idle;
             }
+            succeeded = true;
         }
         Err(message) => {
             eprintln!("ai-quota: account/read 失败: {message}");
             publish_failure(tx, account_failure(&message));
             return SessionEnd::Ended {
                 reset_backoff: is_stable(started.elapsed()),
+                succeeded,
             };
         }
     }
@@ -347,11 +448,23 @@ async fn run_session(
             publish_failure(tx, FAILURE_READ);
             return SessionEnd::Ended {
                 reset_backoff: is_stable(started.elapsed()),
+                succeeded,
             };
         }
     }
 
+    if brief {
+        // 定时唤醒只读这一轮：拿到新数字就把 app-server 收掉，回到浅眠。
+        return SessionEnd::Idle;
+    }
+
     let mut next_id = 4;
+
+    // 浅眠判定：活动痕迹自上次以来没变就累计静默时长，超过窗口把
+    // 子进程收掉。会话刚建立时采样一次基线，用户正在用 Codex 时
+    // 痕迹持续变化，静默时钟不断归零，监控一直保持。
+    let mut idle_stamp = activity::stamp();
+    let mut idle_since: Option<Instant> = None;
 
     let mut ticker = tokio::time::interval(poll_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -362,15 +475,15 @@ async fn run_session(
         tokio::select! {
             _ = &mut *stop => return SessionEnd::Stopped,
             _ = ticker.tick() => {
-                // 先确认账号，再读额度。运行中登出只发布未登录状态，
-                // 复用同一条连接继续探测，避免每次重连都 spawn 子进程。
+                // 先确认账号，再读额度。运行中登出转浅眠（登录活动会唤醒），
+                // 避免未登录状态下每 60 秒空转一次连接。
                 match session.request(next_id, "account/read", json!({}), stop).await {
                     RequestOutcome::Result(Ok(value)) => {
                         next_id += 1;
                         apply_account(&mut session.snapshot, &value, unix_now());
                         if matches!(value.get("account"), Some(Value::Null)) {
                             session.publish();
-                            continue;
+                            return SessionEnd::Idle;
                         }
                         match session
                             .request(next_id, "account/rateLimits/read", json!({}), stop)
@@ -386,6 +499,7 @@ async fn run_session(
                                 publish_failure(tx, FAILURE_READ);
                                 return SessionEnd::Ended {
                                     reset_backoff: is_stable(started.elapsed()),
+                                    succeeded,
                                 };
                             }
                             RequestOutcome::Stopped => return SessionEnd::Stopped,
@@ -393,6 +507,7 @@ async fn run_session(
                                 publish_failure(tx, FAILURE_READ);
                                 return SessionEnd::Ended {
                                     reset_backoff: is_stable(started.elapsed()),
+                                    succeeded,
                                 };
                             }
                         }
@@ -402,6 +517,7 @@ async fn run_session(
                         publish_failure(tx, account_failure(&message));
                         return SessionEnd::Ended {
                             reset_backoff: is_stable(started.elapsed()),
+                            succeeded,
                         };
                     }
                     RequestOutcome::Stopped => return SessionEnd::Stopped,
@@ -409,8 +525,21 @@ async fn run_session(
                         publish_failure(tx, FAILURE_READ);
                         return SessionEnd::Ended {
                             reset_backoff: is_stable(started.elapsed()),
+                            succeeded,
                         };
                     }
+                }
+                // 成功读完一轮后评估是否该睡了。
+                let now_stamp = activity::stamp();
+                if now_stamp != idle_stamp {
+                    idle_stamp = now_stamp;
+                    idle_since = None;
+                } else if let Some(since) = idle_since {
+                    if since.elapsed() >= IDLE_AFTER {
+                        return SessionEnd::Idle;
+                    }
+                } else {
+                    idle_since = Some(Instant::now());
                 }
             }
             line = session.lines.next_line() => {
@@ -427,12 +556,12 @@ async fn run_session(
                     Ok(None) => {
                         eprintln!("ai-quota: app-server 已退出");
                         publish_failure(tx, FAILURE_READ);
-                        return SessionEnd::Ended { reset_backoff: is_stable(started.elapsed()) };
+                        return SessionEnd::Ended { reset_backoff: is_stable(started.elapsed()), succeeded };
                     }
                     Err(err) => {
                         eprintln!("ai-quota: 读取 app-server 输出失败: {err}");
                         publish_failure(tx, FAILURE_READ);
-                        return SessionEnd::Ended { reset_backoff: is_stable(started.elapsed()) };
+                        return SessionEnd::Ended { reset_backoff: is_stable(started.elapsed()), succeeded };
                     }
                 }
             }
@@ -446,6 +575,8 @@ struct Session<'a> {
     lines: Lines<BufReader<ChildStdout>>,
     snapshot: QuotaSnapshot,
     tx: &'a watch::Sender<QuotaSnapshot>,
+    /// 快照落盘路径；每次发布都同步写一份，浅眠与重启期间页面接着用。
+    cache: PathBuf,
     _child: Child,
 }
 
@@ -471,8 +602,13 @@ impl Session<'_> {
         true
     }
 
-    fn publish(&self) {
+    fn publish(&mut self) {
+        // 拿到新数据就清掉浅眠标记；页面的「更新于」提示随之消失。
+        self.snapshot.idle = false;
         let _ = self.tx.send_replace(self.snapshot.clone());
+        if let Err(err) = store::save(&self.cache, &self.snapshot) {
+            eprintln!("ai-quota: 保存额度失败: {err}");
+        }
     }
 
     /// 对 app-server 主动发来的请求回「方法不支持」，避免对方一直等待。
@@ -632,6 +768,31 @@ impl Session<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_windows_are_sane() {
+        // 浅眠检查要快、入眠判定要盖住两次调用之间的间隙、
+        // 定时唤醒要远长于入眠判定，否则休眠形同虚设。
+        assert!(IDLE_TICK < Duration::from_secs(30));
+        assert!(IDLE_AFTER > Duration::from_secs(60));
+        assert!(IDLE_WAKE > IDLE_AFTER);
+        // 失败转浅眠的阈值要小于退避循环在 30 秒封顶后一分钟内的重试次数。
+        assert!(MAX_CONSECUTIVE_FAILURES >= 2);
+    }
+
+    #[test]
+    fn mark_idle_sets_the_flag_and_publish() {
+        let (tx, mut rx) = tokio::sync::watch::channel(QuotaSnapshot::default());
+        let mut snapshot = QuotaSnapshot {
+            plan: Some("plus".to_string()),
+            updated_at: Some(1_700_000_000),
+            ..QuotaSnapshot::default()
+        };
+        snapshot.idle = false;
+        tx.send_replace(snapshot);
+        mark_idle(&tx);
+        assert!(rx.borrow_and_update().idle, "浅眠标记要发布给渲染层");
+    }
 
     #[test]
     fn next_backoff_doubles_from_one_second_and_caps_at_thirty() {
