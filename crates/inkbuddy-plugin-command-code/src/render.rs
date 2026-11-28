@@ -29,7 +29,8 @@ pub fn render_html(snapshot: &QuotaSnapshot, now: i64) -> String {
     };
 
     let mut out = String::new();
-    out.push_str("<div class=\"quota\">\n");
+    // 声明本卡按基准字号占用的高度（vw 单位），宿主据此在矮区域里缩小字号。
+    out.push_str("<div class=\"quota\" data-ink-height=\"23\">\n");
     out.push_str("  <div class=\"quota-head\">\n");
     out.push_str("    <span class=\"quota-mark quota-mark-cc\"></span>\n");
     out.push_str("    <span class=\"quota-brand\">Command Code</span>\n");
@@ -56,7 +57,7 @@ pub fn render_html(snapshot: &QuotaSnapshot, now: i64) -> String {
 /// 单行提示，用于插件失败或快照未就绪。
 pub fn render_notice(message: &str) -> String {
     format!(
-        "<div class=\"quota quota-notice\"><span class=\"quota-notice-text\">{}</span></div>",
+        "<div class=\"quota quota-notice\" data-ink-height=\"6\"><span class=\"quota-notice-text\">{}</span></div>",
         escape_html(message)
     )
 }
@@ -167,7 +168,13 @@ mod tests {
         }
         assert!(!html.contains("style="), "{html}");
         assert!(!html.contains(" id="), "{html}");
-        assert!(!html.contains(" data-"), "{html}");
+        // 只允许 data-ink-height（宿主用它估算这块内容需要多高），别的 data 属性不行。
+        for (i, _) in html.match_indices(" data-") {
+            assert!(
+                html[i + 1..].starts_with("data-ink-height="),
+                "unexpected data attribute at byte {i}: {html}"
+            );
+        }
     }
 
     #[test]

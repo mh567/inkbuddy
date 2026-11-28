@@ -25,7 +25,8 @@ pub fn render_html(snapshot: &Snapshot, now: i64) -> String {
     let stale = snapshot.failure.is_some();
 
     let mut out = String::new();
-    out.push_str("<div class=\"quota\">\n");
+    // 声明本卡按基准字号占用的高度（vw 单位），宿主据此在矮区域里缩小字号。
+    out.push_str("<div class=\"quota\" data-ink-height=\"41\">\n");
     out.push_str("  <div class=\"quota-head\">\n");
     out.push_str("    <span class=\"quota-mark quota-mark-ag\"></span>\n");
     out.push_str("    <span class=\"quota-brand\">Antigravity</span>\n");
@@ -60,7 +61,7 @@ pub fn render_html(snapshot: &Snapshot, now: i64) -> String {
 /// 单行提示，用于插件失败或快照未就绪。
 pub fn render_notice(message: &str) -> String {
     format!(
-        "<div class=\"quota quota-notice\"><span class=\"quota-notice-text\">{}</span></div>",
+        "<div class=\"quota quota-notice\" data-ink-height=\"6\"><span class=\"quota-notice-text\">{}</span></div>",
         escape_html(message)
     )
 }
