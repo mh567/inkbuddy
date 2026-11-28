@@ -95,13 +95,22 @@ final class PreviewWebViewHolder: NSObject, WKNavigationDelegate {
     /// 进程池 API 已废弃；共享配置主要是让偏好设置只有一份。
     private static let sharedConfiguration = WKWebViewConfiguration()
 
-    private(set) lazy var webView: WKWebView = {
+    private var _webView: WKWebView?
+    /// 卸载轮次：unload 之后，在途的 DOM 替换回调直接作废，
+    /// 不再把旧内容灌回刚卸干净的页面。
+    private(set) var epoch = 0
+
+    /// 首次挂载时创建。unload() 在预览从未显示过时直接返回，
+    /// 不会为一个空白站点专门拉起 WebContent 进程。
+    var webView: WKWebView {
+        if let web = _webView { return web }
         let web = WKWebView(frame: .zero, configuration: Self.sharedConfiguration)
         web.allowsBackForwardNavigationGestures = false
         web.allowsMagnification = false
         web.navigationDelegate = self
+        _webView = web
         return web
-    }()
+    }
 
     /// 已载入内容的签名；空串表示当前没有有效内容，下一帧走整页载入。
     var signature: String = ""
@@ -112,7 +121,9 @@ final class PreviewWebViewHolder: NSObject, WKNavigationDelegate {
     func unload() {
         signature = ""
         loaded = false
-        webView.loadHTMLString("<!DOCTYPE html><html><body></body></html>", baseURL: nil)
+        epoch += 1
+        guard let web = _webView else { return }
+        web.loadHTMLString("<!DOCTYPE html><html><body></body></html>", baseURL: nil)
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -167,7 +178,10 @@ private struct InkPreviewWebView: NSViewRepresentable {
           return true;
         })()
         """
+        let epoch = holder.epoch
         web.evaluateJavaScript(script) { result, _ in
+            // 卸载发生在请求之后：结果作废，别把旧内容灌回空白页。
+            guard holder.epoch == epoch else { return }
             // 出错或页面里找不到 #frame 时退回整页重载，下次重新走载入分支。
             if !(result as? Bool ?? false) {
                 Self.reload(web, holder: holder, frame: frame)
