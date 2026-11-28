@@ -182,19 +182,94 @@ final class ViewEditorModel: ObservableObject {
         selected = nil
     }
 
-    /// 把一个已启用的扩展（可带子样式）加进画布。区域互斥：优先找一块
-    /// 放得下的空白；画布已被占满时把面积最大的现有区域对半切开。
-    /// 同一个插件只占一个区域：再次点它的子样式时改这个区域的样式并选中，
-    /// 与宿主 sanitize 按 plugin 去重的规则一致。
+    /// 把一个已启用的扩展（可带子样式）加进画布。
+    ///
+    /// 画布还是拆分方案的形状（没人手动挪过）时，整盘重排成 N+1 的方案，
+    /// 新扩展拿最后一格——这样连续添加得到的布局始终符合拆分规则。
+    /// 手动调整过的布局保持不动：找一块放得下的空白，找不到再把
+    /// 面积最大的区域对半切开。同一个插件只占一个区域：再次点它的
+    /// 子样式时改这个区域的样式并选中，与宿主 sanitize 按 plugin 去重
+    /// 的规则一致。
     func addPlugin(_ id: String, variant: String? = nil) {
         if let index = regions.firstIndex(where: { $0.plugin == id }) {
             regions[index].variant = variant
             selected = index
             return
         }
+        if !regions.isEmpty, regions.count < Self.autoSplitCapacity, matchesAutoSplitLayout() {
+            let cells = Self.autoSplit(regions.count + 1)
+            for index in regions.indices {
+                regions[index] = cells[index].toRegion(plugin: regions[index].plugin,
+                                                       variant: regions[index].variant)
+            }
+            regions.append(cells[regions.count].toRegion(plugin: id, variant: variant))
+            selected = regions.count - 1
+            return
+        }
         let rect = findFreeSpot() ?? splitLargestRegion()
         regions.append(rect.toRegion(plugin: id, variant: variant))
         selected = regions.count - 1
+    }
+
+    /// 拆分方案：竖屏主轴是上下，左右分出来的块太窄。
+    ///
+    /// - 1 个：全屏；2 个：上下对半；3 个：上下三等分（行数到 3 为止）。
+    /// - 4 个起：继续按「第一行左右、第二行左右、第三行左右」的顺序逐行加列，
+    ///   每行最多 3 列——4 个 `[2,1,1]`、6 个 `[2,2,2]`、9 个 `[3,3,3]`。
+    /// - 超过 9 个（3×3 已满）：从第一格起把格子上下对分（竖屏里高度比宽度
+    ///   更经得起分），每格最多 2，容量到 18。
+    fileprivate static func autoSplit(_ count: Int) -> [GeomRect] {
+        if count <= 3 {
+            let height = 100.0 / Double(max(count, 1))
+            return (0..<max(count, 1)).map { row in
+                GeomRect(x: 0, y: height * Double(row), w: 100, h: height)
+            }
+        }
+        var rows = [Int](repeating: min(count / 3, 3), count: 3)
+        for row in 0..<(count % 3) where rows[row] < 3 {
+            rows[row] += 1
+        }
+        var cells: [GeomRect] = []
+        let rowHeight = 100.0 / 3.0
+        for (row, columns) in rows.enumerated() {
+            let width = 100.0 / Double(columns)
+            for column in 0..<columns {
+                cells.append(GeomRect(x: width * Double(column),
+                                      y: rowHeight * Double(row),
+                                      w: width, h: rowHeight))
+            }
+        }
+        // 3×3 已满：把前面的格子逐个上下对分，每格最多分一次。
+        var extra = count - cells.count
+        var index = 0
+        while extra > 0, index < cells.count {
+            let cell = cells[index]
+            let half = cell.h / 2
+            cells[index] = GeomRect(x: cell.x, y: cell.y, w: cell.w, h: half)
+            cells.insert(GeomRect(x: cell.x, y: cell.y + half, w: cell.w, h: half),
+                         at: index + 1)
+            extra -= 1
+            index += 2
+        }
+        return cells
+    }
+
+    /// 方案能表达的最大格子数；超出后调用方走手动兜底。
+    fileprivate static let autoSplitCapacity = 18
+
+    /// 现有区域是否恰好是拆分方案在当前数量下的形状（按创建顺序逐格比对）。
+    /// 手动拖拽或缩放过的布局不匹配，新增时走原有的空白查找兜底。
+    private func matchesAutoSplitLayout() -> Bool {
+        let cells = Self.autoSplit(regions.count)
+        guard regions.count == cells.count else { return false }
+        let tolerance = 0.2
+        return zip(regions, cells).allSatisfy { region, cell in
+            let rect = GeomRect(region)
+            return abs(rect.x - cell.x) < tolerance
+                && abs(rect.y - cell.y) < tolerance
+                && abs(rect.w - cell.w) < tolerance
+                && abs(rect.h - cell.h) < tolerance
+        }
     }
 
     /// 在现有区域之外找一块空白：候选尺寸按面积降序，位置按 5% 网格扫描，
