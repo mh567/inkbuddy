@@ -68,13 +68,36 @@ fn read_disabled(path: &std::path::Path) -> Option<Vec<String>> {
     }
 }
 
-pub fn load_disabled() -> Vec<String> {
-    match disabled_path() {
-        Some(path) if path.exists() => read_disabled(&path).unwrap_or_default(),
-        _ => legacy_disabled_path()
-            .and_then(|path| read_disabled(&path))
-            .unwrap_or_default(),
+/// 清单里 `default_on = false` 的扩展。首次启动先把它们停掉，让默认启用
+/// 跟「本机有没有对应的工具」走，而不是每个插件都常驻一份进程。
+fn default_off_ids(set: &PluginSet) -> Vec<String> {
+    set.order
+        .iter()
+        .filter(|id| {
+            set.get(id.as_str())
+                .map(|p| !p.manifest.runtime.default_on)
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect()
+}
+
+/// 读停用列表。首次启动时按各插件清单的 `default_on` 落一份，
+/// 之后完全由用户在设置窗口里开关。
+pub fn load_disabled(set: &PluginSet) -> Vec<String> {
+    if let Some(path) = disabled_path() {
+        if path.exists() {
+            return read_disabled(&path).unwrap_or_default();
+        }
     }
+    if let Some(path) = legacy_disabled_path() {
+        if path.exists() {
+            return read_disabled(&path).unwrap_or_default();
+        }
+    }
+    let ids = default_off_ids(set);
+    save_disabled(&ids);
+    ids
 }
 
 fn save_disabled(ids: &[String]) {
@@ -203,7 +226,7 @@ struct PluginSummary {
 }
 
 /// Resolve the plugin ids for the no-view path: the URL parameter wins when
-/// set, otherwise each enabled plugin's default_on. Unknown and disabled
+/// set, otherwise every enabled plugin in scan order. Unknown and disabled
 /// ones are dropped.
 fn resolve_ids(set: &PluginSet, query: &Option<String>, disabled: &[String]) -> Vec<String> {
     let requested: Option<Vec<String>> = query.as_ref().and_then(|raw| {
@@ -222,7 +245,7 @@ fn resolve_ids(set: &PluginSet, query: &Option<String>, disabled: &[String]) -> 
             .collect();
         if ids.is_empty() { None } else { Some(ids) }
     });
-    let ids = requested.unwrap_or_else(|| set.default_ids());
+    let ids = requested.unwrap_or_else(|| set.order.clone());
     ids.into_iter()
         .filter(|id| is_enabled(set, disabled, id))
         .collect()
@@ -981,6 +1004,25 @@ mod tests {
         assert!(resolve_ids(&set, &Some("ghost".to_string()), &[]).is_empty());
         let long = "lyrics,".repeat(2000);
         assert_eq!(resolve_ids(&set, &Some(long), &[]), vec!["lyrics"]);
+    }
+
+    #[test]
+    fn no_view_path_lists_every_enabled_plugin() {
+        let mut set = set_with(&["lyrics"], true);
+        found_for(&mut set, &["command-code"], false);
+        // 清单里 default_on = false，但用户启用了（不在这份停用列表里），就排进去
+        let disabled = vec!["lyrics".to_string()];
+        assert_eq!(
+            resolve_ids(&set, &None, &disabled),
+            vec!["command-code".to_string()]
+        );
+    }
+
+    #[test]
+    fn first_launch_disables_plugins_that_are_off_by_default() {
+        let mut set = set_with(&["lyrics", "clock"], true);
+        found_for(&mut set, &["ai-quota"], false);
+        assert_eq!(default_off_ids(&set), vec!["ai-quota"]);
     }
 
     #[test]

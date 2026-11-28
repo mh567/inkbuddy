@@ -101,7 +101,7 @@ command = "$CLOCK_CMD_TOML"
 
 [runtime]
 enabled = true
-default_on = false
+default_on = true
 timeout_ms = 2000
 args = []
 EOF

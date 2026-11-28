@@ -192,7 +192,8 @@ final class MenuPreviewController: NSObject, NSPopoverDelegate {
 
     /// 无视图时的竖排等分布局，与 host 的 Region::stacked 同规则。
     private func stackedRegions(from host: HostService) -> [ViewRegion] {
-        let plugins = host.plugins.filter { $0.enabled && $0.available && $0.defaultOn }
+        // 与 host 的无视图路径一致：所有启用的扩展，按扫描顺序竖排等分。
+        let plugins = host.plugins.filter { $0.enabled && $0.available }
         let total = max(plugins.count, 1)
         let height = 100.0 / Double(total)
         return plugins.enumerated().map { index, plugin in

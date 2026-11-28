@@ -91,7 +91,7 @@ command = "./inkbuddy-plugin-clock"
 
 [runtime]
 enabled = true
-default_on = false
+default_on = true
 timeout_ms = 2000
 args = []
 EOF
