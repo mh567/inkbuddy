@@ -265,7 +265,7 @@ fn render_returns_board_from_local_fake_api() {
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0]["type"].as_str(), Some("html"));
     let html = blocks[0]["html"].as_str().expect("html string");
-    assert!(html.contains("<div class=\"quota\">"), "{html}");
+    assert!(html.contains("<div class=\"quota\" data-ink-height="), "{html}");
     assert!(html.contains("GOAT · 余 62.4"), "{html}");
     assert_eq!(html.matches("quota-row").count(), 3, "{html}");
     // 月行只算套餐 credit：池子 70、monthlyCredits 50，得 29%；额外 credit 只进顶部总额。
