@@ -210,11 +210,12 @@ pub fn apply_quota_summary(snapshot: &mut Snapshot, value: &Value) {
         let Some(buckets) = group.get("buckets").and_then(Value::as_array) else {
             continue;
         };
-        let group_name = group
+        let display_name = group
             .get("displayName")
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_ascii_lowercase();
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        let group_name = display_name.unwrap_or("").to_ascii_lowercase();
 
         for bucket in buckets {
             let Some((target, is_weekly)) = classify_bucket(bucket, &group_name) else {
@@ -223,11 +224,18 @@ pub fn apply_quota_summary(snapshot: &mut Snapshot, value: &Value) {
             let Some(parsed) = parse_bucket(bucket) else {
                 continue;
             };
-            let slot = match (target, is_weekly) {
-                (Target::Gemini, true) => &mut snapshot.gemini.weekly,
-                (Target::Gemini, false) => &mut snapshot.gemini.five_hour,
-                (Target::ThirdParty, true) => &mut snapshot.third_party.weekly,
-                (Target::ThirdParty, false) => &mut snapshot.third_party.five_hour,
+            let group_slot = match target {
+                Target::Gemini => &mut snapshot.gemini,
+                Target::ThirdParty => &mut snapshot.third_party,
+            };
+            // 组名用接口原文，页面标题跟着接口走；接口没给时渲染层退到内置短标题。
+            if let Some(name) = display_name {
+                group_slot.name = Some(name.to_string());
+            }
+            let slot = if is_weekly {
+                &mut group_slot.weekly
+            } else {
+                &mut group_slot.five_hour
             };
             *slot = Some(parsed);
         }
@@ -299,19 +307,25 @@ fn parse_bucket(bucket: &Value) -> Option<Bucket> {
 }
 
 /// 套餐名；`userStatus` 可能被包一层，两种都认。
+///
+/// 接口把套餐放在 `planStatus.planInfo` 里，不同版本用过 `planName` 和
+/// `planDisplayName`，也见过少一层的写法，这里按顺序都试一遍。
 pub fn parse_plan(value: &Value) -> Option<String> {
     let status = value.get("userStatus").unwrap_or(value);
-    let plan = status
-        .get("planStatus")?
-        .get("planInfo")?
-        .get("planName")?
-        .as_str()?
-        .trim();
-    if plan.is_empty() {
-        None
-    } else {
-        Some(plan.to_string())
-    }
+    let plan_info = status.get("planStatus").and_then(|plan| plan.get("planInfo"));
+    let candidates = [
+        plan_info.and_then(|info| info.get("planDisplayName")),
+        plan_info.and_then(|info| info.get("planName")),
+        status.get("planInfo").and_then(|info| info.get("planName")),
+        status.get("planStatus").and_then(|plan| plan.get("planName")),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .find(|plan| !plan.is_empty())
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -363,8 +377,15 @@ mod tests {
 
         let five_hour = snapshot.gemini.five_hour.expect("gemini 5h");
         assert_eq!(five_hour.used_percent, 24);
+        // 组名照接口原文留下，页面标题用它
+        assert_eq!(snapshot.gemini.name.as_deref(), Some("Gemini Models"));
 
         let third = snapshot.third_party.clone();
+        assert_eq!(
+            third.name.as_deref(),
+            Some("Claude and GPT models"),
+            "3p group name"
+        );
         assert_eq!(third.weekly.expect("3p weekly").used_percent, 0);
         let third_five_hour = third.five_hour.expect("3p 5h");
         assert_eq!(third_five_hour.used_percent, 0);
@@ -441,6 +462,27 @@ mod tests {
         assert_eq!(parse_plan(&bare).as_deref(), Some("Ultra"));
         assert_eq!(parse_plan(&json!({"userStatus": {"planStatus": {}}})), None);
         assert_eq!(parse_plan(&json!({"userStatus": {"planStatus": {"planInfo": {"planName": "  "}}}})), None);
+    }
+
+    #[test]
+    fn reads_plan_from_other_field_names() {
+        // 带显示名的写法优先，值本身就是给人看的（如 "Google AI Pro"）
+        let display = json!({
+            "userStatus": {"planStatus": {"planInfo": {"planName": "Pro", "planDisplayName": "Google AI Pro"}}}
+        });
+        assert_eq!(parse_plan(&display).as_deref(), Some("Google AI Pro"));
+
+        // 少一层的写法也认
+        let flat = json!({"planInfo": {"planName": "Pro"}});
+        assert_eq!(parse_plan(&flat).as_deref(), Some("Pro"));
+        let flat_status = json!({"planStatus": {"planName": "Ultra"}});
+        assert_eq!(parse_plan(&flat_status).as_deref(), Some("Ultra"));
+
+        // 只有空白值时当作没有
+        let blank_display = json!({
+            "userStatus": {"planStatus": {"planInfo": {"planDisplayName": " ", "planName": "Pro"}}}
+        });
+        assert_eq!(parse_plan(&blank_display).as_deref(), Some("Pro"));
     }
 
     #[test]

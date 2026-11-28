@@ -4,11 +4,15 @@
 
 ## 显示内容
 
-- 顶部一行：`Antigravity` 和套餐名，例如 `Pro`。
-- `Gemini` 分组标题，下面两行：「5 小时」与「本周」两个窗口的已用百分比进度条和重置倒计时。
-- `Claude、GPT` 分组标题，同样两行。
+- 顶部一行：反重力图标、`Antigravity`，右侧是套餐名，例如 `Pro`。
+- `Gemini Models` 分组标题，下面两行：「5 小时」与「本周」两个窗口的已用百分比进度条和重置倒计时。
+- `Claude and GPT models` 分组标题，同样两行。
 
-两个分组是接口里分开计费的额度池：Gemini 系列模型共用一份，Claude 与 GPT 系列共用另一份。额度满且从没用过时接口不返回重置时间，这一行写「未使用」。进度条按 5% 取整，填充宽度由 `q-0` 到 `q-100` 共 21 档预设 class 控制，样式写在 `web/ink.html`，随宿主一起分发。
+两个分组是接口里分开计费的额度池：Gemini 系列模型共用一份，Claude 与 GPT 系列共用另一份。分组标题直接取接口的 `groups[].displayName`，命令行版的输出第一列同样带这个组名，所以两条路读到的标题一致；接口没给组名时退回内置短标题 `Gemini`、`Claude、GPT`。
+
+额度按组下发，单个模型没有单独的数字：Gemini 4 Hydrogen 这类模型和同组的 Neon、Carbon、Argon、Orchestrator、3.8 Flash 共用同一份 5 小时与周额度，页面显示的就是这份共享额度的用量。
+
+额度满且从没用过时接口不返回重置时间，这一行写「未使用」。进度条按 5% 取整，填充宽度由 `q-0` 到 `q-100` 共 21 档预设 class 控制，样式写在 `web/ink.html`，随宿主一起分发。
 
 反重力关着的时候，页面沿用最后一次读到的数字，底部写「反重力未运行 · 更新于 X 小时前」。如果某个窗口的重置时间在这段时间里已经过去，那个窗口的百分比不再可信，这一行改成「已重置」，不再显示旧数字。
 
@@ -18,7 +22,7 @@
 
 1. 端口和 CSRF 令牌：用 `/bin/ps -A -ww -o pid=,command=` 找 `language_server` 进程，从命令行里取 `--csrf_token`、`--extension_server_port`、`--http_server_port`、`--https_server_port`。端口是随机分配的，所以每轮都要重新读。
 2. 额度：`POST http://127.0.0.1:<port>/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary`，返回 `groups[].buckets[]`，每个桶带 `bucketId`（`gemini-5h`、`gemini-weekly`、`3p-5h`、`3p-weekly`）、`window`、`remainingFraction`、`resetTime`。
-3. 套餐名：`POST .../GetUserStatus`，取 `userStatus.planStatus.planInfo.planName`。这条读不到不影响额度显示。
+3. 套餐名：`POST .../GetUserStatus`，取 `userStatus.planStatus.planInfo` 下的 `planDisplayName` 或 `planName`。这条读不到不影响额度显示；读不到时顶部只写 `Antigravity`，套餐名这一格留空。
 
 `ps` 没找到进程时，退到日志里记录的端口：`~/Library/Logs/Antigravity/language_server.log`、`~/.gemini/antigravity/log/`、`~/.gemini/antigravity-cli/log/` 里最新的那份，只读末尾 64 KiB。
 
@@ -32,7 +36,7 @@
 agy -p "/usage" --log-file <临时文件>
 ```
 
-输出四行，制表符分列：分组、窗口、剩余百分比、重置时间。这条命令会自己起一个语言服务器，一次约 6 秒，所以只在「有端口应答却读不出」时才走，轮询间隔也改成 5 分钟。`--log-file` 把日志指到临时文件，`~/.gemini/antigravity-cli/log/` 不会每轮多出一份。这条路的输出里没有套餐名，顶部写「未知套餐」。
+输出四行，制表符分列：分组、窗口、剩余百分比、重置时间。这条命令会自己起一个语言服务器，一次约 6 秒，所以只在「有端口应答却读不出」时才走，轮询间隔也改成 5 分钟。`--log-file` 把日志指到临时文件，`~/.gemini/antigravity-cli/log/` 不会每轮多出一份。这条路的输出里没有套餐名，插件沿用上一次从语言服务器读到的套餐名；从来没有读到过时套餐名这一格留空。
 
 ## 反重力开着或关着
 

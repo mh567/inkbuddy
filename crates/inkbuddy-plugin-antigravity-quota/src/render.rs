@@ -6,6 +6,10 @@
 use crate::formatting::{escape_html, plan_text, reset_countdown, width_class};
 use crate::model::{Bucket, Group, Snapshot};
 
+/// 接口没给组名时的短标题。
+const GEMINI_TITLE: &str = "Gemini";
+const THIRD_PARTY_TITLE: &str = "Claude、GPT";
+
 /// 渲染完整看板；快照未就绪或失败时降级为提示块。
 pub fn render_html(snapshot: &Snapshot, now: i64) -> String {
     let Some(updated_at) = snapshot.updated_at else {
@@ -23,14 +27,23 @@ pub fn render_html(snapshot: &Snapshot, now: i64) -> String {
     let mut out = String::new();
     out.push_str("<div class=\"quota\">\n");
     out.push_str("  <div class=\"quota-head\">\n");
+    out.push_str("    <span class=\"quota-mark quota-mark-ag\"></span>\n");
     out.push_str("    <span class=\"quota-brand\">Antigravity</span>\n");
-    out.push_str(&format!(
-        "    <span class=\"quota-meta\">{}</span>\n",
-        escape_html(&plan)
-    ));
+    // 套餐名只有语言服务器能给；命令行版读不到时这一格留空。
+    if let Some(plan) = plan {
+        out.push_str(&format!(
+            "    <span class=\"quota-meta\">{}</span>\n",
+            escape_html(&plan)
+        ));
+    }
     out.push_str("  </div>\n");
-    out.push_str(&render_group("Gemini", &snapshot.gemini, now, stale));
-    out.push_str(&render_group("Claude、GPT", &snapshot.third_party, now, stale));
+    out.push_str(&render_group(&snapshot.gemini, GEMINI_TITLE, now, stale));
+    out.push_str(&render_group(
+        &snapshot.third_party,
+        THIRD_PARTY_TITLE,
+        now,
+        stale,
+    ));
     out.push_str("</div>");
 
     if let Some(failure) = snapshot.failure.as_deref() {
@@ -52,8 +65,9 @@ pub fn render_notice(message: &str) -> String {
     )
 }
 
-/// 一组模型：分组标题加 5 小时、周两行。
-fn render_group(title: &str, group: &Group, now: i64, stale: bool) -> String {
+/// 一组模型：分组标题加 5 小时、周两行。标题优先用接口给的组名，读不到时用内置短标题。
+fn render_group(group: &Group, fallback_title: &str, now: i64, stale: bool) -> String {
+    let title = group.name.as_deref().unwrap_or(fallback_title);
     let mut out = format!(
         "  <div class=\"quota-group\">{}</div>\n",
         escape_html(title)
@@ -129,6 +143,7 @@ mod tests {
                     used_percent: 11,
                     resets_at: Some(now + 5 * 24 * 3600 + 11 * 3600),
                 }),
+                ..Group::default()
             },
             third_party: Group {
                 five_hour: Some(Bucket {
@@ -139,6 +154,7 @@ mod tests {
                     used_percent: 0,
                     resets_at: None,
                 }),
+                ..Group::default()
             },
             updated_at: Some(now),
             failure: None,
@@ -163,6 +179,37 @@ mod tests {
     }
 
     #[test]
+    fn renders_group_titles_from_api_names() {
+        let now = 1_700_000_000_i64;
+        let mut snapshot = sample_snapshot(now);
+        snapshot.gemini.name = Some("Gemini Models".to_string());
+        snapshot.third_party.name = Some("Claude and GPT models".to_string());
+        let html = render_html(&snapshot, now);
+        assert!(html.contains(">Gemini Models<"), "{html}");
+        assert!(html.contains(">Claude and GPT models<"), "{html}");
+        // 有了接口组名就不再出现内置短标题
+        assert!(!html.contains(">Gemini<"), "{html}");
+        assert!(!html.contains(">Claude、GPT<"), "{html}");
+    }
+
+    #[test]
+    fn header_carries_the_plugin_icon() {
+        let now = 1_700_000_000_i64;
+        let html = render_html(&sample_snapshot(now), now);
+        assert!(html.contains("quota-mark quota-mark-ag"), "{html}");
+    }
+
+    #[test]
+    fn stylesheet_defines_antigravity_icon() {
+        let css = include_str!("../../../web/ink.html");
+        assert!(css.contains(".quota-mark-ag"), "missing .quota-mark-ag");
+        assert!(
+            css.contains("body.invert .quota-mark-ag"),
+            "missing body.invert .quota-mark-ag"
+        );
+    }
+
+    #[test]
     fn renders_placeholder_for_missing_windows() {
         let now = 1_700_000_000_i64;
         let snapshot = Snapshot {
@@ -173,6 +220,18 @@ mod tests {
         let html = render_html(&snapshot, now);
         assert_eq!(html.matches("暂无数据").count(), 4, "{html}");
         assert!(html.contains("--"), "{html}");
+    }
+
+    #[test]
+    fn omits_plan_meta_when_name_is_unknown() {
+        let now = 1_700_000_000_i64;
+        let mut snapshot = sample_snapshot(now);
+        snapshot.plan = None;
+        let html = render_html(&snapshot, now);
+        assert!(!html.contains("quota-meta"), "{html}");
+        assert!(!html.contains("未知套餐"), "{html}");
+        // 其余行照常
+        assert_eq!(html.matches("quota-row").count(), 4, "{html}");
     }
 
     #[test]

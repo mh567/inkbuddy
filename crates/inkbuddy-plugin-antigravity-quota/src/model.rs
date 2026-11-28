@@ -19,6 +19,8 @@ pub struct Bucket {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Group {
+    /// 接口给的组名（`Gemini Models`、`Claude and GPT models`）；读不到时渲染用内置短标题。
+    pub name: Option<String>,
     pub five_hour: Option<Bucket>,
     pub weekly: Option<Bucket>,
 }
@@ -71,7 +73,7 @@ mod tests {
                 used_percent: 20,
                 resets_at: None,
             }),
-            weekly: None,
+            ..Group::default()
         };
         assert!(!with_window.is_empty());
     }

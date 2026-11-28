@@ -129,14 +129,19 @@ pub fn parse_usage(text: &str) -> Option<Snapshot> {
             used_percent: 100u32.saturating_sub(remaining.min(100)),
             resets_at,
         };
-        match (group, window) {
-            (Group::Gemini, Window::FiveHour) => snapshot.gemini.five_hour = Some(bucket),
-            (Group::Gemini, Window::Weekly) => snapshot.gemini.weekly = Some(bucket),
-            (Group::ThirdParty, Window::FiveHour) => {
-                snapshot.third_party.five_hour = Some(bucket)
-            }
-            (Group::ThirdParty, Window::Weekly) => snapshot.third_party.weekly = Some(bucket),
+        // 第一列就是组名，与语言服务器给的 displayName 同源，直接拿来当标题。
+        let group_slot = match group {
+            Group::Gemini => &mut snapshot.gemini,
+            Group::ThirdParty => &mut snapshot.third_party,
+        };
+        if group_slot.name.is_none() {
+            group_slot.name = Some(fields[0].to_string());
         }
+        let slot = match window {
+            Window::FiveHour => &mut group_slot.five_hour,
+            Window::Weekly => &mut group_slot.weekly,
+        };
+        *slot = Some(bucket);
     }
 
     if snapshot.gemini.is_empty() && snapshot.third_party.is_empty() {
@@ -211,6 +216,12 @@ Claude and GPT models\tFive Hour Limit Remaining\t100%\t1970-01-01T00:00:00Z\n";
         let gemini_week = snapshot.gemini.weekly.expect("gemini weekly");
         assert_eq!(gemini_week.used_percent, 11);
         assert!(gemini_week.resets_at.is_some());
+        // 第一列就是组名，命令行版也据此写标题
+        assert_eq!(snapshot.gemini.name.as_deref(), Some("Gemini Models"));
+        assert_eq!(
+            snapshot.third_party.name.as_deref(),
+            Some("Claude and GPT models")
+        );
 
         let gemini_five = snapshot.gemini.five_hour.expect("gemini 5h");
         assert_eq!(gemini_five.used_percent, 23);

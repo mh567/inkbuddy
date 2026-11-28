@@ -11,12 +11,14 @@ pub fn width_class(used_percent: u32) -> &'static str {
     CLASSES[((bucket + 2) / 5) as usize]
 }
 
-/// 套餐名；缺失或空白时降级为「未知套餐」，其余原样返回。
-pub fn plan_text(raw: Option<&str>) -> String {
-    match raw {
-        Some(value) if !value.trim().is_empty() => value.trim().to_string(),
-        _ => "未知套餐".to_string(),
-    }
+/// 套餐名；缺失或空白时返回 `None`，页面上不占位。
+///
+/// 命令行版 `/usage` 的输出里没有套餐名，只有语言服务器能给出；
+/// 读不到时宁可不显示，也不写一个占位词。
+pub fn plan_text(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 /// 距重置时间的倒计时文字；分钟数向上取整。
@@ -148,13 +150,13 @@ mod tests {
     }
 
     #[test]
-    fn plan_text_trims_and_falls_back() {
-        assert_eq!(plan_text(Some("Pro")), "Pro");
-        assert_eq!(plan_text(Some(" Pro ")), "Pro");
-        assert_eq!(plan_text(Some("Ultra")), "Ultra");
-        assert_eq!(plan_text(Some("")), "未知套餐");
-        assert_eq!(plan_text(Some("   ")), "未知套餐");
-        assert_eq!(plan_text(None), "未知套餐");
+    fn plan_text_trims_and_drops_empty() {
+        assert_eq!(plan_text(Some("Pro")).as_deref(), Some("Pro"));
+        assert_eq!(plan_text(Some(" Pro ")).as_deref(), Some("Pro"));
+        assert_eq!(plan_text(Some("Ultra")).as_deref(), Some("Ultra"));
+        assert_eq!(plan_text(Some("")), None);
+        assert_eq!(plan_text(Some("   ")), None);
+        assert_eq!(plan_text(None), None);
     }
 
     #[test]

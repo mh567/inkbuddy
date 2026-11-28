@@ -74,6 +74,12 @@ async fn collects_quota_and_plan_from_local_server() {
     assert_eq!(snapshot.gemini.weekly.expect("weekly").used_percent, 50);
     assert_eq!(snapshot.gemini.five_hour.expect("5h").used_percent, 25);
     assert_eq!(snapshot.third_party.weekly.expect("3p weekly").used_percent, 0);
+    // 组名从 displayName 带上来，页面标题用它
+    assert_eq!(snapshot.gemini.name.as_deref(), Some("Gemini Models"));
+    assert_eq!(
+        snapshot.third_party.name.as_deref(),
+        Some("Claude and GPT models")
+    );
 
     let requests = server.await.expect("server task");
     assert_eq!(requests.len(), 2);

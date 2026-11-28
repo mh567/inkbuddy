@@ -115,6 +115,7 @@ mod tests {
             plan: Some("Pro".to_string()),
             source: crate::model::Source::Cli,
             gemini: Group {
+                name: Some("Gemini Models".to_string()),
                 five_hour: Some(Bucket {
                     used_percent: 24,
                     resets_at: Some(now + 3600),
@@ -130,6 +131,7 @@ mod tests {
                     resets_at: None,
                 }),
                 weekly: None,
+                ..Group::default()
             },
             updated_at: Some(now),
             failure: None,
@@ -147,6 +149,8 @@ mod tests {
         assert_eq!(loaded.updated_at, Some(now));
         assert_eq!(loaded.plan.as_deref(), Some("Pro"));
         assert_eq!(loaded.gemini.five_hour.expect("5h").used_percent, 24);
+        // 组名一起入盘，拉起时标题不用等第一轮取数
+        assert_eq!(loaded.gemini.name.as_deref(), Some("Gemini Models"));
         assert_eq!(loaded.third_party.weekly, None);
         assert_eq!(loaded.failure, None);
         // 来源不入盘：读回来一律按本地语言服务器算，重启后由第一轮取数重新判定

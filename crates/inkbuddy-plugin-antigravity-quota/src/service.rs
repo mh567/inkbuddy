@@ -128,6 +128,9 @@ async fn run(
             Ok(mut snapshot) => {
                 last_reason = None;
                 idle_since = None;
+                // 命令行版的 `/usage` 输出里没有套餐名，这一轮就用上一次读到的，
+                // 别把已经知道的套餐擦掉；语言服务器读到新值时自然覆盖。
+                inherit_plan(&mut snapshot, &tx.borrow());
                 snapshot.updated_at = Some(unix_now());
                 let from_cli = snapshot.source == Source::Cli;
                 if let Err(err) = store::save(&cache, &snapshot) {
@@ -191,6 +194,16 @@ fn unix_now() -> i64 {
         .unwrap_or_default()
 }
 
+/// 这一轮没读到套餐名时沿用上一份快照的套餐名；读到了就用新的。
+///
+/// 只有语言服务器能给出套餐名，命令行版没有这一项。不沿用的话，走一次
+/// 命令行版就会把已知套餐写回空值。
+fn inherit_plan(incoming: &mut Snapshot, previous: &Snapshot) {
+    if incoming.plan.is_none() {
+        incoming.plan = previous.plan.clone();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +243,35 @@ mod tests {
         // 慢路径的判定要短于一次命令行调用（约 6 秒），也要长于本地 RPC（毫秒级）
         assert!(SLOW_ROUND < Duration::from_secs(6));
         assert!(SLOW_ROUND > Duration::from_secs(1));
+    }
+
+    #[test]
+    fn plan_survives_a_read_that_has_no_plan() {
+        let previous = Snapshot {
+            plan: Some("Pro".to_string()),
+            ..Snapshot::default()
+        };
+
+        // 命令行版读到额度但没有套餐名：保留上一次的套餐
+        let mut from_cli = Snapshot {
+            plan: None,
+            source: Source::Cli,
+            ..Snapshot::default()
+        };
+        inherit_plan(&mut from_cli, &previous);
+        assert_eq!(from_cli.plan.as_deref(), Some("Pro"));
+
+        // 语言服务器读到新套餐：以新的为准
+        let mut from_local = Snapshot {
+            plan: Some("Ultra".to_string()),
+            ..Snapshot::default()
+        };
+        inherit_plan(&mut from_local, &previous);
+        assert_eq!(from_local.plan.as_deref(), Some("Ultra"));
+
+        // 上一份也没有套餐名时保持为空，不编一个值
+        let mut first_read = Snapshot::default();
+        inherit_plan(&mut first_read, &Snapshot::default());
+        assert_eq!(first_read.plan, None);
     }
 }

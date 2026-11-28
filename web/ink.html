@@ -271,6 +271,14 @@
     background-image: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 24 24%27%3E%3Cpath fill=%27%23000%27 d=%27M5 5 L7 5 L14 12 L7 19 L5 19 L12 12 Z M13 17 H22 V19.5 H13 Z%27/%3E%3C/svg%3E");
     background-size: contain; background-repeat: no-repeat; background-position: center;
   }
+  /* 反重力图标：向上的箭头，纯黑填充，反色时随其他图标一起翻白。 */
+  .quota-mark-ag {
+    flex: 0 0 auto;
+    width: calc(4.2vw * var(--ink-scale, 1));
+    height: calc(4.2vw * var(--ink-scale, 1));
+    background-image: url("data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 24 24%27%3E%3Cpath fill=%27%23000%27 d=%27M12 2.2 L20.4 10.6 L15.5 10.6 L15.5 21.8 L8.5 21.8 L8.5 10.6 L3.6 10.6 Z%27/%3E%3C/svg%3E");
+    background-size: contain; background-repeat: no-repeat; background-position: center;
+  }
   .quota-brand {
     font-size: calc(3.4vw * var(--ink-scale, 1));
     font-weight: 700; letter-spacing: .06em;
@@ -285,7 +293,7 @@
     gap: calc(1.5vw * var(--ink-scale, 1));
     font-size: calc(2.6vw * var(--ink-scale, 1));
   }
-  /* 分组标题：一组模型（Gemini、Claude 与 GPT）占一行的额度卡用它分段。 */
+  /* 分组标题：一份共享额度池占一行，标题用接口给的组名（如 Gemini Models）。 */
   .quota-group {
     margin-top: calc(0.8vw * var(--ink-scale, 1));
     font-size: calc(2.2vw * var(--ink-scale, 1));
@@ -340,6 +348,7 @@
   /* 反色：图标翻白，进度条黑白互换，辅助文字推到白灰，提示文字翻白。 */
   body.invert .quota-mark { filter: invert(1); }
   body.invert .quota-mark-cc { filter: invert(1); }
+  body.invert .quota-mark-ag { filter: invert(1); }
   body.invert .quota-bar { border-color: #ffffff; background: #000000; }
   body.invert .quota-fill { background: #ffffff; }
   body.invert .quota-meta, body.invert .quota-reset,
