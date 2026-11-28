@@ -8,6 +8,35 @@ final class MenuPreviewModel: ObservableObject {
     @Published var name: String = "未选择视图"
 }
 
+/// 面板里的小按钮：悬停时垫一层圆角底色，看得见可点范围，按下再压暗一点。
+/// hover 状态用 ObservableObject 承载：命令行构建下 @State 宏不可用，
+/// 且 ButtonStyle 本身不是 View，包装器要放进内层的 View 才有生命周期。
+private final class PanelHoverState: ObservableObject {
+    @Published var hovering = false
+}
+
+private struct HoverButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HoverBody(configuration: configuration)
+    }
+
+    private struct HoverBody: View {
+        let configuration: Configuration
+        @StateObject private var hover = PanelHoverState()
+
+        var body: some View {
+            configuration.label
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(hover.hovering ? Color.primary.opacity(0.10) : Color.clear)
+                )
+                .opacity(configuration.isPressed ? 0.55 : 1)
+                .onHover { hover.hovering = $0 }
+                .animation(.easeOut(duration: 0.12), value: hover.hovering)
+        }
+    }
+}
+
 /// 状态栏弹出面板的内容：◀ 视图名 ▶、实时预览、设置与退出。
 ///
 /// 预览画布与设置里的编辑器预览共用 InkPreviewCanvas，显示 host
@@ -32,7 +61,7 @@ struct MenuPanelView: View {
                         .frame(width: 32, height: 26)
                         .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(HoverButtonStyle())
                 .help("上一个视图")
 
                 Spacer(minLength: 4)
@@ -50,7 +79,7 @@ struct MenuPanelView: View {
                         .frame(width: 32, height: 26)
                         .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(HoverButtonStyle())
                 .help("下一个视图")
             }
             .padding(.horizontal, 8)
@@ -70,14 +99,22 @@ struct MenuPanelView: View {
 
             HStack(spacing: 8) {
                 Button(action: onSettings) {
-                    Text("设置").foregroundColor(.accentColor)
+                    Text("设置")
+                        .foregroundColor(.accentColor)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(HoverButtonStyle())
                 Spacer(minLength: 4)
                 Button(action: onQuit) {
-                    Text("退出 inkbuddy").foregroundColor(.accentColor)
+                    Text("退出 inkbuddy")
+                        .foregroundColor(.accentColor)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(HoverButtonStyle())
             }
             .font(.system(size: 12))
             .padding(.horizontal, 12)
