@@ -104,6 +104,9 @@ async fn run(
     let mut last_reason: Option<&'static str> = None;
     // 待机：反重力没开时只盯活动痕迹，有动静才跑一次完整取数。
     let mut idle_since: Option<tokio::time::Instant> = None;
+    // 待机期间的本机有没有 agy：有就按命令行版的间隔定期读一次，
+    // 额度重置发生在服务端，一直不读数字就停在旧值。
+    let mut idle_cli_fallback = false;
     let mut stamp = discovery::activity_stamp();
     loop {
         // 待机时每 10 秒看一次日志和会话目录的修改时间；有变化就立刻取数，
@@ -116,7 +119,8 @@ async fn run(
             let now = discovery::activity_stamp();
             let woke = now != stamp;
             stamp = now;
-            if !woke && since.elapsed() < IDLE_PROBE {
+            let wake = idle_wake_interval(idle_cli_fallback);
+            if !woke && since.elapsed() < wake {
                 continue;
             }
         }
@@ -128,6 +132,7 @@ async fn run(
             Ok(mut snapshot) => {
                 last_reason = None;
                 idle_since = None;
+                idle_cli_fallback = false;
                 // 命令行版的 `/usage` 输出里没有套餐名，这一轮就用上一次读到的，
                 // 别把已经知道的套餐擦掉；语言服务器读到新值时自然覆盖。
                 inherit_plan(&mut snapshot, &tx.borrow());
@@ -161,8 +166,10 @@ async fn run(
                     quota::FAILURE_NOT_RUNNING | quota::FAILURE_NOT_FOUND
                 );
                 if not_running {
-                    // 记下当前痕迹，之后只有更新的活动才会把它叫醒。
+                    // 记下当前痕迹，之后只有更新的活动、或者命令行版的
+                    // 轮询间隔到了（本机有 agy 时），才会再跑一次取数。
                     idle_since = Some(tokio::time::Instant::now());
+                    idle_cli_fallback = crate::cli::binary().is_some();
                     stamp = discovery::activity_stamp();
                     Duration::ZERO
                 } else if slow {
@@ -184,6 +191,16 @@ async fn run(
                 _ = tokio::time::sleep(delay) => {}
             }
         }
+    }
+}
+
+/// 待机时多久主动跑一次完整取数。有 `agy` 时按命令行版的间隔，
+/// 没有就只留兜底探测——反重力没开又没有命令行版，额度没有来源。
+fn idle_wake_interval(cli_available: bool) -> Duration {
+    if cli_available {
+        CLI_POLL_INTERVAL
+    } else {
+        IDLE_PROBE
     }
 }
 
@@ -233,6 +250,19 @@ mod tests {
         assert!(IDLE_TICK <= Duration::from_secs(15));
         // 有活动要立刻恢复监控，不能被兜底探测的周期拖住
         assert!(IDLE_PROBE > RETRY_INTERVAL);
+    }
+
+    #[test]
+    fn idle_wake_runs_the_cli_on_schedule_when_available() {
+        // 有 agy：按命令行版间隔定期读，比重启探测快
+        assert_eq!(
+            idle_wake_interval(true),
+            CLI_POLL_INTERVAL,
+            "有命令行版时待机也要定期读额度"
+        );
+        assert!(CLI_POLL_INTERVAL < IDLE_PROBE);
+        // 没有 agy：额度没有来源，保持长兜底
+        assert_eq!(idle_wake_interval(false), IDLE_PROBE);
     }
 
     #[test]

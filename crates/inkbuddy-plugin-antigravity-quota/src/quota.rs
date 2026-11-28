@@ -61,13 +61,14 @@ impl Failure {
 /// 取一次额度；失败时返回给用户看的文案。
 ///
 /// 先按语言服务器读；有端口应答却读不出来，说明是命令行版（令牌留在进程内），
-/// 改走 `agy -p "/usage"`。一个端口都没应答时不必起进程，直接报「未运行」。
+/// 改走 `agy -p "/usage"`。反重力整个没开时端口一个都不应答，但额度照样会
+/// 变（重置发生在服务端），本机有 `agy` 时也走一次命令行版；没有才报「未运行」。
 pub async fn collect() -> Result<Snapshot, Failure> {
     let failure = match collect_candidates(discovery::candidates().await).await {
         Ok(snapshot) => return Ok(snapshot),
         Err(failure) => failure,
     };
-    if !failure.answered {
+    if !failure.answered && crate::cli::binary().is_none() {
         return Err(failure);
     }
 
