@@ -1,6 +1,6 @@
 //! 把额度数据转成宿主页面可直接使用的字符串。
 
-use crate::model::{normalize_plan, plan_credit_pool};
+use crate::model::{plan_credit_pool, plan_tier};
 
 /// 把 0..=100 的百分比四舍五入到最近的 5%，返回对应的进度条 class。
 /// 超出范围的值钳到 0 或 100。
@@ -134,7 +134,7 @@ fn round_clamp_percent(value: f64) -> u32 {
     value.round().clamp(0.0, 100.0) as u32
 }
 
-/// 把 planId 映射成可读套餐名；内置档位按归一化结果不区分大小写匹配。
+/// 把 planId 映射成可读套餐名；带账号类型前缀的写法（`individual-goat`）按整词认档位。
 /// 未收录的档位保留接口原始值，缺失或空白返回「未知套餐」。
 pub fn plan_label(raw: Option<&str>) -> String {
     let Some(value) = raw else {
@@ -143,16 +143,10 @@ pub fn plan_label(raw: Option<&str>) -> String {
     if value.trim().is_empty() {
         return "未知套餐".to_string();
     }
-    match normalize_plan(value).as_str() {
-        "go" => "Go",
-        "goat" => "GOAT",
-        "pro" => "Pro",
-        "max" => "Max",
-        "ultra" => "Ultra",
-        "teams pro" => "Teams Pro",
-        _ => return value.to_string(),
+    match plan_tier(value) {
+        Some(tier) => tier.label.to_string(),
+        None => value.to_string(),
     }
-    .to_string()
 }
 
 #[cfg(test)]
@@ -419,6 +413,10 @@ mod tests {
             ("teams_pro_v1", "Teams Pro"),
             ("TeamsPro", "Teams Pro"),
             (" Ultra ", "Ultra"),
+            // 接口实际返回的 planId 带账号类型前缀。
+            ("individual-goat", "GOAT"),
+            ("individual-go", "Go"),
+            ("team-pro", "Pro"),
         ];
         for (raw, expected) in cases {
             assert_eq!(plan_label(Some(raw)), expected, "plan {raw}");

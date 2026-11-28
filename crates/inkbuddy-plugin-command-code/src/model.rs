@@ -98,23 +98,71 @@ fn strip_version_tail(lower: &str) -> &str {
     lower
 }
 
-/// 内置套餐 credit 池，用于月度百分比换算。
-const PLAN_CREDIT_POOLS: [(&str, f64); 6] = [
-    ("Go", 10.0),
-    ("GOAT", 70.0),
-    ("Pro", 30.0),
-    ("Max", 150.0),
-    ("Ultra", 300.0),
-    ("Teams Pro", 40.0),
+/// 一个套餐档位：显示名、匹配键、套餐自带的 credit 池。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlanTier {
+    /// 页面上显示的档位名。
+    pub label: &'static str,
+    /// 归一化后的匹配键，空格分隔；`planId` 里出现这串整词就算命中。
+    pub key: &'static str,
+    /// 套餐自带 credit 池，用于月度百分比换算。
+    pub credit_pool: f64,
+}
+
+/// 内置档位表。接口的 `planId` 带账号类型前缀（如 `individual-goat`），
+/// 所以按整词命中查表，长的键排在前面，免得 `pro` 先吃掉 `teams pro`。
+const PLAN_TIERS: [PlanTier; 6] = [
+    PlanTier {
+        label: "Teams Pro",
+        key: "teams pro",
+        credit_pool: 40.0,
+    },
+    PlanTier {
+        label: "GOAT",
+        key: "goat",
+        credit_pool: 70.0,
+    },
+    PlanTier {
+        label: "Ultra",
+        key: "ultra",
+        credit_pool: 300.0,
+    },
+    PlanTier {
+        label: "Max",
+        key: "max",
+        credit_pool: 150.0,
+    },
+    PlanTier {
+        label: "Pro",
+        key: "pro",
+        credit_pool: 30.0,
+    },
+    PlanTier {
+        label: "Go",
+        key: "go",
+        credit_pool: 10.0,
+    },
 ];
+
+/// 从 `planId` 里认出档位：归一化后按整词比对，`individual-goat` 归到 GOAT。
+/// 未收录的档位返回 `None`，显示层保留接口原文。
+pub fn plan_tier(plan: &str) -> Option<&'static PlanTier> {
+    let normalized = normalize_plan(plan);
+    if normalized.is_empty() {
+        return None;
+    }
+    let tokens: Vec<&str> = normalized.split(' ').collect();
+    PLAN_TIERS.iter().find(|tier| {
+        let key: Vec<&str> = tier.key.split(' ').collect();
+        tokens
+            .windows(key.len())
+            .any(|window| window == key.as_slice())
+    })
+}
 
 /// 按归一化后的 planId 查内置 credit 池上限；未收录的套餐返回 `None`。
 pub fn plan_credit_pool(plan: Option<&str>) -> Option<f64> {
-    let normalized = normalize_plan(plan?);
-    PLAN_CREDIT_POOLS
-        .iter()
-        .find(|(name, _)| normalize_plan(name) == normalized)
-        .map(|(_, cap)| *cap)
+    plan_tier(plan?).map(|tier| tier.credit_pool)
 }
 
 /// 凭据缺失时的终态提示；整块页面换成这条提示。
@@ -162,12 +210,31 @@ mod tests {
             ("Teams Pro", 40.0),
             ("teams_pro_v1", 40.0),
             ("TeamsPro", 40.0),
+            // 接口实际返回带前缀的 planId。
+            ("individual-goat", 70.0),
+            ("individual-go", 10.0),
         ];
         for (raw, expected) in cases {
             assert_eq!(plan_credit_pool(Some(raw)), Some(expected), "plan {raw}");
         }
         assert_eq!(plan_credit_pool(Some("mystery-plan")), None);
         assert_eq!(plan_credit_pool(None), None);
+    }
+
+    #[test]
+    fn plan_tier_matches_whole_words_only() {
+        assert_eq!(plan_tier("individual-goat").map(|t| t.label), Some("GOAT"));
+        // `go` 不能吃掉 `goat`，`pro` 也不能吃掉 `teams pro`。
+        assert_eq!(plan_tier("goat").map(|t| t.label), Some("GOAT"));
+        assert_eq!(plan_tier("go").map(|t| t.label), Some("Go"));
+        assert_eq!(
+            plan_tier("teams_pro_v1").map(|t| t.label),
+            Some("Teams Pro")
+        );
+        // 没有整词命中就当作未收录，交给显示层保留原文。
+        assert_eq!(plan_tier("gopher"), None);
+        assert_eq!(plan_tier("ultraplus"), None);
+        assert_eq!(plan_tier("  "), None);
     }
 
     #[test]

@@ -160,7 +160,7 @@ pub fn apply_subscriptions(snapshot: &mut QuotaSnapshot, value: &Value, previous
     let Some(subscription) = pick_subscription(value) else {
         return;
     };
-    snapshot.plan = subscription.get("planId").and_then(string_value);
+    snapshot.plan = subscription_plan(subscription);
     let resets_at = subscription
         .get("currentPeriodEnd")
         .and_then(parse_reset_at)
@@ -180,6 +180,7 @@ pub fn apply_subscriptions(snapshot: &mut QuotaSnapshot, value: &Value, previous
 
 /// credit 与两个滚动窗口写入快照；百分比按 `used` 和 `cap` 换算，有重置时间则沿用。
 pub fn apply_credits(snapshot: &mut QuotaSnapshot, value: &Value, previous: &QuotaSnapshot) {
+    let value = unwrap_data(value);
     if let Some(credits) = value.get("credits") {
         let monthly = number(credits.get("monthlyCredits"));
         let purchased = number(credits.get("purchasedCredits"));
@@ -281,10 +282,12 @@ pub async fn fetch_snapshot(
 /// 两个计费响应里是否带了任何可识别的额度字段。
 fn has_billing_data(subscriptions: &Value, credits: &Value) -> bool {
     let subscription_fields = pick_subscription(subscriptions).is_some_and(|sub| {
-        ["planId", "currentPeriodStart", "currentPeriodEnd"]
-            .iter()
-            .any(|key| sub.get(key).is_some())
+        subscription_plan(sub).is_some()
+            || ["currentPeriodStart", "currentPeriodEnd"]
+                .iter()
+                .any(|key| sub.get(key).is_some())
     });
+    let credits = unwrap_data(credits);
     let credit_fields = credits.get("credits").is_some_and(|value| {
         ["monthlyCredits", "purchasedCredits", "freeCredits"]
             .iter()
@@ -364,28 +367,63 @@ fn same_origin(requested: &Url, actual: &Url) -> bool {
         && requested.port_or_known_default() == actual.port_or_known_default()
 }
 
-fn pick_subscription(value: &Value) -> Option<&Value> {
-    if let Some(items) = value.as_array() {
-        return items
-            .iter()
-            .find(|item| {
-                item.get("status")
-                    .and_then(Value::as_str)
-                    .is_some_and(|status| status.eq_ignore_ascii_case("active"))
-            })
-            .or_else(|| items.first());
+/// 计费接口把结果包在 `{"success":true,"data":{…}}` 里；取内层，没有这层就原样用。
+fn unwrap_data(value: &Value) -> &Value {
+    match value.get("data") {
+        Some(inner) if inner.is_object() || inner.is_array() => inner,
+        _ => value,
     }
-    value.is_object().then_some(value)
+}
+
+/// 挑出当前订阅：接口可能直接给对象，也可能给数组或 `{"subscriptions":[…]}`。
+fn pick_subscription(value: &Value) -> Option<&Value> {
+    let value = unwrap_data(value);
+    let items = if let Some(items) = value.as_array() {
+        items
+    } else if let Some(items) = value.get("subscriptions").and_then(Value::as_array) {
+        items
+    } else {
+        return value.is_object().then_some(value);
+    };
+    items
+        .iter()
+        .find(|item| {
+            item.get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| status.eq_ignore_ascii_case("active"))
+        })
+        .or_else(|| items.first())
+}
+
+/// 订阅里的套餐字段；不同版本用过 `planId` / `plan` / `tier`，也认嵌套的 `plan.id`、`plan.name`。
+fn subscription_plan(subscription: &Value) -> Option<String> {
+    for key in ["planId", "plan", "tier"] {
+        let Some(field) = subscription.get(key) else {
+            continue;
+        };
+        if let Some(plan) = string_value(field) {
+            return Some(plan);
+        }
+        if let Some(plan) = field.get("id").and_then(string_value) {
+            return Some(plan);
+        }
+        if let Some(plan) = field.get("name").and_then(string_value) {
+            return Some(plan);
+        }
+    }
+    None
 }
 
 /// 窗口滚动时接口可能省略整个窗口或 cap/used；此时沿用旧重置时间，百分比写 None。
 /// 连重置时间也拿不到时才整行留 None。
+/// 接口用 `resetAt: 0` 表示这个窗口还没开始计时，按没有重置时间处理。
 fn parse_window(value: Option<&Value>, previous: Option<&QuotaWindow>) -> Option<QuotaWindow> {
     let used_percent = value
         .and_then(|value| used_cap_percent(number(value.get("used")), number(value.get("cap"))));
     let resets_at = value
         .and_then(|value| value.get("resetAt"))
         .and_then(parse_reset_at)
+        .filter(|stamp| *stamp > 0)
         .or_else(|| previous.and_then(|window| window.resets_at));
     (used_percent.is_some() || resets_at.is_some()).then_some(QuotaWindow {
         used_percent,

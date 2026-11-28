@@ -234,6 +234,70 @@ async fn fetch_requests_four_read_only_gets_with_headers_and_maps_fields() {
 }
 
 #[tokio::test]
+async fn wrapped_subscription_response_and_prefixed_plan_id_are_understood() {
+    // 真实接口：订阅包在 {"success":true,"data":{…}} 里，planId 带账号类型前缀，
+    // 没用过的窗口给 resetAt: 0。三者都要按实际含义解析。
+    let server = FakeServer::start(Arc::new(|path| {
+        let route = path.split('?').next().unwrap_or(path);
+        match route {
+            "/alpha/whoami" => (200, vec![], "{}".to_string()),
+            "/alpha/billing/subscriptions" => (
+                200,
+                vec![],
+                json!({
+                    "success": true,
+                    "data": {
+                        "id": "sub_1",
+                        "status": "active",
+                        "planId": "individual-goat",
+                        "currentPeriodStart": "2026-11-14T02:44:35.000Z",
+                        "currentPeriodEnd": "2026-12-14T02:44:35.000Z"
+                    }
+                })
+                .to_string(),
+            ),
+            "/alpha/billing/credits" => (
+                200,
+                vec![],
+                json!({
+                    "credits": {
+                        "monthlyCredits": 34.6035274374,
+                        "purchasedCredits": 5.6425826001,
+                        "freeCredits": 0
+                    },
+                    "windowLimits": {
+                        "fiveHour": {"used": 0, "cap": 14, "resetAt": 0},
+                        "weekly": {"used": 19.0944469005, "cap": 35, "resetAt": 1795865557036_i64}
+                    }
+                })
+                .to_string(),
+            ),
+            "/alpha/usage/summary" => (200, vec![], "{}".to_string()),
+            _ => (404, vec![], "{}".to_string()),
+        }
+    }))
+    .await;
+    let client = build_client();
+    let snapshot = fetch_snapshot(&client, &server.base, "test-key", &QuotaSnapshot::default())
+        .await
+        .unwrap();
+
+    assert_eq!(snapshot.plan.as_deref(), Some("individual-goat"));
+    // 月行按 GOAT 池 70 算：(70-34.6)/70 ≈ 51%。
+    let monthly = snapshot.monthly.unwrap();
+    assert_eq!(monthly.used_percent, Some(51));
+    assert_eq!(monthly.resets_at, Some(1797216275));
+    // resetAt: 0 是「窗口还没开始」，不是「马上重置」。
+    let five = snapshot.five_hour.unwrap();
+    assert_eq!(five.used_percent, Some(0));
+    assert_eq!(five.resets_at, None);
+    let weekly = snapshot.weekly.unwrap();
+    assert_eq!(weekly.used_percent, Some(55));
+    assert_eq!(weekly.resets_at, Some(1795865557));
+    server.handle.abort();
+}
+
+#[tokio::test]
 async fn monthly_percent_uses_plan_credits_and_excludes_extras() {
     // GOAT 池 70；monthlyCredits 50，purchased 10，free 2.4。
     // 月行按套餐单项算 (70-50)/70 ≈ 29%，额外 credit 只进顶部总额。

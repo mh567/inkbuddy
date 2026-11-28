@@ -11,9 +11,9 @@
 - 第三行：「本周」窗口的已用百分比进度条，以及距重置的倒计时。
 - 第四行：「本月」窗口的已用百分比进度条，以及本期结束倒计时。
 
-套餐名识别 Go、GOAT、Pro、Max、Ultra、Teams Pro；接口返回其他 `planId` 时直接显示原始值。进度条按 5% 取整，填充宽度由 `q-0` 到 `q-100` 共 21 档预设 class 控制。
+套餐名按整词识别 Go、GOAT、Pro、Max、Ultra、Teams Pro，接口的 `planId` 带账号类型前缀（如 `individual-goat`）也能认出来，页面上写 `GOAT`；接口返回其他 `planId` 时直接显示原始值。进度条按 5% 取整，填充宽度由 `q-0` 到 `q-100` 共 21 档预设 class 控制。
 
-月度行只按套餐自带的 credit 池计算百分比。顶部显示的剩余 credit 是套餐剩余 credit、购买 credit 和赠送 credit 三项之和，额外购买和赠送的部分只进入顶部总额，算作套餐外的余量。5 小时与周窗口的百分比按接口返回的 `used` 和 `cap` 换算，`cap` 或 `used` 缺失时该行显示 `--` 和空进度条；重置时间已知时倒计时继续走，重置时间也取不到时显示「暂无数据」。倒计时不足 1 小时按分钟写，不超过 24 小时按「X 小时 X 分」写，超过 24 小时按「X 天 X 小时」写，整天只写「X 天」。
+月度行只按套餐自带的 credit 池计算百分比，池子上限按 `planId` 认出的档位查表。顶部显示的剩余 credit 是套餐剩余 credit、购买 credit 和赠送 credit 三项之和，额外购买和赠送的部分只进入顶部总额，算作套餐外的余量。5 小时与周窗口的百分比按接口返回的 `used` 和 `cap` 换算，`cap` 或 `used` 缺失时该行显示 `--` 和空进度条；重置时间已知时倒计时继续走，重置时间也取不到时显示「暂无数据」。接口用 `resetAt: 0` 表示这个窗口还没开始计时，已用为 0% 时该行写「未使用」。倒计时不足 1 小时按分钟写，不超过 24 小时按「X 小时 X 分」写，超过 24 小时按「X 天 X 小时」写，整天只写「X 天」。
 
 ## 数据来源
 
@@ -22,7 +22,7 @@
 插件向 `api.commandcode.ai` 发四个只读 GET，认证头是 `Authorization: Bearer <key>`，另带 CLI 标识头 `x-command-code-version` 和 `x-cli-environment`：
 
 1. `GET /alpha/whoami` 取账号与组织 id。
-2. `GET /alpha/billing/subscriptions` 取套餐 id 与本期起止时间。
+2. `GET /alpha/billing/subscriptions` 取套餐 id 与本期起止时间。这条响应包在 `{"success":true,"data":{…}}` 里，`planId`、`currentPeriodStart`、`currentPeriodEnd` 都在 `data` 内层。
 3. `GET /alpha/billing/credits` 取剩余 credit 与 5 小时、周窗口的用量和重置时间。
 4. `GET /alpha/usage/summary` 取本期请求数、花费与 token 数，存进快照供后续使用。
 

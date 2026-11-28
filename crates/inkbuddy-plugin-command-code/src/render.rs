@@ -67,7 +67,12 @@ fn render_row(label: &str, window: Option<&QuotaWindow>, now: i64) -> String {
         Some(p) => (
             width_class(p),
             format!("{p}%"),
-            reset_countdown(resets_at, now),
+            // 0% 且没有重置时间：这个窗口还没开始计时，接口给的是 resetAt: 0。
+            if p == 0 && resets_at.is_none() {
+                "未使用".to_string()
+            } else {
+                reset_countdown(resets_at, now)
+            },
         ),
         // 算不出百分比时百分比列写 --；重置时间已知就让倒计时继续走。
         None => (
