@@ -191,10 +191,10 @@ struct SettingsView: View {
     /// 待确认停用的扩展（alert 确认后真正调用停用接口）
     @ObservedObject private var pending = PendingUninstall()
 
-    /// 在线设备摘要行：台数与各自实测比例。
+    /// 在线设备摘要：台数、设备短 ID 与对应的宽高比。
     static func deviceSummary(_ devices: [DeviceReport]) -> String {
-        let aspects = devices.map { String(format: "%.2f", $0.aspect) }.joined(separator: " / ")
-        return "\(devices.count) 台在线 · 比例 \(aspects)（60 秒内上报）"
+        let heading = "\(devices.count) 台在线（60 秒内上报）"
+        return ([heading] + devices.map(\.displayLabel)).joined(separator: "\n")
     }
 
     var body: some View {

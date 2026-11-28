@@ -583,7 +583,7 @@ struct ViewEditorView: View {
                 Picker("跟随", selection: $host.followDeviceId) {
                     Text("不跟随").tag(String?.none)
                     ForEach(host.devices) { device in
-                        Text("跟随 \(Self.shortDeviceId(device.id)) · \(String(format: "%.2f", device.aspect))")
+                        Text("跟随 \(device.displayLabel)")
                             .tag(Optional(device.id))
                     }
                 }
@@ -643,11 +643,6 @@ struct ViewEditorView: View {
                 host.followDeviceId = nil
             }
         }
-    }
-
-    /// 设备 id 展示为前 6 位：随机串太长，顶栏放下下。
-    private static func shortDeviceId(_ id: String) -> String {
-        String(id.prefix(6))
     }
 
     private var canSave: Bool {

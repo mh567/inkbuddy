@@ -109,6 +109,25 @@ struct DeviceReport: Identifiable, Decodable, Equatable {
     let id: String
     let aspect: Double
     let seen: Double
+
+    var displayLabel: String {
+        "\(id.prefix(6)) · \(aspectLabel)"
+    }
+
+    private var aspectLabel: String {
+        guard (0.25...4.0).contains(aspect) else { return "比例未知" }
+
+        // 从最小分母开始，优先显示误差在 0.5% 内的简单整数比。
+        for height in 1...512 {
+            let width = Int((aspect * Double(height)).rounded())
+            let error = abs(Double(width) / Double(height) - aspect)
+            if error <= aspect * 0.005 {
+                let prefix = error < 0.000001 ? "" : "≈"
+                return "\(prefix)\(width):\(height)"
+            }
+        }
+        return "比例未知"
+    }
 }
 
 /// /api/health 的负载：60 秒内上报过的设备清单。
