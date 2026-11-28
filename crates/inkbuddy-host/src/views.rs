@@ -177,10 +177,29 @@ pub fn save(state: &ViewState) {
     }
 }
 
-/// Load the stored state; when no file exists yet, seed default views from the
-/// discovered plugins: one view per plugin plus an "all" view with every
-/// default_on plugin, each as a stacked full-width layout. The seeded state is
-/// written back so a later edit does not re-seed over it.
+/// 新用户的预制视图：时钟、歌词、ChatGPT 额度。每个视图整屏放一个插件；
+/// 只播种已安装的插件，没安装的插件留在视图里只会渲染出一块空白。
+/// 清单固定顺序，名称取插件 manifest。
+fn preset_views(installed: &[(String, String)]) -> Vec<View> {
+    const ORDER: [&str; 3] = ["clock", "lyrics", "ai-quota"];
+    ORDER
+        .iter()
+        .filter_map(|pid| {
+            installed
+                .iter()
+                .find(|(id, _)| id == pid)
+                .map(|(_, name)| View {
+                    id: pid.to_string(),
+                    name: name.clone(),
+                    regions: vec![Region::stacked(pid, 0, 1)],
+                })
+        })
+        .collect()
+}
+
+/// Load the stored state; when no file exists yet, seed the preset views
+/// (时钟、歌词、ChatGPT 额度，已安装的才播种). The seeded state is written
+/// back so a later edit does not re-seed over it.
 pub fn load_or_seed(set: &PluginSet) -> ViewState {
     if let Some(p) = path() {
         if p.exists() {
@@ -188,36 +207,19 @@ pub fn load_or_seed(set: &PluginSet) -> ViewState {
         }
     }
 
-    let mut views = Vec::new();
-    for (i, id) in set.order.iter().enumerate() {
-        let Some(p) = set.get(id) else { continue };
-        views.push(View {
-            id: id.clone(),
-            name: p.manifest.plugin.name.clone(),
-            regions: vec![Region::stacked(id, 0, 1)],
-        });
-        let _ = i; // 单插件视图只占一格
-    }
-    let defaults = set.default_ids();
-    if !defaults.is_empty()
-        && !views
-            .iter()
-            .any(|v| v.regions.len() == defaults.len() && v.regions.iter().zip(&defaults).all(|(r, d)| &r.plugin == d))
-    {
-        views.push(View {
-            id: "all".to_string(),
-            name: "全部".to_string(),
-            regions: defaults
-                .iter()
-                .enumerate()
-                .map(|(i, id)| Region::stacked(id, i, defaults.len()))
-                .collect(),
-        });
-    }
+    let installed: Vec<(String, String)> = set
+        .order
+        .iter()
+        .filter_map(|id| {
+            set.plugins
+                .get(id)
+                .map(|p| (id.clone(), p.manifest.plugin.name.clone()))
+        })
+        .collect();
 
     let state = ViewState {
         current: None,
-        views,
+        views: preset_views(&installed),
     };
     save(&state);
     state
@@ -313,6 +315,22 @@ mod tests {
         assert_eq!(view.regions[1].plugin, "clock");
         assert_eq!(view.regions[1].y, 50.0);
         assert_eq!(view.regions[1].h, 50.0);
+    }
+
+    #[test]
+    fn preset_views_follow_the_fixed_order_and_skip_missing_plugins() {
+        let installed = vec![
+            ("lyrics".to_string(), "歌词".to_string()),
+            ("clock".to_string(), "时钟".to_string()),
+        ];
+        let views = preset_views(&installed);
+        // 顺序按预制清单走：clock 在 lyrics 前面，与 installed 的顺序无关。
+        assert_eq!(views.iter().map(|v| v.id.as_str()).collect::<Vec<_>>(), ["clock", "lyrics"]);
+        assert_eq!(views[0].name, "时钟");
+        // 每个预制视图整屏一个插件。
+        assert_eq!(views[0].regions, vec![Region::stacked("clock", 0, 1)]);
+        // 未安装的插件（ai-quota）不出现在预置清单里。
+        assert!(views.iter().all(|v| v.id != "ai-quota"));
     }
 
     #[test]

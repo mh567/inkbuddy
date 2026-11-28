@@ -398,19 +398,6 @@ impl PluginSet {
     }
 
     /// Ids that are enabled. Used when the visitor omits `?plugins=`.
-    pub fn default_ids(&self) -> Vec<String> {
-        self.order
-            .iter()
-            .filter(|id| {
-                self.plugins
-                    .get(*id)
-                    .map(|p| p.manifest.runtime.default_on && p.manifest.runtime.enabled)
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect()
-    }
-
     /// Kept for callers that prefer to shut the whole set down at once.
     #[allow(dead_code)]
     pub async fn shutdown_all(&self) {
