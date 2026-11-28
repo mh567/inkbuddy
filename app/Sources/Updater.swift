@@ -8,6 +8,8 @@ import Combine
 final class Updater: ObservableObject {
     static let shared = Updater()
     private static let repo = "mh567/inkbuddy"
+    /// 发版脚本固定产出的 dmg 名，见 docs/release.md
+    private static let assetName = "InkBuddy-macOS-arm64.dmg"
 
     enum State: Equatable {
         case idle
@@ -31,29 +33,42 @@ final class Updater: ObservableObject {
     func check() {
         guard state != .checking, state != .downloading, state != .installing else { return }
         state = .checking
-        let url = URL(string: "https://api.github.com/repos/\(Self.repo)/releases/latest")!
+        // 走网页端的 latest 跳转，从重定向后的地址里取 tag。
+        // api.github.com 对未认证请求按出口 IP 限 60 次/小时，打满后一直返回 403，
+        // 更新检查会长期失败；网页端这条路径不吃配额。
+        let url = URL(string: "https://github.com/\(Self.repo)/releases/latest")!
         var req = URLRequest(url: url)
-        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         req.timeoutInterval = 10
-        URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
+        URLSession.shared.dataTask(with: req) { [weak self] _, resp, err in
             DispatchQueue.main.async {
                 guard let self else { return }
-                guard let data, err == nil,
-                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let tag = obj["tag_name"] as? String,
-                      let assets = obj["assets"] as? [[String: Any]] else {
+                if let err {
+                    self.state = .failed(Self.describe(err))
+                    return
+                }
+                guard let http = resp as? HTTPURLResponse else {
                     self.state = .failed("无法连接 GitHub")
                     return
                 }
+                guard http.statusCode == 200 else {
+                    self.state = .failed("获取版本失败（HTTP \(http.statusCode)）")
+                    return
+                }
+                guard let tag = Self.releaseTag(from: http.url) else {
+                    self.state = .failed("没有找到发布版本")
+                    return
+                }
                 let latest = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
-                guard Self.isNewer(latest, than: self.currentVersion),
-                      let asset = assets.first(where: { ($0["name"] as? String)?.hasPrefix("InkBuddy-macOS") == true }),
-                      let raw = asset["browser_download_url"] as? String,
-                      let url = URL(string: raw) else {
+                guard Self.isNewer(latest, than: self.currentVersion) else {
                     self.state = .upToDate
                     return
                 }
-                self.assetURL = url
+                guard let asset = URL(string:
+                        "https://github.com/\(Self.repo)/releases/download/\(tag)/\(Self.assetName)") else {
+                    self.state = .failed("下载地址无效")
+                    return
+                }
+                self.assetURL = asset
                 self.releaseVersion = latest
                 self.state = .available(version: latest)
             }
@@ -143,6 +158,37 @@ final class Updater: ObservableObject {
     }
 
     // MARK: - 版本比较
+
+    /// 从重定向后的 URL 里取 tag，形如 .../releases/tag/v0.3.18 或 .../tag/v0.3.18
+    static func releaseTag(from url: URL?) -> String? {
+        guard let url else { return nil }
+        let parts = url.pathComponents
+        guard let i = parts.firstIndex(of: "tag"), i + 1 < parts.count else { return nil }
+        let tag = parts[i + 1]
+        return tag.isEmpty ? nil : tag
+    }
+
+    /// 把网络错误分成人话，避免一律报成「无法连接 GitHub」
+    static func describe(_ error: Error) -> String {
+        let ns = error as NSError
+        guard ns.domain == NSURLErrorDomain else {
+            return "检查更新失败：\(ns.localizedDescription)"
+        }
+        switch ns.code {
+        case NSURLErrorNotConnectedToInternet:
+            return "本机网络未连接"
+        case NSURLErrorTimedOut:
+            return "连接 GitHub 超时"
+        case NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed:
+            return "无法解析 github.com，检查 DNS 或代理设置"
+        case NSURLErrorCannotConnectToHost:
+            return "无法连接 github.com，检查网络或代理设置"
+        case NSURLErrorAppTransportSecurityRequiresSecureConnection:
+            return "连接被系统安全策略拦截"
+        default:
+            return "无法连接 GitHub（\(ns.code)）"
+        }
+    }
 
     /// 逐段比较语义化版本（1.2.3），段数不同按 0 补齐；无法解析时退到字符串比较
     private static func isNewer(_ a: String, than b: String) -> Bool {
