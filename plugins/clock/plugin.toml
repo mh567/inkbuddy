@@ -4,6 +4,7 @@ name = "时钟"
 version = "0.1.0"
 description = "当前日期与时间"
 command = "../../target/release/inkbuddy-plugin-clock"
+order = 50
 
 [runtime]
 enabled = true

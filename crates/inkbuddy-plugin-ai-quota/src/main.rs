@@ -115,7 +115,7 @@ async fn handle_request(req: Request, board: &mut Board) -> Response {
             // TODO: 协议 variants/Default 合并进提交态后，改回结构体字面量。
             match serde_json::from_value::<PluginInfo>(serde_json::json!({
                 "id": PLUGIN_ID,
-                "name": "AI 额度",
+                "name": "ChatGPT 额度",
                 "version": env!("CARGO_PKG_VERSION"),
                 "description": "Codex 套餐与 5 小时、周额度用量",
                 "protocol": PROTOCOL_VERSION,

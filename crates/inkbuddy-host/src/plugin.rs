@@ -492,10 +492,19 @@ pub fn scan(dirs: &[PathBuf]) -> Vec<(Manifest, PathBuf)> {
 
     // read_dir 顺序不固定；排序让重复 id 的取舍保持稳定，避免重新扫描时
     // 换胜出的插件并重启进程。
+    sort_by_display_order(found)
+}
+
+/// 显示顺序：按清单里的 order（未写排最后），同序号按 id，再按目录路径。
+/// 设置窗口、编辑器面板和无视图布局共用这个顺序。
+fn sort_by_display_order(
+    mut found: Vec<(Manifest, PathBuf)>,
+) -> Vec<(Manifest, PathBuf)> {
     found.sort_by(|a, b| {
         a.0.plugin
-            .id
-            .cmp(&b.0.plugin.id)
+            .order
+            .cmp(&b.0.plugin.order)
+            .then_with(|| a.0.plugin.id.cmp(&b.0.plugin.id))
             .then_with(|| a.1.cmp(&b.1))
     });
     found
@@ -525,6 +534,7 @@ mod tests {
                 version: "0.1.0".to_string(),
                 description: String::new(),
                 command: "./plugin".to_string(),
+                order: 9000,
             },
             runtime: RuntimeManifest::default(),
         }
@@ -554,6 +564,34 @@ mod tests {
         let r = parse_render_result("demo", serde_json::json!({"refresh_ms": 500}));
         assert!(r.blocks.is_empty());
         assert_eq!(r.refresh_ms, Some(500));
+    }
+
+    #[test]
+    fn display_order_sorts_by_manifest_order_then_id() {
+        let manifest = |id: &str, name: &str, order: u32| Manifest {
+            plugin: PluginManifest {
+                id: id.to_string(),
+                name: name.to_string(),
+                version: "0.1.0".to_string(),
+                description: String::new(),
+                command: "./plugin".to_string(),
+                order,
+            },
+            runtime: RuntimeManifest::default(),
+        };
+        let found = vec![
+            (manifest("clock", "时钟", 9000), PathBuf::from("/a/clock")),
+            (manifest("lyrics", "歌词", 40), PathBuf::from("/a/lyrics")),
+            (manifest("ai-quota", "AI 额度", 10), PathBuf::from("/a/ai")),
+            (manifest("another", "同名较小", 10), PathBuf::from("/a/another")),
+        ];
+        let sorted = sort_by_display_order(found);
+        let ids: Vec<&str> = sorted
+            .iter()
+            .map(|(m, _)| m.plugin.id.as_str())
+            .collect();
+        // order 在前，同序号按 id；未写 order 的 9000 排到最后
+        assert_eq!(ids, vec!["ai-quota", "another", "lyrics", "clock"]);
     }
 
     #[test]

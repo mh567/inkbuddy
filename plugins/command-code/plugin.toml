@@ -4,6 +4,7 @@ name = "Command Code 额度"
 version = "0.1.0"
 description = "Command Code 套餐与 5 小时、周、月额度用量"
 command = "../../target/release/inkbuddy-plugin-command-code"
+order = 30
 
 [runtime]
 enabled = true

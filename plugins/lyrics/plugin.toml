@@ -6,6 +6,7 @@ description = "正在播放的同步歌词"
 # Resolved relative to this manifest's directory. Overwritten by
 # scripts/install.sh with the absolute path of the installed binary.
 command = "../../target/release/inkbuddy-plugin-lyrics"
+order = 40
 
 [runtime]
 enabled = true

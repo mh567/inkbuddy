@@ -251,7 +251,7 @@ fn answers_unknown_method_and_exits_on_shutdown() {
     assert_eq!(reply["id"].as_u64(), Some(1));
     assert_eq!(reply["ok"].as_bool(), Some(true));
     assert_eq!(reply["result"]["id"].as_str(), Some("ai-quota"));
-    assert_eq!(reply["result"]["name"].as_str(), Some("AI 额度"));
+    assert_eq!(reply["result"]["name"].as_str(), Some("ChatGPT 额度"));
 
     // 未知方法：id 原样带回、ok=false，且进程不退出。
     let reply = roundtrip(&mut stdin, &replies, r#"{"id":9,"method":"future_method"}"#);

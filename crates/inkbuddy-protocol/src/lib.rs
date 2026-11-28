@@ -284,10 +284,18 @@ pub struct PluginManifest {
     pub description: String,
     /// Executable path. Relative paths resolve against the manifest's directory.
     pub command: String,
+    /// 显示排序：设置窗口、编辑器面板与无视图布局都按它排，小的在前。
+    /// 没写的插件排到最后（9000），同序号再按 id 排。
+    #[serde(default = "default_display_order")]
+    pub order: u32,
 }
 
 fn default_version() -> String {
     "0.1.0".to_string()
+}
+
+fn default_display_order() -> u32 {
+    9000
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -368,6 +376,7 @@ mod tests {
                 version: "0.1.0".to_string(),
                 description: String::new(),
                 command: "./demo".to_string(),
+                order: 9000,
             },
             runtime: RuntimeManifest::default(),
         };

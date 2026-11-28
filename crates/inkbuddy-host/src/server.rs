@@ -971,6 +971,7 @@ mod tests {
                         version: "0.1.0".to_string(),
                         description: String::new(),
                         command: "./plugin".to_string(),
+                        order: 9000,
                     },
                     runtime: RuntimeManifest {
                         enabled: true,

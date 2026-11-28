@@ -4,6 +4,7 @@ name = "反重力额度"
 version = "0.1.0"
 description = "Antigravity 套餐与 5 小时、周额度用量"
 command = "../../target/release/inkbuddy-plugin-antigravity-quota"
+order = 20
 
 [runtime]
 enabled = true

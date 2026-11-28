@@ -73,6 +73,7 @@ name = "歌词"
 version = "0.1.0"
 description = "正在播放的同步歌词"
 command = "./inkbuddy-plugin-lyrics"
+order = 40
 
 [runtime]
 enabled = true
@@ -88,6 +89,7 @@ name = "时钟"
 version = "0.1.0"
 description = "当前日期与时间"
 command = "./inkbuddy-plugin-clock"
+order = 50
 
 [runtime]
 enabled = true
@@ -107,10 +109,11 @@ fi
 cat > "$RESDIR/plugins/ai-quota/plugin.toml" <<EOF
 [plugin]
 id = "ai-quota"
-name = "AI 额度"
+name = "ChatGPT 额度"
 version = "0.1.0"
 description = "Codex 套餐与 5 小时、周额度用量"
 command = "./inkbuddy-plugin-ai-quota"
+order = 10
 
 [runtime]
 enabled = true
@@ -135,6 +138,7 @@ name = "反重力额度"
 version = "0.1.0"
 description = "Antigravity 套餐与 5 小时、周额度用量"
 command = "./inkbuddy-plugin-antigravity-quota"
+order = 20
 
 [runtime]
 enabled = true
@@ -154,6 +158,7 @@ name = "Command Code 额度"
 version = "0.1.0"
 description = "Command Code 套餐与 5 小时、周、月额度用量"
 command = "./inkbuddy-plugin-command-code"
+order = 30
 
 [runtime]
 enabled = true

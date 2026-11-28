@@ -1,6 +1,6 @@
-# AI 额度插件（inkbuddy-plugin-ai-quota）
+# ChatGPT 额度插件（inkbuddy-plugin-ai-quota）
 
-在墨水屏上显示本机 Codex CLI 账号的套餐和额度用量。插件 id 为 `ai-quota`，安装后的清单在 `plugins/ai-quota/plugin.toml`。`scripts/install.sh` 与 `scripts/build-macos-app.sh` 会检测本机有没有 `codex`：检测到就写 `default_on = true`，随展示页一起显示；没检测到就写 `false`。两种情况下都可以用 `?plugins=ai-quota` 参数，或把 `default_on` 改成 `true` 来启用。
+在墨水屏上显示本机 Codex CLI 账号的套餐和额度用量。显示名为「ChatGPT 额度」，插件 id 为 `ai-quota`，安装后的清单在 `plugins/ai-quota/plugin.toml`。`scripts/install.sh` 与 `scripts/build-macos-app.sh` 会检测本机有没有 `codex`：检测到就写 `default_on = true`，随展示页一起显示；没检测到就写 `false`。两种情况下都可以用 `?plugins=ai-quota` 参数，或把 `default_on` 改成 `true` 来启用。
 
 ## 显示内容
 
