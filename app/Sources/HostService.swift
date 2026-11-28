@@ -2,9 +2,10 @@ import Foundation
 import Combine
 import AppKit
 
-/// 一个扩展。installed 来自 host 的卸载黑名单：目录扫描到 = 安装来源，
-/// 卸载只是本地标记。enabled 是 manifest 的运行时开关，host 的默认布局
-/// 用它过滤，菜单无视图时也要按同样规则回退。
+/// 一个扩展。enabled 是用户的启用开关：停用只是本地标记，扩展文件仍在
+/// 磁盘上，渲染时跳过、子进程停掉。available 是 manifest 的构建级开关，
+/// 为 false 时这款扩展在本机用不了。
+
 /// 插件声明的一个子样式，id 传给插件的 render 请求，name 用于界面展示。
 struct PluginVariant: Identifiable, Codable, Hashable {
     let id: String
@@ -16,15 +17,15 @@ struct PluginInfo: Identifiable, Codable {
     let name: String
     let version: String
     let description: String
-    var installed: Bool
-    let enabled: Bool
+    var enabled: Bool
+    let available: Bool
     let defaultOn: Bool
     let running: Bool
     /// 插件提供的子样式，缺省为空数组。
     var variants: [PluginVariant]
 
     enum CodingKeys: String, CodingKey {
-        case id, name, version, description, installed, enabled, running, variants
+        case id, name, version, description, enabled, available, running, variants
         case defaultOn = "default_on"
     }
 
@@ -34,23 +35,23 @@ struct PluginInfo: Identifiable, Codable {
         name = try c.decode(String.self, forKey: .name)
         version = try c.decode(String.self, forKey: .version)
         description = try c.decode(String.self, forKey: .description)
-        installed = try c.decode(Bool.self, forKey: .installed)
         enabled = try c.decode(Bool.self, forKey: .enabled)
+        available = try c.decode(Bool.self, forKey: .available)
         defaultOn = try c.decode(Bool.self, forKey: .defaultOn)
         running = try c.decode(Bool.self, forKey: .running)
         variants = try c.decodeIfPresent([PluginVariant].self, forKey: .variants) ?? []
     }
 
-    /// setInstalled 里重建对象时用：保留已有字段，只改 installed / running。
+    /// setEnabled 里重建对象时用：保留已有字段，只改 enabled / running。
     init(id: String, name: String, version: String, description: String,
-         installed: Bool, enabled: Bool, defaultOn: Bool, running: Bool,
+         enabled: Bool, available: Bool, defaultOn: Bool, running: Bool,
          variants: [PluginVariant] = []) {
         self.id = id
         self.name = name
         self.version = version
         self.description = description
-        self.installed = installed
         self.enabled = enabled
+        self.available = available
         self.defaultOn = defaultOn
         self.running = running
         self.variants = variants
@@ -420,7 +421,7 @@ final class HostService: ObservableObject {
         return 3
     }
 
-    // MARK: - 扩展管理（安装/卸载）
+    // MARK: - 扩展管理（启用/停用）
 
     /// 从 host 拉取扩展列表。
     func fetchPlugins() {
@@ -434,13 +435,13 @@ final class HostService: ObservableObject {
         }.resume()
     }
 
-    /// 安装/卸载一个扩展。卸载只是打标记并停掉子进程，文件仍在扩展目录。
-    func setInstalled(_ id: String, installed: Bool, completion: ((Bool) -> Void)? = nil) {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/api/plugins/\(id)/installed") else { return }
+    /// 启用/停用一个扩展。停用只打标记并停掉子进程，文件仍在扩展目录。
+    func setEnabled(_ id: String, enabled: Bool, completion: ((Bool) -> Void)? = nil) {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/api/plugins/\(id)/enabled") else { return }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: ["installed": installed])
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["enabled": enabled])
         request.timeoutInterval = 3
         URLSession.shared.dataTask(with: request) { [weak self] _, response, _ in
             let ok = (response as? HTTPURLResponse)?.statusCode == 200
@@ -453,10 +454,10 @@ final class HostService: ObservableObject {
                         name: old.name,
                         version: old.version,
                         description: old.description,
-                        installed: installed,
-                        enabled: old.enabled,
+                        enabled: enabled,
+                        available: old.available,
                         defaultOn: old.defaultOn,
-                        running: installed ? old.running : false,
+                        running: enabled ? old.running : false,
                         variants: old.variants
                     )
                 } else if !ok {
@@ -466,7 +467,7 @@ final class HostService: ObservableObject {
                 completion?(ok)
                 if ok {
                     // host 对扩展是懒启动：/api/plugins 的 describe 会拉起子进程
-                    // 并把 running 置为 true。安装后立刻重拉一次，稍后再补一次，
+                    // 并把 running 置为 true。启用后立刻重拉一次，稍后再补一次，
                     // 避免列表一直停留在「未运行」。
                     self?.fetchPlugins()
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
@@ -630,12 +631,12 @@ final class HostService: ObservableObject {
 
     // MARK: - 辅助
 
-    /// 扩展的显示名；未安装的扩展返回 nil。
+    /// 扩展的显示名；已停用的扩展返回 nil。
     func pluginName(for id: String) -> String? {
-        plugins.first { $0.id == id && $0.installed }?.name
+        plugins.first { $0.id == id && $0.enabled }?.name
     }
 
-    /// 视图里引用了但本机未安装的扩展 id。
+    /// 视图里引用了但本机已停用的扩展 id。
     func missingPluginIds(in view: SavedView) -> [String] {
         view.regions.map { $0.plugin }.filter { pluginName(for: $0) == nil }
     }

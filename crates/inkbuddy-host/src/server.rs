@@ -40,39 +40,49 @@ pub struct DisplayState {
     pub invert: bool,
 }
 
-/// 卸载标记的持久化形式。目录扫描到 = 安装来源；卸载只是本地黑名单。
+/// 用户停用的扩展 id 列表的持久化形式。目录里扫描到就算可用，
+/// 停用只记在这里：渲染时跳过、子进程停掉，扩展文件仍在磁盘上。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct UninstalledState {
+struct DisabledState {
     ids: Vec<String>,
 }
 
-fn uninstalled_path() -> Option<std::path::PathBuf> {
+fn disabled_path() -> Option<std::path::PathBuf> {
+    config::home_dir().ok().map(|p| p.join("disabled.json"))
+}
+
+/// 旧版本把这个文件叫 uninstalled.json。新文件还没写出来时按旧文件读一次，
+/// 用户之前停用过的扩展不会又冒出来。
+fn legacy_disabled_path() -> Option<std::path::PathBuf> {
     config::home_dir().ok().map(|p| p.join("uninstalled.json"))
 }
 
-pub fn load_uninstalled() -> Vec<String> {
-    let Some(path) = uninstalled_path() else {
-        return Vec::new();
-    };
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(_) => return Vec::new(),
-    };
-    match serde_json::from_str::<UninstalledState>(&text) {
-        Ok(state) => state.ids,
+fn read_disabled(path: &std::path::Path) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    match serde_json::from_str::<DisabledState>(&text) {
+        Ok(state) => Some(state.ids),
         Err(e) => {
-            warn!(path = %path.display(), error = %e, "invalid uninstalled.json, ignoring");
-            Vec::new()
+            warn!(path = %path.display(), error = %e, "invalid disabled plugin file, ignoring");
+            None
         }
     }
 }
 
-fn save_uninstalled(ids: &[String]) {
-    let Some(path) = uninstalled_path() else { return };
+pub fn load_disabled() -> Vec<String> {
+    match disabled_path() {
+        Some(path) if path.exists() => read_disabled(&path).unwrap_or_default(),
+        _ => legacy_disabled_path()
+            .and_then(|path| read_disabled(&path))
+            .unwrap_or_default(),
+    }
+}
+
+fn save_disabled(ids: &[String]) {
+    let Some(path) = disabled_path() else { return };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(text) = serde_json::to_string_pretty(&UninstalledState {
+    if let Ok(text) = serde_json::to_string_pretty(&DisabledState {
         ids: ids.to_vec(),
     }) {
         // 临时文件 + rename，防止半截 JSON。
@@ -86,8 +96,8 @@ fn save_uninstalled(ids: &[String]) {
 pub struct AppState {
     pub config: Config,
     pub display: tokio::sync::RwLock<DisplayState>,
-    /// 卸载的扩展 id 列表。显示与可组合集合都排除这些扩展。
-    pub uninstalled: tokio::sync::RwLock<Vec<String>>,
+    /// 用户停用的扩展 id。渲染与视图可选集合都排除这些扩展。
+    pub disabled: tokio::sync::RwLock<Vec<String>>,
     /// 具名视图（区域布局）+ 当前应用的视图指针。显示完全跟随当前视图。
     pub views: tokio::sync::RwLock<ViewState>,
     pub plugins: tokio::sync::RwLock<PluginSet>,
@@ -108,12 +118,12 @@ pub struct AppState {
 
 pub type Shared = Arc<AppState>;
 
-/// 扩展是否可用：被扫描到、自身声明 enabled、且未被用户卸载。
-fn is_installed(set: &PluginSet, uninstalled: &[String], id: &str) -> bool {
+/// 扩展是否参与渲染：被扫描到、自己声明可用、且用户没有停用。
+fn is_enabled(set: &PluginSet, disabled: &[String], id: &str) -> bool {
     set.get(id)
         .map(|p| p.manifest.runtime.enabled)
         .unwrap_or(false)
-        && !uninstalled.iter().any(|x| x == id)
+        && !disabled.iter().any(|x| x == id)
 }
 
 /// Re-scan plugin directories at most once every 2 seconds. New plugins
@@ -182,9 +192,10 @@ struct PluginSummary {
     name: String,
     version: String,
     description: String,
-    installed: bool,
-    /// manifest 里的运行时开关。默认布局要用它过滤，和 default_ids 一致。
+    /// 用户开关：不在停用列表里就是启用。停用的扩展不渲染、子进程也停掉。
     enabled: bool,
+    /// manifest 里的构建级开关；为 false 时这款扩展在本机不可用。
+    available: bool,
     default_on: bool,
     running: bool,
     /// 插件声明的子样式；控制端据此把时钟展开成可选样式。
@@ -192,9 +203,9 @@ struct PluginSummary {
 }
 
 /// Resolve the plugin ids for the no-view path: the URL parameter wins when
-/// set, otherwise each installed plugin's default_on. Unknown and uninstalled
+/// set, otherwise each enabled plugin's default_on. Unknown and disabled
 /// ones are dropped.
-fn resolve_ids(set: &PluginSet, query: &Option<String>, uninstalled: &[String]) -> Vec<String> {
+fn resolve_ids(set: &PluginSet, query: &Option<String>, disabled: &[String]) -> Vec<String> {
     let requested: Option<Vec<String>> = query.as_ref().and_then(|raw| {
         if raw.len() > MAX_QUERY_BYTES {
             warn!(len = raw.len(), "plugins query too long, using defaults");
@@ -213,7 +224,7 @@ fn resolve_ids(set: &PluginSet, query: &Option<String>, uninstalled: &[String]) 
     });
     let ids = requested.unwrap_or_else(|| set.default_ids());
     ids.into_iter()
-        .filter(|id| is_installed(set, uninstalled, id))
+        .filter(|id| is_enabled(set, disabled, id))
         .collect()
 }
 
@@ -326,11 +337,11 @@ async fn preview_html(
     let mut seen = HashSet::new();
     let selected: Vec<(String, Option<String>, Arc<crate::plugin::PluginProcess>)> = {
         let guard = state.plugins.read().await;
-        let uninstalled = state.uninstalled.read().await;
+        let disabled = state.disabled.read().await;
         regions
             .iter()
             .filter(|r| seen.insert(r.plugin.clone()))
-            .filter(|r| is_installed(&guard, &uninstalled, &r.plugin))
+            .filter(|r| is_enabled(&guard, &disabled, &r.plugin))
             .filter_map(|r| {
                 guard
                     .get(&r.plugin)
@@ -401,12 +412,12 @@ async fn preview_frame(State(state): State<Shared>, Json(req): Json<PreviewReque
     let text_mode = state.display.read().await.mode == "text";
     let selected: Vec<(String, Option<String>, Arc<crate::plugin::PluginProcess>)> = {
         let guard = state.plugins.read().await;
-        let uninstalled = state.uninstalled.read().await;
+        let disabled = state.disabled.read().await;
         let mut seen = HashSet::new();
         req.plugins
             .iter()
             .filter(|item| seen.insert(preview_key(item.plugin(), item.variant())))
-            .filter(|item| is_installed(&guard, &uninstalled, item.plugin()))
+            .filter(|item| is_enabled(&guard, &disabled, item.plugin()))
             .filter_map(|item| {
                 guard.get(item.plugin()).map(|p| {
                     (
@@ -464,7 +475,7 @@ async fn get_frame(State(state): State<Shared>, Query(q): Query<FrameQuery>) -> 
     // 目录重扫。
     let (layout, ids, selected) = {
         let guard = state.plugins.read().await;
-        let uninstalled = state.uninstalled.read().await;
+        let disabled = state.disabled.read().await;
         let views_state = state.views.read().await;
         let layout: Option<Vec<Region>> = views_state.current_regions();
         // 当前视图存在时按区域顺序渲染；否则走 URL 参数 / default_on 流式。
@@ -475,10 +486,10 @@ async fn get_frame(State(state): State<Shared>, Query(q): Query<FrameQuery>) -> 
                     .iter()
                     .filter(|r| seen.insert(r.plugin.clone()))
                     .map(|r| r.plugin.clone())
-                    .filter(|id| is_installed(&guard, &uninstalled, id))
+                    .filter(|id| is_enabled(&guard, &disabled, id))
                     .collect()
             }
-            None => resolve_ids(&guard, &q.plugins, &uninstalled),
+            None => resolve_ids(&guard, &q.plugins, &disabled),
         };
         // 区域的子样式随插件一起带下去，并参与渲染缓存的 key。
         // 同一个插件在视图里只占一个区域（sanitize 按 plugin 去重），
@@ -640,21 +651,21 @@ async fn get_plugins(State(state): State<Shared>) -> impl IntoResponse {
     refresh_plugins(&state).await;
     // Clone the handles and drop the read lock before the child-process
     // round trips; otherwise a slow describe blocks every rescan and frame.
-    let (entries, uninstalled) = {
+    let (entries, disabled) = {
         let guard = state.plugins.read().await;
-        let uninstalled = state.uninstalled.read().await.clone();
+        let disabled = state.disabled.read().await.clone();
         let entries: Vec<(String, Arc<crate::plugin::PluginProcess>)> = guard
             .order
             .iter()
             .filter_map(|id| guard.get(id).map(|p| (id.clone(), p)))
             .collect();
-        (entries, uninstalled)
+        (entries, disabled)
     };
     let mut futures = Vec::new();
     let mut offline: Vec<(String, Arc<crate::plugin::PluginProcess>)> = Vec::new();
     for (id, p) in entries {
-        // 未安装的扩展不 describe：懒启动会为一个不可用的扩展拉起子进程。
-        if uninstalled.iter().any(|x| x == &id) {
+        // 停用的扩展不 describe：懒启动会为一个不再使用的扩展拉起子进程。
+        if disabled.iter().any(|x| x == &id) {
             offline.push((id, p));
         } else {
             futures.push(async move {
@@ -667,7 +678,6 @@ async fn get_plugins(State(state): State<Shared>) -> impl IntoResponse {
     let mut out = Vec::new();
     for (id, p, info) in results {
         let m = &p.manifest;
-        let installed = !uninstalled.iter().any(|x| x == &id);
         let (running, i) = match info {
             Ok(v) => (true, Some(v)),
             Err(e) => {
@@ -677,8 +687,8 @@ async fn get_plugins(State(state): State<Shared>) -> impl IntoResponse {
         };
         out.push(PluginSummary {
             id,
-            installed,
-            enabled: m.runtime.enabled,
+            enabled: true,
+            available: m.runtime.enabled,
             name: i
                 .as_ref()
                 .map(|v| v.name.clone())
@@ -700,8 +710,8 @@ async fn get_plugins(State(state): State<Shared>) -> impl IntoResponse {
         let m = &p.manifest;
         out.push(PluginSummary {
             id,
-            installed: false,
-            enabled: m.runtime.enabled,
+            enabled: false,
+            available: m.runtime.enabled,
             name: m.plugin.name.clone(),
             version: m.plugin.version.clone(),
             description: m.plugin.description.clone(),
@@ -714,15 +724,16 @@ async fn get_plugins(State(state): State<Shared>) -> impl IntoResponse {
 }
 
 #[derive(Deserialize)]
-struct InstalledUpdate {
-    installed: bool,
+struct EnabledUpdate {
+    enabled: bool,
 }
 
-/// 安装/卸载一个扩展。卸载会把它的子进程停掉；安装只是移除黑名单标记。
-async fn set_installed(
+/// 启用/停用一个扩展。停用会把它的子进程停掉，渲染与视图里都跳过；
+/// 扩展文件仍在磁盘上，随时可以再启用。
+async fn set_enabled(
     State(state): State<Shared>,
     Path(id): Path<String>,
-    Json(update): Json<InstalledUpdate>,
+    Json(update): Json<EnabledUpdate>,
 ) -> Response {
     let id = id.trim().to_string();
     if id.is_empty() {
@@ -733,8 +744,8 @@ async fn set_installed(
         )
             .into_response();
     }
-    let mut list = state.uninstalled.write().await;
-    let changed = if update.installed {
+    let mut list = state.disabled.write().await;
+    let changed = if update.enabled {
         let before = list.len();
         list.retain(|x| x != &id);
         before != list.len()
@@ -745,17 +756,17 @@ async fn set_installed(
         false
     };
     if changed {
-        save_uninstalled(&list);
+        save_disabled(&list);
     }
     drop(list);
-    if !update.installed {
-        // 卸载后停掉子进程；再安装时按需懒启动。
+    if !update.enabled {
+        // 停用后停掉子进程；再启用时按需懒启动。
         let proc = state.plugins.read().await.get(&id);
         if let Some(p) = proc {
             p.shutdown().await;
         }
     }
-    debug!(plugin = %id, installed = update.installed, "extension install state updated");
+    debug!(plugin = %id, enabled = update.enabled, "plugin enabled state updated");
     StatusCode::OK.into_response()
 }
 
@@ -900,7 +911,7 @@ pub fn router(state: Shared) -> Router {
         .route("/api/preview/html", post(preview_html))
         .route("/api/display", axum::routing::post(set_display))
         .route("/api/plugins", get(get_plugins))
-        .route("/api/plugins/{id}/installed", post(set_installed))
+        .route("/api/plugins/{id}/enabled", post(set_enabled))
         .route("/api/views", get(get_views).post(set_views))
         .route("/api/views/current", post(set_current_view))
         .route("/api/health", get(get_health))
@@ -973,16 +984,16 @@ mod tests {
     }
 
     #[test]
-    fn uninstalled_plugins_are_filtered_everywhere() {
+    fn disabled_plugins_are_filtered_everywhere() {
         let set = set_with(&["lyrics", "clock"], true);
-        let un = vec!["clock".to_string()];
-        // URL 请求两个，卸载的 clock 被过滤
+        let off = vec!["clock".to_string()];
+        // URL 请求两个，停用的 clock 被过滤
         assert_eq!(
-            resolve_ids(&set, &Some("lyrics,clock".to_string()), &un),
+            resolve_ids(&set, &Some("lyrics,clock".to_string()), &off),
             vec!["lyrics"]
         );
         // default_on 回退同样过滤
-        assert_eq!(resolve_ids(&set, &None, &un), vec!["lyrics"]);
+        assert_eq!(resolve_ids(&set, &None, &off), vec!["lyrics"]);
     }
 
     #[test]

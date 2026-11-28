@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
     let state = std::sync::Arc::new(AppState {
         config: cfg,
         display: tokio::sync::RwLock::new(initial_display),
-        uninstalled: tokio::sync::RwLock::new(server::load_uninstalled()),
+        disabled: tokio::sync::RwLock::new(server::load_disabled()),
         views: tokio::sync::RwLock::new(views::load_or_seed(&plugins)),
         plugins: tokio::sync::RwLock::new(plugins),
         plugin_dirs: dirs,

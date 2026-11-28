@@ -50,7 +50,7 @@ private struct GroupHeader: View {
     }
 }
 
-/// 状态徽标：运行中 / 当前 / 未安装 等。
+/// 状态徽标：运行中 / 当前 / 已停用 等。
 private struct Pill: View {
     let text: String
     let tone: Tone
@@ -188,7 +188,7 @@ struct SettingsView: View {
     @EnvironmentObject var host: HostService
     @EnvironmentObject var updater: Updater
 
-    /// 待确认卸载的扩展（alert 确认后真正调用卸载接口）
+    /// 待确认停用的扩展（alert 确认后真正调用停用接口）
     @ObservedObject private var pending = PendingUninstall()
 
     var body: some View {
@@ -211,20 +211,20 @@ struct SettingsView: View {
             updater.check()
         }
         .alert(
-            "卸载扩展",
+            "停用扩展",
             isPresented: Binding(
                 get: { pending.plugin != nil },
                 set: { if !$0 { pending.plugin = nil } }
             ),
             presenting: pending.plugin
         ) { plugin in
-            Button("卸载", role: .destructive) {
-                host.setInstalled(plugin.id, installed: false)
+            Button("停用") {
+                host.setEnabled(plugin.id, enabled: false)
                 pending.plugin = nil
             }
             Button("取消", role: .cancel) { pending.plugin = nil }
         } message: { plugin in
-            Text("卸载「\(plugin.name)」后墨水屏不再显示它，视图里引用它的区域也会被跳过。扩展文件仍保留在本机，可随时重新安装。")
+            Text("停用「\(plugin.name)」后它不再读取任何数据，墨水屏也不再显示它，视图里引用它的区域会被跳过。扩展文件仍保留在本机，随时可以再启用。")
         }
     }
 
@@ -387,7 +387,7 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 8) {
                 GroupHeader(
                     title: "扩展",
-                    detail: "\(host.plugins.filter { $0.installed }.count) / \(host.plugins.count) 已安装"
+                    detail: "\(host.plugins.filter { $0.enabled }.count) / \(host.plugins.count) 已启用"
                 )
                 card {
                     if host.plugins.isEmpty {
@@ -410,8 +410,9 @@ struct SettingsView: View {
     }
 
     private func pluginRow(_ plugin: PluginInfo) -> some View {
-        let tone: Tone = !plugin.installed ? .muted : (plugin.running ? .positive : .caution)
-        let status = !plugin.installed ? "未安装" : (plugin.running ? "运行中" : "未运行")
+        // 停用是用户主动选的，用中性色；启用了却没跑起来才是要提示的问题。
+        let tone: Tone = !plugin.enabled ? .muted : (plugin.running ? .positive : .caution)
+        let status = !plugin.enabled ? "已停用" : (plugin.running ? "运行中" : "未运行")
 
         return SettingRow(
             leading: {
@@ -431,20 +432,21 @@ struct SettingsView: View {
                 }
             },
             trailing: {
-                if plugin.installed {
-                    Button("卸载", role: .destructive) { pending.plugin = plugin }
+                if plugin.enabled {
+                    Button("停用") { pending.plugin = plugin }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
-                        .tint(Tone.negative.ink)
                 } else {
-                    Button("安装") { host.setInstalled(plugin.id, installed: true) }
+                    Button("启用") { host.setEnabled(plugin.id, enabled: true) }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
                         .tint(Theme.ink)
+                        .disabled(!plugin.available)
+                        .help(plugin.available ? "启用后开始取数" : "这款扩展的清单里已禁用，本机无法启用")
                 }
             }
         )
-        .opacity(plugin.installed ? 1 : 0.75)
+        .opacity(plugin.enabled ? 1 : 0.75)
     }
 
     // MARK: 视图 Tab（列表 + 应用；编辑在独立大窗口进行）
@@ -547,7 +549,7 @@ struct SettingsView: View {
         )
     }
 
-    /// 布局摘要：每个区域一个扩展名，未安装的显示原始 id。
+    /// 布局摘要：每个区域一个扩展名，已停用的显示原始 id。
     private func viewSummary(_ view: SavedView) -> String {
         view.regions
             .map { host.pluginName(for: $0.plugin) ?? $0.plugin }

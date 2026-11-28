@@ -182,7 +182,7 @@ final class ViewEditorModel: ObservableObject {
         selected = nil
     }
 
-    /// 把一个已安装扩展（可带子样式）加进画布。区域互斥：优先找一块
+    /// 把一个已启用的扩展（可带子样式）加进画布。区域互斥：优先找一块
     /// 放得下的空白；画布已被占满时把面积最大的现有区域对半切开。
     /// 同一个插件只占一个区域：再次点它的子样式时改这个区域的样式并选中，
     /// 与宿主 sanitize 按 plugin 去重的规则一致。
@@ -512,7 +512,7 @@ struct ViewEditorView: View {
             .padding(.top, 12)
 
             HStack(alignment: .top, spacing: 12) {
-                // 左侧：已安装扩展面板
+                // 左侧：已启用的扩展面板
                 pluginPanel
                     .frame(width: paletteWidth)
                 // 中间：画布
@@ -529,7 +529,7 @@ struct ViewEditorView: View {
             .padding(.bottom, 12)
 
             if !missing.isEmpty {
-                Text("含未安装扩展：\(missing.joined(separator: "、"))，渲染时会跳过")
+                Text("含已停用扩展：\(missing.joined(separator: "、"))，渲染时会跳过")
                     .font(.system(size: 11))
                     .foregroundColor(.orange)
             }
@@ -557,26 +557,26 @@ struct ViewEditorView: View {
 
     // MARK: - 左侧扩展面板
 
-    private var installedPlugins: [PluginInfo] {
-        host.plugins.filter { $0.installed }
+    private var enabledPlugins: [PluginInfo] {
+        host.plugins.filter { $0.enabled }
     }
 
     private var pluginPanel: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("已安装扩展")
+            Text("已启用的扩展")
                 .font(.system(size: 12, weight: .medium))
                 .foregroundColor(.secondary)
-            if installedPlugins.isEmpty {
-                Text(host.running ? "未安装扩展" : "启动服务后显示")
+            if enabledPlugins.isEmpty {
+                Text(host.running ? "没有启用的扩展" : "启动服务后显示")
                     .font(.system(size: 12))
                     .foregroundColor(.secondary)
                 Spacer(minLength: 0)
             } else {
                 ScrollView(.vertical) {
                     VStack(alignment: .leading, spacing: 10) {
-                        ForEach(installedPlugins) { plugin in
+                        ForEach(enabledPlugins) { plugin in
                             pluginPaletteGroup(plugin)
-                            if plugin.id != installedPlugins.last?.id {
+                            if plugin.id != enabledPlugins.last?.id {
                                 Divider().padding(.leading, 2)
                             }
                         }
